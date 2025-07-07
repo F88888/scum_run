@@ -1,0 +1,194 @@
+# SCUM Run Client Application - Local Rules
+
+## Feature Purpose
+Go client application that runs on SCUM game servers, providing server process management, log monitoring, database operations, and real-time communication with scum_robot.
+
+## Architecture
+- Cross-platform Go application (Windows focus)
+- WebSocket client for real-time communication
+- SQLite database operations for SCUM server data
+- Windows API integration for process management
+- File system monitoring for log processing
+- Modular package structure for maintainability
+
+## Dependencies
+- Go standard library
+- WebSocket client library
+- SQLite driver (go-sqlite3 or modernc.org/sqlite)
+- Windows API bindings (golang.org/x/sys/windows)
+- File watching library (fsnotify)
+- Configuration management (yaml/json)
+- Logging library (logrus or slog)
+
+## API Contracts
+
+### WebSocket Messages (to scum_robot):
+#### Outbound Messages:
+- `status_update` - Client health and status
+  ```json
+  {
+    "type": "status_update",
+    "data": {
+      "server_id": 123,
+      "status": "online|offline|starting|stopping",
+      "timestamp": "2024-01-01T00:00:00Z"
+    }
+  }
+  ```
+
+- `log_data` - SCUM server log entries
+  ```json
+  {
+    "type": "log_data", 
+    "data": {
+      "server_id": 123,
+      "log_type": "chat|combat|admin|system",
+      "content": "log content",
+      "timestamp": "2024-01-01T00:00:00Z"
+    }
+  }
+  ```
+
+- `db_query_result` - Database query response
+  ```json
+  {
+    "type": "db_query_result",
+    "data": {
+      "query_id": "uuid",
+      "success": true,
+      "results": [...],
+      "error": "error message if any"
+    }
+  }
+  ```
+
+#### Inbound Messages:
+- `server_start`, `server_stop`, `server_restart`, `server_status`
+- `db_query` - Database query request
+
+### Configuration Structure:
+```yaml
+server:
+  id: 123
+  name: "SCUM Server 1"
+  
+scum_robot:
+  endpoint: "ws://localhost:8080/api/v1/scum_run/ws"
+  token: "server_authentication_token"
+  reconnect_interval: 30s
+  heartbeat_interval: 60s
+
+scum_server:
+  executable_path: "C:/SteamCMD/steamapps/common/SCUM Dedicated Server/SCUM/Binaries/Win64/SCUMServer.exe"
+  config_path: "C:/SCUM Server/Saved/Config"
+  database_path: "C:/SCUM Server/Saved/SaveGames/database.db"
+  log_path: "C:/SCUM Server/Saved/Logs"
+
+steam:
+  auto_detect: true
+  steam_path: "C:/Program Files (x86)/Steam"
+  steamcmd_path: "C:/SteamCMD"
+```
+
+## Testing Strategy
+- Unit tests for each package/module
+- Integration tests for WebSocket communication
+- Mock SCUM server processes for testing
+- File system monitoring tests with temporary files
+- Database operation tests with in-memory SQLite
+- Cross-platform compatibility tests
+- Performance tests for log processing
+
+## Documentation Requirements
+- Installation and setup guide
+- Configuration reference
+- WebSocket protocol documentation
+- Database schema documentation
+- Troubleshooting guide
+- Performance tuning guide
+
+## Specific Coding Standards
+
+1. **Project Structure**:
+   ```
+   scum_run/
+   ├── main.go                 # Application entry point
+   ├── config/                 # Configuration management
+   ├── steam/                  # Steam integration
+   ├── websocket/              # WebSocket client
+   ├── database/               # SQLite operations
+   ├── server/                 # SCUM server management
+   ├── logs/                   # Log monitoring and parsing
+   ├── utils/                  # Shared utilities
+   └── internal/               # Internal packages
+   ```
+
+2. **Error Handling**:
+   - Use wrapped errors with context
+   - Implement retry logic with exponential backoff
+   - Log errors with structured logging
+   - Graceful degradation for non-critical failures
+   - Proper error propagation up the call stack
+
+3. **Logging Standards**:
+   - Use structured logging (JSON format)
+   - Include correlation IDs for request tracking
+   - Log levels: Debug, Info, Warn, Error
+   - Rotate log files to prevent disk space issues
+   - Include relevant context in log messages
+
+4. **WebSocket Management**:
+   - Implement automatic reconnection with backoff
+   - Handle connection state properly
+   - Send heartbeat/ping messages
+   - Process incoming messages asynchronously
+   - Buffer outgoing messages during disconnection
+
+5. **Process Management**:
+   - Use OS-specific process handling
+   - Implement graceful process termination
+   - Monitor process health and status
+   - Handle process crashes and restarts
+   - Capture process output and logs
+
+6. **Database Operations**:
+   - Use prepared statements for all queries
+   - Implement connection pooling
+   - Handle database locks and busy errors
+   - Use transactions for data consistency
+   - Implement database schema versioning
+
+7. **File System Monitoring**:
+   - Use efficient file watching mechanisms
+   - Handle file rotation and renaming
+   - Process files in batches for performance
+   - Implement proper file locking
+   - Handle large log files efficiently
+
+8. **Configuration Management**:
+   - Support multiple configuration formats
+   - Implement configuration validation
+   - Allow runtime configuration updates
+   - Use environment variable overrides
+   - Provide sensible default values
+
+9. **Security Considerations**:
+   - Validate all incoming WebSocket messages
+   - Sanitize file paths and database queries
+   - Use secure WebSocket connections (WSS) when available
+   - Implement proper authentication token handling
+   - Avoid logging sensitive information
+
+10. **Performance Optimization**:
+    - Use goroutines for concurrent operations
+    - Implement proper resource cleanup
+    - Use buffered channels for message passing
+    - Optimize database queries and indexing
+    - Monitor memory usage and prevent leaks
+
+11. **Cross-Platform Compatibility**:
+    - Use filepath package for path operations
+    - Handle OS-specific process management
+    - Test on different Windows versions
+    - Use build tags for platform-specific code
+    - Document platform-specific requirements 

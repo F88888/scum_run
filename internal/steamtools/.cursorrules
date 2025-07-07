@@ -1,0 +1,204 @@
+# Steam++ Integration Module - Local Rules
+
+## Feature Purpose
+集成 Steam++ (Watt Toolkit) 网络加速功能，为 SCUM 服务器和 steamCMD 提供稳定的 Steam 服务访问支持。
+
+## Architecture
+- **Manager Pattern**: 使用管理器模式封装 Steam++ 生命周期管理
+- **Auto Detection**: 自动检测 Steam++ 安装路径的多路径算法
+- **Process Management**: 安全的进程启动、停止和状态监控
+- **Configuration Driven**: 基于配置文件的功能控制和参数设置
+- **Error Resilience**: 容错设计，Steam++ 失败不影响主程序运行
+
+## Dependencies
+- Go 标准库 (`os`, `os/exec`, `context`, `path/filepath`)
+- Windows API 绑定 (`syscall`, `golang.org/x/sys/windows`)
+- 项目内部依赖:
+  - `scum_run/config` - 配置管理
+  - `scum_run/internal/logger` - 日志记录
+
+## API Contracts
+
+### Manager Interface
+```go
+type Manager struct {
+    config *config.SteamToolsConfig
+    logger *logger.Logger
+    cmd    *exec.Cmd
+    ctx    context.Context
+    cancel context.CancelFunc
+}
+
+// 主要方法
+func New(cfg *config.SteamToolsConfig, logger *logger.Logger) *Manager
+func (m *Manager) Start() error
+func (m *Manager) Stop() error
+func (m *Manager) GetStatus() map[string]interface{}
+func (m *Manager) DetectSteamTools() string
+```
+
+### Configuration Structure
+```go
+type SteamToolsConfig struct {
+    Enabled         bool     `json:"enabled"`
+    ExecutablePath  string   `json:"executable_path,omitempty"`
+    AutoStart       bool     `json:"auto_start"`
+    AutoAccelerate  bool     `json:"auto_accelerate"`
+    WaitTimeout     int      `json:"wait_timeout"`
+    AccelerateItems []string `json:"accelerate_items,omitempty"`
+}
+```
+
+### Status Response
+```go
+map[string]interface{}{
+    "enabled":        bool,
+    "running":        bool,
+    "auto_start":     bool,
+    "auto_accelerate": bool,
+    "pid":           int,      // 仅在运行时提供
+    "executable_path": string, // 仅在检测到时提供
+}
+```
+
+## Testing Strategy
+
+### Unit Tests
+- **路径检测测试**: 验证各种安装路径的检测逻辑
+- **配置验证测试**: 测试配置文件解析和验证
+- **进程管理测试**: 模拟进程启动、停止场景
+- **错误处理测试**: 验证各种错误情况的处理
+
+### Integration Tests
+- **Steam++ 启动流程测试**: 端到端启动流程验证
+- **状态查询测试**: WebSocket 状态查询功能测试
+- **配置变更测试**: 动态配置变更的影响测试
+
+### Mock Requirements
+- **Mock Steam++ 进程**: 用于测试进程管理逻辑
+- **Mock 文件系统**: 测试路径检测功能
+- **Mock Windows API**: 测试 Windows 特定功能
+
+## Documentation Requirements
+- **API 文档**: 详细的方法和结构体文档
+- **配置指南**: 完整的配置选项说明
+- **故障排除指南**: 常见问题和解决方案
+- **集成示例**: 使用示例和最佳实践
+
+## Specific Coding Standards
+
+### 1. 错误处理规范
+```go
+// 好的做法
+if err := m.steamTools.Start(); err != nil {
+    m.logger.Warn("Steam++ 启动失败，继续运行但可能影响 Steam 服务访问: %v", err)
+    // 不要因为 Steam++ 失败而退出主程序
+}
+
+// 避免的做法
+if err := m.steamTools.Start(); err != nil {
+    return fmt.Errorf("critical error: %w", err) // 不要让 Steam++ 错误导致程序崩溃
+}
+```
+
+### 2. 日志记录规范
+```go
+// 使用中文日志便于用户理解
+m.logger.Info("正在启动 Steam++ 网络加速...")
+m.logger.Info("Steam++ 已启动，PID: %d", pid)
+m.logger.Warn("Steam++ 启动失败，继续运行但可能影响 Steam 服务访问: %v", err)
+```
+
+### 3. 配置验证规范
+```go
+// 总是验证配置的有效性
+func (m *Manager) isValidSteamToolsPath(path string) bool {
+    if path == "" {
+        return false
+    }
+    
+    // 检查文件是否存在
+    if _, err := os.Stat(path); os.IsNotExist(err) {
+        return false
+    }
+    
+    // Windows 平台检查 .exe 扩展名
+    if runtime.GOOS == "windows" && !strings.HasSuffix(strings.ToLower(path), ".exe") {
+        return false
+    }
+    
+    return true
+}
+```
+
+### 4. 跨平台兼容性
+```go
+// 根据操作系统选择不同的实现
+switch runtime.GOOS {
+case "windows":
+    return m.checkWindowsProcess()
+case "linux":
+    return m.checkLinuxProcess()
+case "darwin":
+    return m.checkMacOSProcess()
+default:
+    return false
+}
+```
+
+### 5. 资源管理规范
+```go
+// 确保正确释放资源
+func (m *Manager) Stop() error {
+    m.cancel() // 取消 context
+    
+    if m.cmd != nil && m.cmd.Process != nil {
+        // 尝试优雅停止
+        if err := m.cmd.Process.Signal(os.Interrupt); err != nil {
+            // 强制终止
+            m.cmd.Process.Kill()
+        }
+        m.cmd = nil
+    }
+    
+    return nil
+}
+```
+
+### 6. 超时处理规范
+```go
+// 使用 context 进行超时控制
+ctx, cancel := context.WithTimeout(m.ctx, time.Duration(m.config.WaitTimeout)*time.Second)
+defer cancel()
+
+m.cmd = exec.CommandContext(ctx, execPath, args...)
+```
+
+## Performance Considerations
+- **启动时间优化**: Steam++ 检测和启动应该异步进行
+- **内存使用**: 避免长时间持有大量数据
+- **CPU 使用**: 进程检测不应过于频繁
+- **网络影响**: 监控 Steam++ 对网络性能的影响
+
+## Security Considerations
+- **路径验证**: 严格验证可执行文件路径，防止路径遍历攻击
+- **权限控制**: 确保以适当权限运行 Steam++
+- **进程隔离**: Steam++ 失败不应影响主程序安全性
+
+## Integration Points
+- **Client 集成**: 在 `scum_run/internal/client` 中集成生命周期管理
+- **WebSocket API**: 通过 WebSocket 提供状态查询接口
+- **配置系统**: 与主配置系统集成
+- **心跳监控**: 在心跳消息中包含 Steam++ 状态
+
+## Known Limitations
+1. **手动加速启用**: 由于 Steam++ 设计限制，无法通过 API 自动启用网络加速
+2. **Windows 依赖**: 某些功能（如进程检测）依赖 Windows API
+3. **版本兼容性**: 不同版本的 Steam++ 可能有不同的安装路径和行为
+4. **网络依赖**: 需要网络连接才能正常工作
+
+## Future Enhancements
+- **远程控制**: 通过 WebSocket 远程控制 Steam++ 启停
+- **配置同步**: 自动同步 Steam++ 加速配置
+- **性能监控**: 监控网络加速效果
+- **多实例支持**: 支持管理多个 Steam++ 实例 
