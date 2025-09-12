@@ -26,33 +26,33 @@ import (
 
 // Client represents the SCUM Run client
 type Client struct {
-	config       *config.Config
-	steamDir     string
-	logger       *logger.Logger
-	wsClient     *websocket_client.Client
-	db           *database.Client
-	logMonitor   *logmonitor.Monitor
-	process      *process.Manager
-	steamTools   *steamtools.Manager
-	ctx          context.Context
-	cancel       context.CancelFunc
-	wg           sync.WaitGroup
+	config     *config.Config
+	steamDir   string
+	logger     *logger.Logger
+	wsClient   *websocket_client.Client
+	db         *database.Client
+	logMonitor *logmonitor.Monitor
+	process    *process.Manager
+	steamTools *steamtools.Manager
+	ctx        context.Context
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
 }
 
 // Message types for WebSocket communication
 const (
-	MsgTypeAuth            = "auth"
-	MsgTypeServerStart     = "server_start"
-	MsgTypeServerStop      = "server_stop"
-	MsgTypeServerRestart   = "server_restart"
-	MsgTypeServerStatus    = "server_status"
-	MsgTypeDBQuery         = "db_query"
-	MsgTypeLogUpdate       = "log_update"
-	MsgTypeHeartbeat       = "heartbeat"
+	MsgTypeAuth             = "auth"
+	MsgTypeServerStart      = "server_start"
+	MsgTypeServerStop       = "server_stop"
+	MsgTypeServerRestart    = "server_restart"
+	MsgTypeServerStatus     = "server_status"
+	MsgTypeDBQuery          = "db_query"
+	MsgTypeLogUpdate        = "log_update"
+	MsgTypeHeartbeat        = "heartbeat"
 	MsgTypeSteamToolsStatus = "steamtools_status"
-	MsgTypeConfigSync      = "config_sync"      // 配置同步
-	MsgTypeConfigUpdate    = "config_update"    // 配置更新
-	MsgTypeInstallServer   = "install_server"   // 安装服务器
+	MsgTypeConfigSync       = "config_sync"       // 配置同步
+	MsgTypeConfigUpdate     = "config_update"     // 配置更新
+	MsgTypeInstallServer    = "install_server"    // 安装服务器
 	MsgTypeDownloadSteamCmd = "download_steamcmd" // 下载SteamCmd
 )
 
@@ -145,19 +145,36 @@ func (c *Client) Start() error {
 	c.wg.Add(1)
 	go c.heartbeat()
 
-	// Initialize database connection and set WAL mode
-	c.logger.Info("Initializing SCUM database connection...")
-	if err := c.db.Initialize(); err != nil {
-		c.logger.Warn("Failed to initialize database on startup: %v", err)
-		c.logger.Info("Database will be initialized when server starts")
-	}
-
-	// Initialize log monitor
+	// Check if SCUM server is installed before initializing database and log monitor
 	steamDetector := steam.NewDetector(c.logger)
-	logsPath := steamDetector.GetSCUMLogsPath(c.steamDir)
-	c.logMonitor = logmonitor.New(logsPath, c.logger, c.onLogUpdate)
-	if err := c.logMonitor.Start(); err != nil {
-		c.logger.Warn("Failed to start log monitor: %v", err)
+	if !steamDetector.IsSCUMServerInstalled(c.steamDir) {
+		c.logger.Warn("SCUM Dedicated Server is not installed")
+		c.logger.Info("Please install SCUM Dedicated Server first, or use the web interface to install it")
+		c.logger.Info("Database and log monitoring will be initialized when server is installed")
+	} else {
+		c.logger.Info("SCUM Dedicated Server is installed, initializing components...")
+
+		// Initialize database connection and set WAL mode
+		if steamDetector.IsSCUMDatabaseAvailable(c.steamDir) {
+			c.logger.Info("Initializing SCUM database connection...")
+			if err := c.db.Initialize(); err != nil {
+				c.logger.Warn("Failed to initialize database on startup: %v", err)
+				c.logger.Info("Database will be initialized when server starts")
+			}
+		} else {
+			c.logger.Info("SCUM database not found, will be created when server starts")
+		}
+
+		// Initialize log monitor
+		if steamDetector.IsSCUMLogsDirectoryAvailable(c.steamDir) {
+			logsPath := steamDetector.GetSCUMLogsPath(c.steamDir)
+			c.logMonitor = logmonitor.New(logsPath, c.logger, c.onLogUpdate)
+			if err := c.logMonitor.Start(); err != nil {
+				c.logger.Warn("Failed to start log monitor: %v", err)
+			}
+		} else {
+			c.logger.Info("SCUM logs directory not found, will be created when server starts")
+		}
 	}
 
 	c.logger.Info("SCUM Run client started successfully")
@@ -252,11 +269,27 @@ func (c *Client) handleMessage(msg WebSocketMessage) {
 func (c *Client) handleServerStart() {
 	c.logger.Info("Starting SCUM server...")
 
+	// Check if SCUM server is installed before attempting to start
+	steamDetector := steam.NewDetector(c.logger)
+	if !steamDetector.IsSCUMServerInstalled(c.steamDir) {
+		c.sendResponse(MsgTypeServerStart, nil, "SCUM Dedicated Server is not installed. Please install it first.")
+		return
+	}
+
 	// Ensure database connection is initialized and set WAL mode before starting server
 	c.logger.Info("Ensuring SCUM database connection is ready...")
 	if err := c.db.Initialize(); err != nil {
 		c.sendResponse(MsgTypeServerStart, nil, fmt.Sprintf("Failed to initialize database: %v", err))
 		return
+	}
+
+	// Initialize log monitor if not already done
+	if c.logMonitor == nil && steamDetector.IsSCUMLogsDirectoryAvailable(c.steamDir) {
+		logsPath := steamDetector.GetSCUMLogsPath(c.steamDir)
+		c.logMonitor = logmonitor.New(logsPath, c.logger, c.onLogUpdate)
+		if err := c.logMonitor.Start(); err != nil {
+			c.logger.Warn("Failed to start log monitor: %v", err)
+		}
 	}
 
 	if err := c.process.Start(); err != nil {
@@ -530,7 +563,7 @@ func (c *Client) handleInstallServer(data interface{}) {
 // handleDownloadSteamCmd handles SteamCmd download requests
 func (c *Client) handleDownloadSteamCmd(data interface{}) {
 	c.logger.Info("Received SteamCmd download request")
-	
+
 	// 在后台执行SteamCmd下载
 	go c.performSteamCmdDownload()
 }
@@ -538,7 +571,7 @@ func (c *Client) handleDownloadSteamCmd(data interface{}) {
 // performServerInstallation performs the actual server installation
 func (c *Client) performServerInstallation(installPath, steamCmdPath string, forceReinstall bool) {
 	c.logger.Info("Starting SCUM server installation...")
-	
+
 	// 更新安装状态
 	c.sendInstallStatus("downloading", 0, "Starting installation...")
 
@@ -576,7 +609,7 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	// 执行SteamCmd安装
 	cmd := exec.Command(steamCmdPath, args...)
 	output, err := cmd.CombinedOutput()
-	
+
 	if err != nil {
 		c.logger.Error("SteamCmd installation failed: %v, output: %s", err, string(output))
 		c.sendInstallStatus("failed", 0, fmt.Sprintf("Installation failed: %v", err))

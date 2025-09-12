@@ -3,6 +3,8 @@ package database
 import (
 	"database/sql"
 	"fmt"
+	"os"
+	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
 
@@ -37,21 +39,34 @@ func (c *Client) Initialize() error {
 		c.db.Close()
 		c.db = nil
 	}
-	
+
 	c.logger.Info("Initializing database connection: %s", c.dbPath)
-	
+
+	// Check if database file exists, if not, provide helpful error message
+	if _, err := os.Stat(c.dbPath); os.IsNotExist(err) {
+		return fmt.Errorf("database file does not exist: %s. This usually means SCUM server has not been started yet or the server is not installed", c.dbPath)
+	}
+
 	// Open database connection
 	db, err := sql.Open("sqlite3", c.dbPath)
 	if err != nil {
+		// Provide more specific error messages for common issues
+		if strings.Contains(err.Error(), "CGO_ENABLED=0") {
+			return fmt.Errorf("SQLite driver requires CGO to be enabled. Please rebuild with CGO_ENABLED=1: %w", err)
+		}
 		return fmt.Errorf("failed to open database: %w", err)
 	}
-	
+
 	// Test the connection
 	if err := db.Ping(); err != nil {
 		db.Close()
+		// Provide more specific error messages
+		if strings.Contains(err.Error(), "database is locked") {
+			return fmt.Errorf("database is locked, another process may be using it: %w", err)
+		}
 		return fmt.Errorf("failed to ping database: %w", err)
 	}
-	
+
 	// Set WAL mode
 	c.logger.Info("Setting database journal mode to WAL")
 	_, err = db.Exec("PRAGMA journal_mode=WAL;")
@@ -59,7 +74,7 @@ func (c *Client) Initialize() error {
 		db.Close()
 		return fmt.Errorf("failed to set WAL mode: %w", err)
 	}
-	
+
 	// Verify WAL mode is set
 	var journalMode string
 	err = db.QueryRow("PRAGMA journal_mode;").Scan(&journalMode)
@@ -67,9 +82,9 @@ func (c *Client) Initialize() error {
 		db.Close()
 		return fmt.Errorf("failed to verify journal mode: %w", err)
 	}
-	
+
 	c.logger.Info("Database journal mode set to: %s", journalMode)
-	
+
 	c.db = db
 	return nil
 }
@@ -88,11 +103,11 @@ func (c *Client) Close() error {
 // Query executes a SQL query and returns the results
 func (c *Client) Query(query string) ([]map[string]interface{}, error) {
 	c.logger.Debug("Executing query: %s", query)
-	
+
 	// Use existing connection if available, otherwise create a temporary one
 	var db *sql.DB
 	var shouldClose bool
-	
+
 	if c.db != nil {
 		db = c.db
 	} else {
@@ -104,7 +119,7 @@ func (c *Client) Query(query string) ([]map[string]interface{}, error) {
 		}
 		shouldClose = true
 	}
-	
+
 	if shouldClose {
 		defer db.Close()
 	}
@@ -121,19 +136,19 @@ func (c *Client) Query(query string) ([]map[string]interface{}, error) {
 	}
 
 	var results []map[string]interface{}
-	
+
 	for rows.Next() {
 		values := make([]interface{}, len(columns))
 		valuePtrs := make([]interface{}, len(columns))
-		
+
 		for i := range values {
 			valuePtrs[i] = &values[i]
 		}
-		
+
 		if err := rows.Scan(valuePtrs...); err != nil {
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
-		
+
 		row := make(map[string]interface{})
 		for i, col := range columns {
 			val := values[i]
@@ -147,14 +162,14 @@ func (c *Client) Query(query string) ([]map[string]interface{}, error) {
 				row[col] = nil
 			}
 		}
-		
+
 		results = append(results, row)
 	}
-	
+
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating rows: %w", err)
 	}
-	
+
 	c.logger.Debug("Query returned %d rows", len(results))
 	return results, nil
 }
@@ -162,11 +177,11 @@ func (c *Client) Query(query string) ([]map[string]interface{}, error) {
 // Execute executes a SQL command (INSERT, UPDATE, DELETE)
 func (c *Client) Execute(query string) (int64, error) {
 	c.logger.Debug("Executing command: %s", query)
-	
+
 	// Use existing connection if available, otherwise create a temporary one
 	var db *sql.DB
 	var shouldClose bool
-	
+
 	if c.db != nil {
 		db = c.db
 	} else {
@@ -178,7 +193,7 @@ func (c *Client) Execute(query string) (int64, error) {
 		}
 		shouldClose = true
 	}
-	
+
 	if shouldClose {
 		defer db.Close()
 	}
@@ -195,4 +210,4 @@ func (c *Client) Execute(query string) (int64, error) {
 
 	c.logger.Debug("Command affected %d rows", rowsAffected)
 	return rowsAffected, nil
-} 
+}
