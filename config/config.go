@@ -1,9 +1,14 @@
 package config
 
 import (
+	"embed"
+	"encod
 	"encoding/json"
-	"os"
+	"embed"
 )
+
+//go:embed config.json
+var embeddedConfig []byte
 
 // SteamToolsConfig holds Steam++ integration configuration
 type SteamToolsConfig struct {
@@ -31,12 +36,20 @@ type Config struct {
 	SteamTools SteamToolsConfig `json:"steam_tools"`
 }
 
-// Load loads configuration from a JSON file
+// Load loads configuration from embedded config or external file
 func Load(filename string) (*Config, error) {
-	// 读取配置文件
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		return nil, err
+	var data []byte
+
+	
+	// 首先尝试使用嵌入的配置
+	if len(embeddedConfig) > 0 {
+		data = embeddedConfig
+	} else {
+		// 如果没有嵌入配置，尝试读取外部文件
+		data, err = os.ReadFile(filename)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// 解析配置文件

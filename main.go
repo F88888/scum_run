@@ -4,8 +4,6 @@ import (
 	"flag"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"strings"
 	"syscall"
 
 	"scum_run/config"
@@ -25,50 +23,8 @@ func main() {
 	// Initialize logger
 	logger := logger.New()
 
-	// Load configuration
+	// Load configuration (embedded config takes priority)
 	cfg, err := config.Load(*configFile)
-
-	// 如果默认配置文件加载失败，尝试查找同目录下的配置文件
-	if err != nil && *configFile == "config.json" {
-		logger.Info("Default config file not found, searching for packaged config...")
-
-		// 尝试查找与可执行文件同名的配置文件
-		exePath, err2 := os.Executable()
-		if err2 == nil {
-			exeDir := filepath.Dir(exePath)
-			exeName := strings.TrimSuffix(filepath.Base(exePath), filepath.Ext(exePath))
-
-			logger.Info("Executable path: %s", exePath)
-			logger.Info("Executable dir: %s", exeDir)
-			logger.Info("Executable name: %s", exeName)
-
-			// 查找可能的配置文件
-			possibleConfigs := []string{
-				filepath.Join(exeDir, exeName+"_config.json"),
-				filepath.Join(exeDir, "config.json"),
-			}
-
-			for _, configPath := range possibleConfigs {
-				logger.Info("Checking config path: %s", configPath)
-				if _, err2 := os.Stat(configPath); err2 == nil {
-					logger.Info("Found config file: %s", configPath)
-					cfg, err = config.Load(configPath)
-					if err == nil {
-						logger.Info("Successfully loaded config from: %s", configPath)
-						break
-					} else {
-						logger.Warn("Failed to load config from %s: %v", configPath, err)
-					}
-				} else {
-					logger.Info("Config file not found: %s (%v)", configPath, err2)
-				}
-			}
-		} else {
-			logger.Error("Failed to get executable path: %v", err2)
-		}
-	}
-
-	// 如果仍然无法加载配置，退出程序
 	if err != nil {
 		logger.Error("Failed to load config: %v", err)
 		os.Exit(1)

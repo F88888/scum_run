@@ -1,3 +1,6 @@
 .idea
+config.json
 test_build.exe
+config/config.json
+scum_run_debug.exe
 go_build_scum_run.exe
