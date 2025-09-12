@@ -1,0 +1,15 @@
+{
+  "log_level": "info",
+  "server_addr": "ws://jp.npc0.com:43000/api/v1/scum_run/ws",
+  "steam_dir": "C:\\SteamCMD\\steamapps\\common\\SCUM",
+  "steam_tools": {
+    "auto_accelerate": true,
+    "auto_download": true,
+    "auto_start": true,
+    "download_url": "https://github.com/BeyondDimension/SteamTools/releases/latest",
+    "enabled": true,
+    "verify_checksum": false,
+    "wait_timeout": 30
+  },
+  "token": "Vg+aATgevg25ZlABaVCE2BZ8xhTyQuQyn2eoELQjJhgEFmfeRcgMQ+fB/Ugac1UkgXjs6X0XTV9TPkNQ0jjcpPuS5PKl22t8WPTaoXsataluLsjl3b/pvR+qzzOCfWBgWKsrwKqf7YNkZMG2tWnTwz1Rtm9r/gs/nSk9OBSmESKzKKZVyTAKmc0/3c1ibzSF+ykD4bsBhz1fPaB7VH7aZPlkA1p9ORHKzr5vp//4cB9UvTYVzpjnnT4aS8npQEhJPHOIjwzURSMDOT3gSlKvR0qhqwB+4gjQtTijYsuUAWgXZtPKGFtHM3oz+Sykv4d8XhbSkmzU7D6jfOgqdDjMMA=="
+}
