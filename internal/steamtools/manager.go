@@ -20,11 +20,12 @@ import (
 
 // Manager manages Steam++ lifecycle
 type Manager struct {
-	config *config.SteamToolsConfig
-	logger *logger.Logger
-	cmd    *exec.Cmd
-	ctx    context.Context
-	cancel context.CancelFunc
+	config               *config.SteamToolsConfig
+	logger               *logger.Logger
+	cmd                  *exec.Cmd
+	ctx                  context.Context
+	cancel               context.CancelFunc
+	accelerationNotified bool // 是否已经显示过加速提示
 }
 
 // New creates a new Steam++ manager
@@ -57,7 +58,7 @@ func (m *Manager) DetectSteamTools() string {
 		filepath.Join(os.Getenv("LOCALAPPDATA"), "Steam++", "Steam++.exe"),
 		filepath.Join(os.Getenv("PROGRAMFILES"), "Steam++", "Steam++.exe"),
 		filepath.Join(os.Getenv("PROGRAMFILES(X86)"), "Steam++", "Steam++.exe"),
-		
+
 		// Steam++ 旧版本
 		filepath.Join(os.Getenv("LOCALAPPDATA"), "SteamTools", "Steam++.exe"),
 		filepath.Join(os.Getenv("PROGRAMFILES"), "SteamTools", "Steam++.exe"),
@@ -78,7 +79,7 @@ func (m *Manager) DetectSteamTools() string {
 	}
 
 	m.logger.Warn("未能自动检测到 Steam++ 安装路径")
-	
+
 	// 尝试自动下载安装
 	if m.config.AutoDownload && m.config.DownloadUrl != "" {
 		m.logger.Info("尝试自动下载并安装 Steam++...")
@@ -89,7 +90,7 @@ func (m *Manager) DetectSteamTools() string {
 			return downloadedPath
 		}
 	}
-	
+
 	return ""
 }
 
@@ -295,7 +296,7 @@ func (m *Manager) Start() error {
 
 	// Prepare command arguments
 	args := []string{}
-	
+
 	// Add minimized startup if auto start
 	if m.config.AutoStart {
 		args = append(args, "-m") // Minimized start
@@ -303,7 +304,7 @@ func (m *Manager) Start() error {
 
 	// Create command
 	m.cmd = exec.CommandContext(m.ctx, execPath, args...)
-	
+
 	// Start Steam++
 	if err := m.cmd.Start(); err != nil {
 		return fmt.Errorf("启动 Steam++ 失败: %w", err)
@@ -315,7 +316,7 @@ func (m *Manager) Start() error {
 	if m.config.AutoAccelerate {
 		m.logger.Info("等待 Steam++ 初始化完成...")
 		time.Sleep(time.Duration(m.config.WaitTimeout) * time.Second)
-		
+
 		// Enable acceleration
 		return m.enableAcceleration()
 	}
@@ -323,7 +324,7 @@ func (m *Manager) Start() error {
 	return nil
 }
 
-// Stop stops Steam++ 
+// Stop stops Steam++
 func (m *Manager) Stop() error {
 	m.logger.Info("正在停止 Steam++...")
 
@@ -358,9 +359,25 @@ func (m *Manager) enableAcceleration() error {
 	// This is a limitation of the current Steam++ design
 	// Users need to manually enable acceleration in the GUI or use automation tools
 
-	m.logger.Info("请手动在 Steam++ 界面中启用网络加速功能")
-	m.logger.Info("建议加速项目: %v", m.config.AccelerateItems)
-	
+	// 只在第一次时显示详细提示
+	if !m.accelerationNotified {
+		if len(m.config.AccelerateItems) > 0 {
+			m.logger.Info("请手动在 Steam++ 界面中启用网络加速功能")
+			m.logger.Info("建议加速项目: %v", m.config.AccelerateItems)
+			m.logger.Info("操作步骤:")
+			m.logger.Info("1. 打开 Steam++ 主界面")
+			m.logger.Info("2. 点击左侧的 '网络加速' 选项")
+			m.logger.Info("3. 选择需要加速的服务并点击 '一键加速'")
+			m.logger.Info("4. 确认加速状态显示为 '已启用'")
+		} else {
+			m.logger.Info("请手动在 Steam++ 界面中启用网络加速功能")
+			m.logger.Info("建议加速项目: Steam 商店、Steam 社区、Steam API、Github")
+		}
+		m.accelerationNotified = true
+	} else {
+		m.logger.Debug("Steam++ 网络加速需要手动启用（已提示过）")
+	}
+
 	return nil
 }
 
@@ -383,12 +400,12 @@ func (m *Manager) isSteamToolsRunning() bool {
 // GetStatus returns the current status of Steam++
 func (m *Manager) GetStatus() map[string]interface{} {
 	status := map[string]interface{}{
-		"enabled":        m.config.Enabled,
-		"running":        m.isSteamToolsRunning(),
-		"auto_start":     m.config.AutoStart,
+		"enabled":         m.config.Enabled,
+		"running":         m.isSteamToolsRunning(),
+		"auto_start":      m.config.AutoStart,
 		"auto_accelerate": m.config.AutoAccelerate,
-		"auto_download":  m.config.AutoDownload,
-		"download_url":   m.config.DownloadUrl,
+		"auto_download":   m.config.AutoDownload,
+		"download_url":    m.config.DownloadUrl,
 	}
 
 	if m.cmd != nil && m.cmd.Process != nil {
@@ -401,4 +418,4 @@ func (m *Manager) GetStatus() map[string]interface{} {
 	}
 
 	return status
-} 
+}

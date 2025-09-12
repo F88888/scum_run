@@ -96,15 +96,8 @@ func New(cfg *config.Config, steamDir string, logger *logger.Logger) *Client {
 
 // Start starts the client
 func (c *Client) Start() error {
-	// Start Steam++ first for network acceleration
-	if c.config.SteamTools.Enabled {
-		c.logger.Info("正在启动 Steam++ 网络加速...")
-		if err := c.steamTools.Start(); err != nil {
-			c.logger.Warn("Steam++ 启动失败，继续运行但可能影响 Steam 服务访问: %v", err)
-		} else {
-			c.logger.Info("Steam++ 启动成功，网络加速已启用")
-		}
-	}
+	// Note: Steam++ will be started based on server configuration after authentication
+	// This allows for dynamic Steam++ management based on server requirements
 
 	// Connect to WebSocket server
 	u, err := url.Parse(c.config.ServerAddr)
@@ -240,6 +233,10 @@ func (c *Client) handleMessage(msg WebSocketMessage) {
 	c.logger.Debug("Received message: %s", msg.Type)
 
 	switch msg.Type {
+	case MsgTypeAuth:
+		c.handleAuthResponse(msg)
+	case MsgTypeHeartbeat:
+		c.handleHeartbeatResponse(msg)
 	case MsgTypeServerStart:
 		c.handleServerStart()
 	case MsgTypeServerStop:
@@ -463,6 +460,29 @@ func (c *Client) handleConfigSync(data interface{}) {
 	c.updateServerConfig(configData)
 }
 
+// handleAuthResponse handles authentication response from server
+func (c *Client) handleAuthResponse(msg WebSocketMessage) {
+	if msg.Success {
+		c.logger.Info("Authentication successful")
+		if data, ok := msg.Data.(map[string]interface{}); ok {
+			if serverName, exists := data["server_name"]; exists {
+				c.logger.Info("Connected to server: %v", serverName)
+			}
+		}
+	} else {
+		c.logger.Error("Authentication failed: %s", msg.Error)
+	}
+}
+
+// handleHeartbeatResponse handles heartbeat response from server
+func (c *Client) handleHeartbeatResponse(msg WebSocketMessage) {
+	if msg.Success {
+		c.logger.Debug("Heartbeat acknowledged by server")
+	} else {
+		c.logger.Warn("Heartbeat failed: %s", msg.Error)
+	}
+}
+
 // handleConfigUpdate handles configuration updates from server
 func (c *Client) handleConfigUpdate(data interface{}) {
 	configData, ok := data.(map[string]interface{})
@@ -509,6 +529,19 @@ func (c *Client) updateServerConfig(configData map[string]interface{}) {
 
 	if additionalArgs, ok := configData["additional_args"].(string); ok {
 		config.AdditionalArgs = additionalArgs
+	}
+
+	// 检查是否需要启动Steam++
+	if installSteamPlus, ok := configData["install_steam_plus"].(bool); ok && installSteamPlus {
+		if !c.config.SteamTools.Enabled {
+			c.logger.Info("服务器配置要求启动 Steam++，正在启用...")
+			c.config.SteamTools.Enabled = true
+			if err := c.steamTools.Start(); err != nil {
+				c.logger.Warn("Steam++ 启动失败: %v", err)
+			} else {
+				c.logger.Info("Steam++ 已启动并配置完成")
+			}
+		}
 	}
 
 	// 更新进程管理器配置

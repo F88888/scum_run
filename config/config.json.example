@@ -3,6 +3,14 @@
   "server_addr": "ws://jp.npc0.com:43000/api/v1/scum_run/ws",
   "steam_dir": "C:\\SteamCMD\\steamapps\\common\\SCUM",
   "steam_tools": {
+    "accelerate_items": [
+      "Steam 商店",
+      "Steam 社区",
+      "Steam 图片",
+      "Steam API",
+      "Github",
+      "Discord"
+    ],
     "auto_accelerate": true,
     "auto_download": true,
     "auto_start": true,
