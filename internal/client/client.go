@@ -617,6 +617,7 @@ func (c *Client) initializeComponentsAfterInstall() {
 // performServerInstallation performs the actual server installation
 func (c *Client) performServerInstallation(installPath, steamCmdPath string, forceReinstall bool) {
 	c.logger.Info("Starting SCUM server installation...")
+	c.logger.Info("Installation parameters - installPath: %s, steamCmdPath: %s, forceReinstall: %t", installPath, steamCmdPath, forceReinstall)
 
 	// 更新安装状态
 	c.sendInstallStatus(_const.InstallStatusDownloading, 0, "Starting installation...")
@@ -625,21 +626,34 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	if steamCmdPath == "" {
 		c.logger.Info("SteamCmd path not provided, downloading...")
 		if err := c.downloadSteamCmd(); err != nil {
+			c.logger.Error("Failed to download SteamCmd: %v", err)
 			c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("Failed to download SteamCmd: %v", err))
 			return
 		}
 		steamCmdPath = _const.DefaultSteamCmdPath
+		c.logger.Info("SteamCmd downloaded, using path: %s", steamCmdPath)
 	}
 
 	// 检查SteamCmd是否存在
+	c.logger.Info("Checking if SteamCmd exists at: %s", steamCmdPath)
 	if _, err := os.Stat(steamCmdPath); os.IsNotExist(err) {
-		c.sendInstallStatus(_const.InstallStatusFailed, 0, "SteamCmd not found")
+		c.logger.Error("SteamCmd not found at path: %s, error: %v", steamCmdPath, err)
+		c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("SteamCmd not found at %s", steamCmdPath))
 		return
 	}
+	c.logger.Info("SteamCmd found at: %s", steamCmdPath)
 
 	// 设置安装路径
 	if installPath == "" {
 		installPath = _const.DefaultInstallPath
+	}
+	c.logger.Info("Using install path: %s", installPath)
+
+	// 创建安装目录
+	if err := os.MkdirAll(installPath, 0755); err != nil {
+		c.logger.Error("Failed to create install directory: %v", err)
+		c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("Failed to create install directory: %v", err))
+		return
 	}
 
 	c.sendInstallStatus(_const.InstallStatusInstalling, 25, "Installing SCUM server...")
@@ -652,9 +666,17 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 		"+exit",
 	}
 
+	c.logger.Info("Executing SteamCmd with command: %s %v", steamCmdPath, args)
+
 	// 执行SteamCmd安装
 	cmd := exec.Command(steamCmdPath, args...)
+	cmd.Dir = filepath.Dir(steamCmdPath) // 设置工作目录
 	output, err := cmd.CombinedOutput()
+
+	c.logger.Info("SteamCmd execution completed. Output length: %d bytes", len(output))
+	if len(output) > 0 {
+		c.logger.Info("SteamCmd output: %s", string(output))
+	}
 
 	if err != nil {
 		c.logger.Error("SteamCmd installation failed: %v, output: %s", err, string(output))
