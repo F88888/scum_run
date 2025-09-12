@@ -38,6 +38,10 @@ func main() {
 			exeDir := filepath.Dir(exePath)
 			exeName := strings.TrimSuffix(filepath.Base(exePath), filepath.Ext(exePath))
 
+			logger.Info("Executable path: %s", exePath)
+			logger.Info("Executable dir: %s", exeDir)
+			logger.Info("Executable name: %s", exeName)
+
 			// 查找可能的配置文件
 			possibleConfigs := []string{
 				filepath.Join(exeDir, exeName+"_config.json"),
@@ -45,14 +49,22 @@ func main() {
 			}
 
 			for _, configPath := range possibleConfigs {
+				logger.Info("Checking config path: %s", configPath)
 				if _, err2 := os.Stat(configPath); err2 == nil {
 					logger.Info("Found config file: %s", configPath)
 					cfg, err = config.Load(configPath)
 					if err == nil {
+						logger.Info("Successfully loaded config from: %s", configPath)
 						break
+					} else {
+						logger.Warn("Failed to load config from %s: %v", configPath, err)
 					}
+				} else {
+					logger.Info("Config file not found: %s (%v)", configPath, err2)
 				}
 			}
+		} else {
+			logger.Error("Failed to get executable path: %v", err2)
 		}
 	}
 
