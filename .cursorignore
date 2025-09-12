@@ -29,9 +29,6 @@ log/
 *.sqlite3
 
 # ==================== 配置文件 ====================
-config.yaml
-config.yml
-config.json
 *.conf
 *.cfg
 config.example.json
