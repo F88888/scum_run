@@ -33,41 +33,19 @@ type Config struct {
 
 // Load loads configuration from a JSON file
 func Load(filename string) (*Config, error) {
-	cfg := &Config{
-		LogLevel: "info",
-		SteamTools: SteamToolsConfig{
-			Enabled:        true,
-			AutoStart:      true,
-			AutoAccelerate: true,
-			WaitTimeout:    30,
-			AccelerateItems: []string{
-				"Steam",
-				"SteamCommunity",
-				"SteamStore",
-				"SteamCDN",
-			},
-			// 自动下载默认配置
-			AutoDownload:     true,
-			DownloadUrl:      "https://www.npc0.com/Steam++_v3.0.0-rc.16_win_x64.exe",
-			VerifyChecksum:   true,
-			ExpectedChecksum: "C3754C0913F69AD89C04292E3388A72C40967D4F7123AC3A58512FF65FFD26C0", // Steam++ v3.0.0-rc.16 的SHA256
-		},
-	}
-
+	// 读取配置文件
 	data, err := os.ReadFile(filename)
 	if err != nil {
-		if os.IsNotExist(err) {
-			// 返回默认配置，不自动创建文件
-			return cfg, nil
-		}
 		return nil, err
 	}
 
-	if err := json.Unmarshal(data, cfg); err != nil {
+	// 解析配置文件
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, err
 	}
 
-	return cfg, nil
+	return &cfg, nil
 }
 
 // Save saves configuration to a JSON file
