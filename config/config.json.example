@@ -2,6 +2,13 @@
   "log_level": "info",
   "server_addr": "ws://jp.npc0.com:43000/api/v1/scum_run/ws",
   "steam_dir": "C:\\SteamCMD\\steamapps\\common\\SCUM",
+  "auto_install": {
+    "enabled": true,
+    "install_path": "./scumserver",
+    "steamcmd_path": "./steamcmd/steamcmd.exe",
+    "force_reinstall": false,
+    "install_timeout": 600
+  },
   "steam_tools": {
     "accelerate_items": [
       "Steam 商店",

@@ -12,22 +12,14 @@ import (
 	"syscall"
 	"time"
 
+	_const "scum_run/internal/const"
 	"scum_run/internal/logger"
+	"scum_run/model"
 )
-
-// ServerConfig SCUM服务器配置
-type ServerConfig struct {
-	ExecPath       string // 可执行文件路径
-	GamePort       int    // 游戏端口
-	MaxPlayers     int    // 最大玩家数
-	EnableBattlEye bool   // 是否启用BattlEye
-	ServerIP       string // 服务器IP
-	AdditionalArgs string // 额外参数
-}
 
 // Manager manages the SCUM server process
 type Manager struct {
-	config *ServerConfig
+	config *model.ServerConfig
 	logger *logger.Logger
 	cmd    *exec.Cmd
 	mutex  sync.Mutex
@@ -36,20 +28,20 @@ type Manager struct {
 // New creates a new process manager
 func New(execPath string, logger *logger.Logger) *Manager {
 	return &Manager{
-		config: &ServerConfig{
+		config: &model.ServerConfig{
 			ExecPath:       execPath,
-			GamePort:       7779,
-			MaxPlayers:     128,
-			EnableBattlEye: false,
-			ServerIP:       "",
-			AdditionalArgs: "",
+			GamePort:       _const.DefaultGamePort,
+			MaxPlayers:     _const.DefaultMaxPlayers,
+			EnableBattlEye: _const.DefaultEnableBattlEye,
+			ServerIP:       _const.DefaultServerIP,
+			AdditionalArgs: _const.DefaultAdditionalArgs,
 		},
 		logger: logger,
 	}
 }
 
 // NewWithConfig creates a new process manager with configuration
-func NewWithConfig(config *ServerConfig, logger *logger.Logger) *Manager {
+func NewWithConfig(config *model.ServerConfig, logger *logger.Logger) *Manager {
 	return &Manager{
 		config: config,
 		logger: logger,
@@ -57,14 +49,14 @@ func NewWithConfig(config *ServerConfig, logger *logger.Logger) *Manager {
 }
 
 // UpdateConfig updates the server configuration
-func (m *Manager) UpdateConfig(config *ServerConfig) {
+func (m *Manager) UpdateConfig(config *model.ServerConfig) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 	m.config = config
 }
 
 // GetConfig returns the current server configuration
-func (m *Manager) GetConfig() *ServerConfig {
+func (m *Manager) GetConfig() *model.ServerConfig {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 	configCopy := *m.config
@@ -117,24 +109,24 @@ func (m *Manager) Start() error {
 
 	// Build command arguments
 	args := m.buildStartArgs()
-	
+
 	m.logger.Info("Starting SCUM server: %s %s", m.config.ExecPath, strings.Join(args, " "))
 
 	m.cmd = exec.Command(m.config.ExecPath, args...)
-	
+
 	// Set working directory to the directory containing the executable
 	execDir := strings.TrimSuffix(m.config.ExecPath, "SCUMServer.exe")
 	if execDir != m.config.ExecPath {
 		m.cmd.Dir = execDir
 		m.logger.Info("Setting working directory to: %s", execDir)
 	}
-	
+
 	// Set up stdout and stderr pipes for logging
 	stdout, err := m.cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
-	
+
 	stderr, err := m.cmd.StderrPipe()
 	if err != nil {
 		return fmt.Errorf("failed to create stderr pipe: %w", err)
@@ -146,7 +138,7 @@ func (m *Manager) Start() error {
 	}
 
 	m.logger.Info("SCUM server started with PID: %d", m.cmd.Process.Pid)
-	m.logger.Info("Server configuration - Port: %d, MaxPlayers: %d, BattlEye: %v", 
+	m.logger.Info("Server configuration - Port: %d, MaxPlayers: %d, BattlEye: %v",
 		m.config.GamePort, m.config.MaxPlayers, m.config.EnableBattlEye)
 
 	// Start goroutines to read stdout and stderr
@@ -211,7 +203,7 @@ func (m *Manager) Restart() error {
 		// Wait a bit for the process to fully terminate
 		time.Sleep(2 * time.Second)
 	}
-	
+
 	return m.Start()
 }
 
@@ -282,4 +274,4 @@ func (m *Manager) waitForCompletion() {
 			m.logger.Info("SCUM server (PID: %d) exited normally", pid)
 		}
 	}
-} 
+}

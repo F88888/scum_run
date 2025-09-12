@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"scum_run/config"
+	_const "scum_run/internal/const"
 	"scum_run/internal/database"
 	"scum_run/internal/logger"
 	"scum_run/internal/logmonitor"
@@ -22,6 +23,8 @@ import (
 	"scum_run/internal/steam"
 	"scum_run/internal/steamtools"
 	"scum_run/internal/websocket_client"
+	"scum_run/model"
+	"scum_run/model/request"
 )
 
 // Client represents the SCUM Run client
@@ -56,26 +59,6 @@ const (
 	MsgTypeDownloadSteamCmd = "download_steamcmd" // 下载SteamCmd
 )
 
-// WebSocketMessage represents a message sent over WebSocket
-type WebSocketMessage struct {
-	Type    string      `json:"type"`
-	Data    interface{} `json:"data,omitempty"`
-	Error   string      `json:"error,omitempty"`
-	Success bool        `json:"success"`
-}
-
-// ScumServerConfigData SCUM服务器配置数据
-type ScumServerConfigData struct {
-	InstallPath    string `json:"install_path"`
-	GamePort       int    `json:"game_port"`
-	MaxPlayers     int    `json:"max_players"`
-	EnableBattlEye bool   `json:"enable_battleye"`
-	ServerIP       string `json:"server_ip"`
-	AdditionalArgs string `json:"additional_args"`
-	SteamCmdPath   string `json:"steamcmd_path"`
-	AutoUpdate     bool   `json:"auto_update"`
-}
-
 // New creates a new SCUM Run client
 func New(cfg *config.Config, steamDir string, logger *logger.Logger) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -96,8 +79,15 @@ func New(cfg *config.Config, steamDir string, logger *logger.Logger) *Client {
 
 // Start starts the client
 func (c *Client) Start() error {
-	// Note: Steam++ will be started based on server configuration after authentication
-	// This allows for dynamic Steam++ management based on server requirements
+	// Start Steam++ first for network acceleration
+	if c.config.SteamTools.Enabled {
+		c.logger.Info("正在启动 Steam++ 网络加速...")
+		if err := c.steamTools.Start(); err != nil {
+			c.logger.Warn("Steam++ 启动失败，继续运行但可能影响 Steam 服务访问: %v", err)
+		} else {
+			c.logger.Info("Steam++ 启动成功，网络加速已启用")
+		}
+	}
 
 	// Connect to WebSocket server
 	u, err := url.Parse(c.config.ServerAddr)
@@ -111,7 +101,7 @@ func (c *Client) Start() error {
 	}
 
 	// Authenticate
-	authMsg := WebSocketMessage{
+	authMsg := request.WebSocketMessage{
 		Type: MsgTypeAuth,
 		Data: map[string]string{
 			"token": c.config.Token,
@@ -142,7 +132,14 @@ func (c *Client) Start() error {
 	steamDetector := steam.NewDetector(c.logger)
 	if !steamDetector.IsSCUMServerInstalled(c.steamDir) {
 		c.logger.Warn("SCUM Dedicated Server is not installed")
-		c.logger.Info("Please install SCUM Dedicated Server first, or use the web interface to install it")
+
+		// 检查是否启用自动安装
+		if c.config.AutoInstall.Enabled {
+			c.logger.Info("Auto-install is enabled, starting SCUM server installation...")
+			go c.performAutoInstall()
+		} else {
+			c.logger.Info("Please install SCUM Dedicated Server first, or use the web interface to install it")
+		}
 		c.logger.Info("Database and log monitoring will be initialized when server is installed")
 	} else {
 		c.logger.Info("SCUM Dedicated Server is installed, initializing components...")
@@ -216,7 +213,7 @@ func (c *Client) handleMessages() {
 		case <-c.ctx.Done():
 			return
 		default:
-			var msg WebSocketMessage
+			var msg request.WebSocketMessage
 			if err := c.wsClient.ReadMessage(&msg); err != nil {
 				c.logger.Error("Failed to read WebSocket message: %v", err)
 				time.Sleep(time.Second)
@@ -229,14 +226,10 @@ func (c *Client) handleMessages() {
 }
 
 // handleMessage handles a single WebSocket message
-func (c *Client) handleMessage(msg WebSocketMessage) {
+func (c *Client) handleMessage(msg request.WebSocketMessage) {
 	c.logger.Debug("Received message: %s", msg.Type)
 
 	switch msg.Type {
-	case MsgTypeAuth:
-		c.handleAuthResponse(msg)
-	case MsgTypeHeartbeat:
-		c.handleHeartbeatResponse(msg)
 	case MsgTypeServerStart:
 		c.handleServerStart()
 	case MsgTypeServerStop:
@@ -400,7 +393,7 @@ func (c *Client) heartbeat() {
 		case <-c.ctx.Done():
 			return
 		case <-ticker.C:
-			heartbeatMsg := WebSocketMessage{
+			heartbeatMsg := request.WebSocketMessage{
 				Type: MsgTypeHeartbeat,
 				Data: map[string]interface{}{
 					"timestamp":         time.Now().Unix(),
@@ -418,7 +411,7 @@ func (c *Client) heartbeat() {
 
 // sendResponse sends a response message to the server
 func (c *Client) sendResponse(msgType string, data interface{}, errorMsg string) {
-	response := WebSocketMessage{
+	response := request.WebSocketMessage{
 		Type:    msgType,
 		Data:    data,
 		Success: errorMsg == "",
@@ -435,7 +428,7 @@ func (c *Client) sendResponse(msgType string, data interface{}, errorMsg string)
 
 // requestConfigSync requests configuration sync from server
 func (c *Client) requestConfigSync() {
-	syncMsg := WebSocketMessage{
+	syncMsg := request.WebSocketMessage{
 		Type: MsgTypeConfigSync,
 		Data: map[string]interface{}{
 			"request_config": true,
@@ -460,29 +453,6 @@ func (c *Client) handleConfigSync(data interface{}) {
 	c.updateServerConfig(configData)
 }
 
-// handleAuthResponse handles authentication response from server
-func (c *Client) handleAuthResponse(msg WebSocketMessage) {
-	if msg.Success {
-		c.logger.Info("Authentication successful")
-		if data, ok := msg.Data.(map[string]interface{}); ok {
-			if serverName, exists := data["server_name"]; exists {
-				c.logger.Info("Connected to server: %v", serverName)
-			}
-		}
-	} else {
-		c.logger.Error("Authentication failed: %s", msg.Error)
-	}
-}
-
-// handleHeartbeatResponse handles heartbeat response from server
-func (c *Client) handleHeartbeatResponse(msg WebSocketMessage) {
-	if msg.Success {
-		c.logger.Debug("Heartbeat acknowledged by server")
-	} else {
-		c.logger.Warn("Heartbeat failed: %s", msg.Error)
-	}
-}
-
 // handleConfigUpdate handles configuration updates from server
 func (c *Client) handleConfigUpdate(data interface{}) {
 	configData, ok := data.(map[string]interface{})
@@ -497,7 +467,7 @@ func (c *Client) handleConfigUpdate(data interface{}) {
 
 // updateServerConfig updates the local server configuration
 func (c *Client) updateServerConfig(configData map[string]interface{}) {
-	config := &process.ServerConfig{}
+	config := &model.ServerConfig{}
 
 	if installPath, ok := configData["install_path"].(string); ok && installPath != "" {
 		config.ExecPath = installPath + "\\SCUM\\Binaries\\Win64\\SCUMServer.exe"
@@ -510,13 +480,13 @@ func (c *Client) updateServerConfig(configData map[string]interface{}) {
 	if gamePort, ok := configData["game_port"].(float64); ok {
 		config.GamePort = int(gamePort)
 	} else {
-		config.GamePort = 7779 // 默认端口
+		config.GamePort = _const.DefaultGamePort
 	}
 
 	if maxPlayers, ok := configData["max_players"].(float64); ok {
 		config.MaxPlayers = int(maxPlayers)
 	} else {
-		config.MaxPlayers = 128 // 默认最大玩家数
+		config.MaxPlayers = _const.DefaultMaxPlayers
 	}
 
 	if enableBattlEye, ok := configData["enable_battleye"].(bool); ok {
@@ -531,19 +501,6 @@ func (c *Client) updateServerConfig(configData map[string]interface{}) {
 		config.AdditionalArgs = additionalArgs
 	}
 
-	// 检查是否需要启动Steam++
-	if installSteamPlus, ok := configData["install_steam_plus"].(bool); ok && installSteamPlus {
-		if !c.config.SteamTools.Enabled {
-			c.logger.Info("服务器配置要求启动 Steam++，正在启用...")
-			c.config.SteamTools.Enabled = true
-			if err := c.steamTools.Start(); err != nil {
-				c.logger.Warn("Steam++ 启动失败: %v", err)
-			} else {
-				c.logger.Info("Steam++ 已启动并配置完成")
-			}
-		}
-	}
-
 	// 更新进程管理器配置
 	if c.process != nil {
 		c.process.UpdateConfig(config)
@@ -556,7 +513,7 @@ func (c *Client) updateServerConfig(configData map[string]interface{}) {
 	}
 
 	// 发送配置更新确认
-	response := WebSocketMessage{
+	response := request.WebSocketMessage{
 		Type:    MsgTypeConfigUpdate,
 		Success: true,
 		Data: map[string]interface{}{
@@ -601,41 +558,97 @@ func (c *Client) handleDownloadSteamCmd(data interface{}) {
 	go c.performSteamCmdDownload()
 }
 
+// performAutoInstall performs automatic SCUM server installation on startup
+func (c *Client) performAutoInstall() {
+	c.logger.Info("Starting automatic SCUM server installation...")
+
+	// 获取配置参数
+	installPath := c.config.AutoInstall.InstallPath
+	if installPath == "" {
+		installPath = _const.DefaultInstallPath
+	}
+
+	steamCmdPath := c.config.AutoInstall.SteamCmdPath
+	if steamCmdPath == "" {
+		steamCmdPath = _const.DefaultSteamCmdPath
+	}
+
+	forceReinstall := c.config.AutoInstall.ForceReinstall
+
+	// 执行安装
+	c.performServerInstallation(installPath, steamCmdPath, forceReinstall)
+
+	// 安装完成后，重新初始化组件
+	c.initializeComponentsAfterInstall()
+}
+
+// initializeComponentsAfterInstall initializes components after server installation
+func (c *Client) initializeComponentsAfterInstall() {
+	c.logger.Info("Initializing components after server installation...")
+
+	steamDetector := steam.NewDetector(c.logger)
+	if !steamDetector.IsSCUMServerInstalled(c.steamDir) {
+		c.logger.Error("Server installation failed, SCUM server still not found")
+		return
+	}
+
+	c.logger.Info("SCUM Dedicated Server installation verified, initializing components...")
+
+	// Initialize database connection
+	if steamDetector.IsSCUMDatabaseAvailable(c.steamDir) {
+		c.logger.Info("Initializing SCUM database connection...")
+		if err := c.db.Initialize(); err != nil {
+			c.logger.Warn("Failed to initialize database after installation: %v", err)
+		}
+	}
+
+	// Initialize log monitor
+	if steamDetector.IsSCUMLogsDirectoryAvailable(c.steamDir) {
+		logsPath := steamDetector.GetSCUMLogsPath(c.steamDir)
+		c.logMonitor = logmonitor.New(logsPath, c.logger, c.onLogUpdate)
+		if err := c.logMonitor.Start(); err != nil {
+			c.logger.Warn("Failed to start log monitor after installation: %v", err)
+		}
+	}
+
+	c.logger.Info("Components initialized successfully after installation")
+}
+
 // performServerInstallation performs the actual server installation
 func (c *Client) performServerInstallation(installPath, steamCmdPath string, forceReinstall bool) {
 	c.logger.Info("Starting SCUM server installation...")
 
 	// 更新安装状态
-	c.sendInstallStatus("downloading", 0, "Starting installation...")
+	c.sendInstallStatus(_const.InstallStatusDownloading, 0, "Starting installation...")
 
 	// 如果没有SteamCmd路径，先下载SteamCmd
 	if steamCmdPath == "" {
 		c.logger.Info("SteamCmd path not provided, downloading...")
 		if err := c.downloadSteamCmd(); err != nil {
-			c.sendInstallStatus("failed", 0, fmt.Sprintf("Failed to download SteamCmd: %v", err))
+			c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("Failed to download SteamCmd: %v", err))
 			return
 		}
-		steamCmdPath = "./steamcmd/steamcmd.exe"
+		steamCmdPath = _const.DefaultSteamCmdPath
 	}
 
 	// 检查SteamCmd是否存在
 	if _, err := os.Stat(steamCmdPath); os.IsNotExist(err) {
-		c.sendInstallStatus("failed", 0, "SteamCmd not found")
+		c.sendInstallStatus(_const.InstallStatusFailed, 0, "SteamCmd not found")
 		return
 	}
 
 	// 设置安装路径
 	if installPath == "" {
-		installPath = "./scumserver"
+		installPath = _const.DefaultInstallPath
 	}
 
-	c.sendInstallStatus("installing", 25, "Installing SCUM server...")
+	c.sendInstallStatus(_const.InstallStatusInstalling, 25, "Installing SCUM server...")
 
 	// 构建SteamCmd命令
 	args := []string{
 		"+force_install_dir", installPath,
 		"+login", "anonymous",
-		"+app_update", "3792580", "validate",
+		"+app_update", _const.SCUMServerAppID, "validate",
 		"+exit",
 	}
 
@@ -645,11 +658,11 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 
 	if err != nil {
 		c.logger.Error("SteamCmd installation failed: %v, output: %s", err, string(output))
-		c.sendInstallStatus("failed", 0, fmt.Sprintf("Installation failed: %v", err))
+		c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("Installation failed: %v", err))
 		return
 	}
 
-	c.sendInstallStatus("installed", 100, "SCUM server installation completed successfully")
+	c.sendInstallStatus(_const.InstallStatusInstalled, 100, "SCUM server installation completed successfully")
 	c.logger.Info("SCUM server installation completed successfully")
 }
 
@@ -660,15 +673,15 @@ func (c *Client) performSteamCmdDownload() {
 	} else {
 		c.sendResponse(MsgTypeDownloadSteamCmd, map[string]interface{}{
 			"downloaded": true,
-			"path":       "./steamcmd/steamcmd.exe",
+			"path":       _const.DefaultSteamCmdPath,
 		}, "")
 	}
 }
 
 // downloadSteamCmd downloads and extracts SteamCmd
 func (c *Client) downloadSteamCmd() error {
-	const steamCmdURL = "https://www.npc0.com/steamcmd.zip"
-	const steamCmdDir = "./steamcmd"
+	steamCmdURL := _const.DefaultSteamCmdURL
+	steamCmdDir := _const.DefaultSteamCmdDir
 
 	c.logger.Info("Downloading SteamCmd from %s", steamCmdURL)
 
@@ -775,7 +788,7 @@ func (c *Client) extractZip(src, dest string) error {
 
 // sendInstallStatus sends installation status to server
 func (c *Client) sendInstallStatus(status string, progress int, message string) {
-	statusMsg := WebSocketMessage{
+	statusMsg := request.WebSocketMessage{
 		Type:    MsgTypeInstallServer,
 		Success: status != "failed",
 		Data: map[string]interface{}{

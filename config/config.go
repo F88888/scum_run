@@ -26,13 +26,23 @@ type SteamToolsConfig struct {
 	ExpectedChecksum string `json:"expected_checksum,omitempty"` // 期望的文件校验和
 }
 
+// AutoInstallConfig holds auto installation configuration
+type AutoInstallConfig struct {
+	Enabled        bool   `json:"enabled"`                 // 是否启用自动安装
+	InstallPath    string `json:"install_path,omitempty"`  // SCUM 服务器安装路径
+	SteamCmdPath   string `json:"steamcmd_path,omitempty"` // SteamCmd 路径
+	ForceReinstall bool   `json:"force_reinstall"`         // 是否强制重新安装
+	InstallTimeout int    `json:"install_timeout"`         // 安装超时时间（秒）
+}
+
 // Config holds the configuration for the SCUM Run client
 type Config struct {
-	Token      string           `json:"token"`
-	ServerAddr string           `json:"server_addr"`
-	SteamDir   string           `json:"steam_dir,omitempty"`
-	LogLevel   string           `json:"log_level"`
-	SteamTools SteamToolsConfig `json:"steam_tools"`
+	Token       string            `json:"token"`
+	ServerAddr  string            `json:"server_addr"`
+	SteamDir    string            `json:"steam_dir,omitempty"`
+	LogLevel    string            `json:"log_level"`
+	SteamTools  SteamToolsConfig  `json:"steam_tools"`
+	AutoInstall AutoInstallConfig `json:"auto_install"`
 }
 
 // Load loads configuration from embedded config or external file
