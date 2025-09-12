@@ -27,16 +27,14 @@ func main() {
 
 	// Load configuration
 	cfg, err := config.Load(*configFile)
-	if err != nil {
-		logger.Error("Failed to load config: %v", err)
-		os.Exit(1)
-	}
 
-	// 如果配置文件加载失败且没有指定配置文件，尝试查找同目录下的配置文件
-	if cfg.Token == "" && *configFile == "config.json" {
+	// 如果默认配置文件加载失败，尝试查找同目录下的配置文件
+	if err != nil && *configFile == "config.json" {
+		logger.Info("Default config file not found, searching for packaged config...")
+
 		// 尝试查找与可执行文件同名的配置文件
-		exePath, err := os.Executable()
-		if err == nil {
+		exePath, err2 := os.Executable()
+		if err2 == nil {
 			exeDir := filepath.Dir(exePath)
 			exeName := strings.TrimSuffix(filepath.Base(exePath), filepath.Ext(exePath))
 
@@ -47,15 +45,21 @@ func main() {
 			}
 
 			for _, configPath := range possibleConfigs {
-				if _, err := os.Stat(configPath); err == nil {
+				if _, err2 := os.Stat(configPath); err2 == nil {
 					logger.Info("Found config file: %s", configPath)
 					cfg, err = config.Load(configPath)
-					if err == nil && cfg.Token != "" {
+					if err == nil {
 						break
 					}
 				}
 			}
 		}
+	}
+
+	// 如果仍然无法加载配置，退出程序
+	if err != nil {
+		logger.Error("Failed to load config: %v", err)
+		os.Exit(1)
 	}
 
 	// Override config with command line arguments
