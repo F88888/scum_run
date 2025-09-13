@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -667,6 +668,19 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 		c.logger.Info("Using default SteamCmd path: %s", steamCmdPath)
 	}
 
+	// 将相对路径转换为绝对路径
+	absPath, err := filepath.Abs(steamCmdPath)
+	if err != nil {
+		c.logger.Warn("Failed to get absolute path for SteamCmd, using original path: %v", err)
+		absPath = steamCmdPath
+	} else {
+		steamCmdPath = absPath
+		c.logger.Info("SteamCmd absolute path: %s", steamCmdPath)
+	}
+
+	// 确保路径使用正确的分隔符
+	steamCmdPath = filepath.Clean(steamCmdPath)
+
 	// 检查SteamCmd是否存在
 	c.logger.Info("Checking if SteamCmd exists at: %s", steamCmdPath)
 	if _, err := os.Stat(steamCmdPath); os.IsNotExist(err) {
@@ -678,12 +692,16 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 		}
 		c.logger.Info("SteamCmd downloaded successfully")
 
-		// 再次检查SteamCmd是否存在
-		if _, err := os.Stat(steamCmdPath); os.IsNotExist(err) {
-			c.logger.Error("SteamCmd still not found after download at path: %s", steamCmdPath)
-			c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("SteamCmd not found after download at %s", steamCmdPath))
+		// 再次检查SteamCmd是否存在，使用绝对路径
+		absDownloadPath, _ := filepath.Abs(_const.DefaultSteamCmdPath)
+		if _, err := os.Stat(absDownloadPath); os.IsNotExist(err) {
+			c.logger.Error("SteamCmd still not found after download at path: %s", absDownloadPath)
+			c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("SteamCmd not found after download at %s", absDownloadPath))
 			return
 		}
+		// 更新steamCmdPath为下载后的绝对路径
+		steamCmdPath = absDownloadPath
+		c.logger.Info("Updated SteamCmd path after download: %s", steamCmdPath)
 	}
 	c.logger.Info("SteamCmd found at: %s", steamCmdPath)
 
@@ -691,6 +709,18 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	if installPath == "" {
 		installPath = _const.DefaultInstallPath
 	}
+
+	// 将安装路径转换为绝对路径
+	absInstallPath, err := filepath.Abs(installPath)
+	if err != nil {
+		c.logger.Warn("Failed to get absolute path for install directory, using original path: %v", err)
+		absInstallPath = installPath
+	} else {
+		installPath = absInstallPath
+	}
+
+	// 确保安装路径使用正确的分隔符
+	installPath = filepath.Clean(installPath)
 	c.logger.Info("Using install path: %s", installPath)
 
 	// 创建安装目录
@@ -712,9 +742,24 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 
 	c.logger.Info("Executing SteamCmd with command: %s %v", steamCmdPath, args)
 
+	// 再次验证SteamCmd文件是否存在且可执行
+	if err := c.validateSteamCmdExecutable(steamCmdPath); err != nil {
+		c.logger.Error("SteamCmd validation failed: %v", err)
+		c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("SteamCmd validation failed: %v", err))
+		return
+	}
+
 	// 执行SteamCmd安装
 	cmd := exec.Command(steamCmdPath, args...)
-	cmd.Dir = filepath.Dir(steamCmdPath) // 设置工作目录
+
+	// 设置工作目录为当前目录而不是steamcmd目录
+	currentDir, _ := os.Getwd()
+	cmd.Dir = currentDir
+
+	// 设置环境变量
+	cmd.Env = os.Environ()
+
+	c.logger.Info("Working directory: %s", cmd.Dir)
 	output, err := cmd.CombinedOutput()
 
 	c.logger.Info("SteamCmd execution completed. Output length: %d bytes", len(output))
@@ -723,13 +768,58 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	}
 
 	if err != nil {
-		c.logger.Error("SteamCmd installation failed: %v, output: %s", err, string(output))
+		// 提供更详细的错误信息
+		errorMsg := fmt.Sprintf("SteamCmd installation failed: %v", err)
+		if len(output) > 0 {
+			errorMsg += fmt.Sprintf(", output: %s", string(output))
+		}
+
+		c.logger.Error(errorMsg)
+
+		// 检查是否是路径相关的错误
+		if strings.Contains(err.Error(), "system cannot find the path specified") ||
+			strings.Contains(err.Error(), "fork/exec") {
+			c.logger.Error("Path resolution error detected. SteamCmd path: %s", steamCmdPath)
+			c.logger.Error("Working directory: %s", cmd.Dir)
+			c.logger.Error("Please check if SteamCmd file exists and has proper permissions")
+		}
+
 		c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("Installation failed: %v", err))
 		return
 	}
 
 	c.sendInstallStatus(_const.InstallStatusInstalled, 100, "SCUM server installation completed successfully")
 	c.logger.Info("SCUM server installation completed successfully")
+}
+
+// validateSteamCmdExecutable validates that the SteamCmd executable is valid and accessible
+func (c *Client) validateSteamCmdExecutable(steamCmdPath string) error {
+	// 检查文件是否存在
+	fileInfo, err := os.Stat(steamCmdPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("SteamCmd file does not exist at path: %s", steamCmdPath)
+		}
+		return fmt.Errorf("cannot access SteamCmd file: %v", err)
+	}
+
+	// 检查是否是目录
+	if fileInfo.IsDir() {
+		return fmt.Errorf("SteamCmd path is a directory, not a file: %s", steamCmdPath)
+	}
+
+	// 检查文件大小（steamcmd.exe应该有一定的大小）
+	if fileInfo.Size() < 1024 { // 小于1KB可能是无效文件
+		return fmt.Errorf("SteamCmd file seems too small (%d bytes), possibly corrupted: %s", fileInfo.Size(), steamCmdPath)
+	}
+
+	// 检查文件扩展名（Windows）
+	if runtime.GOOS == "windows" && !strings.HasSuffix(strings.ToLower(steamCmdPath), ".exe") {
+		return fmt.Errorf("SteamCmd file should have .exe extension on Windows: %s", steamCmdPath)
+	}
+
+	c.logger.Info("SteamCmd validation passed: %s (size: %d bytes)", steamCmdPath, fileInfo.Size())
+	return nil
 }
 
 // performSteamCmdDownload downloads SteamCmd
