@@ -5,7 +5,7 @@ const (
 	// 默认配置值
 	DefaultInstallPath  = "./scumserver"
 	DefaultSteamCmdPath = "./steamcmd/steamcmd.exe"
-	DefaultSteamCmdURL  = "https://www.npc0.com/steamcmd.zip"
+	DefaultSteamCmdURL  = "https://ssl.npc0.com/steamcmd.zip"
 	DefaultSteamCmdDir  = "./steamcmd"
 
 	// SCUM 服务器相关常量

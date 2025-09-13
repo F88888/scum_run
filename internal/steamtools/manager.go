@@ -25,7 +25,9 @@ type Manager struct {
 	cmd                  *exec.Cmd
 	ctx                  context.Context
 	cancel               context.CancelFunc
-	accelerationNotified bool // 是否已经显示过加速提示
+	accelerationNotified bool      // 是否已经显示过加速提示
+	cachedExecutablePath string    // 缓存检测到的可执行文件路径
+	lastDetectionTime    time.Time // 上次检测时间
 }
 
 // New creates a new Steam++ manager
@@ -412,10 +414,28 @@ func (m *Manager) GetStatus() map[string]interface{} {
 		status["pid"] = m.cmd.Process.Pid
 	}
 
-	execPath := m.DetectSteamTools()
+	// 使用缓存的路径，避免重复检测
+	execPath := m.getCachedExecutablePath()
 	if execPath != "" {
 		status["executable_path"] = execPath
 	}
 
 	return status
+}
+
+// getCachedExecutablePath returns cached executable path or detects it if cache is expired
+func (m *Manager) getCachedExecutablePath() string {
+	// 如果缓存有效（5分钟内），直接返回缓存的路径
+	if m.cachedExecutablePath != "" && time.Since(m.lastDetectionTime) < 5*time.Minute {
+		return m.cachedExecutablePath
+	}
+
+	// 缓存过期或为空，重新检测
+	execPath := m.DetectSteamTools()
+	if execPath != "" {
+		m.cachedExecutablePath = execPath
+		m.lastDetectionTime = time.Now()
+	}
+
+	return execPath
 }

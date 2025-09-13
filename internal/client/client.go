@@ -40,6 +40,8 @@ type Client struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
+	installing bool       // 安装状态标志
+	installMux sync.Mutex // 安装锁
 }
 
 // Message types for WebSocket communication
@@ -250,6 +252,9 @@ func (c *Client) handleMessage(msg request.WebSocketMessage) {
 		c.handleInstallServer(msg.Data)
 	case MsgTypeDownloadSteamCmd:
 		c.handleDownloadSteamCmd(msg.Data)
+	case MsgTypeHeartbeat:
+		// Heartbeat messages from server are handled silently
+		c.logger.Debug("Received heartbeat from server")
 	default:
 		c.logger.Warn("Unknown message type: %s", msg.Type)
 	}
@@ -541,13 +546,31 @@ func (c *Client) handleInstallServer(data interface{}) {
 
 	c.logger.Info("Received server installation request")
 
+	// 检查是否已经在安装中
+	c.installMux.Lock()
+	if c.installing {
+		c.installMux.Unlock()
+		c.logger.Info("Installation already in progress, ignoring duplicate request")
+		c.sendResponse(MsgTypeInstallServer, nil, "Installation already in progress")
+		return
+	}
+	c.installing = true
+	c.installMux.Unlock()
+
 	// 获取安装参数
 	installPath, _ := installData["install_path"].(string)
 	steamCmdPath, _ := installData["steamcmd_path"].(string)
 	forceReinstall, _ := installData["force_reinstall"].(bool)
 
 	// 在后台执行安装
-	go c.performServerInstallation(installPath, steamCmdPath, forceReinstall)
+	go func() {
+		defer func() {
+			c.installMux.Lock()
+			c.installing = false
+			c.installMux.Unlock()
+		}()
+		c.performServerInstallation(installPath, steamCmdPath, forceReinstall)
+	}()
 }
 
 // handleDownloadSteamCmd handles SteamCmd download requests
@@ -561,6 +584,22 @@ func (c *Client) handleDownloadSteamCmd(data interface{}) {
 // performAutoInstall performs automatic SCUM server installation on startup
 func (c *Client) performAutoInstall() {
 	c.logger.Info("Starting automatic SCUM server installation...")
+
+	// 检查是否已经在安装中
+	c.installMux.Lock()
+	if c.installing {
+		c.installMux.Unlock()
+		c.logger.Info("Installation already in progress, skipping auto-install")
+		return
+	}
+	c.installing = true
+	c.installMux.Unlock()
+
+	defer func() {
+		c.installMux.Lock()
+		c.installing = false
+		c.installMux.Unlock()
+	}()
 
 	// 获取配置参数
 	installPath := c.config.AutoInstall.InstallPath
@@ -622,24 +661,29 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	// 更新安装状态
 	c.sendInstallStatus(_const.InstallStatusDownloading, 0, "Starting installation...")
 
-	// 如果没有SteamCmd路径，先下载SteamCmd
+	// 设置默认SteamCmd路径（如果为空）
 	if steamCmdPath == "" {
-		c.logger.Info("SteamCmd path not provided, downloading...")
-		if err := c.downloadSteamCmd(); err != nil {
-			c.logger.Error("Failed to download SteamCmd: %v", err)
-			c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("Failed to download SteamCmd: %v", err))
-			return
-		}
 		steamCmdPath = _const.DefaultSteamCmdPath
-		c.logger.Info("SteamCmd downloaded, using path: %s", steamCmdPath)
+		c.logger.Info("Using default SteamCmd path: %s", steamCmdPath)
 	}
 
 	// 检查SteamCmd是否存在
 	c.logger.Info("Checking if SteamCmd exists at: %s", steamCmdPath)
 	if _, err := os.Stat(steamCmdPath); os.IsNotExist(err) {
-		c.logger.Error("SteamCmd not found at path: %s, error: %v", steamCmdPath, err)
-		c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("SteamCmd not found at %s", steamCmdPath))
-		return
+		c.logger.Info("SteamCmd not found at path: %s, downloading...", steamCmdPath)
+		if err := c.downloadSteamCmd(); err != nil {
+			c.logger.Error("Failed to download SteamCmd: %v", err)
+			c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("Failed to download SteamCmd: %v", err))
+			return
+		}
+		c.logger.Info("SteamCmd downloaded successfully")
+
+		// 再次检查SteamCmd是否存在
+		if _, err := os.Stat(steamCmdPath); os.IsNotExist(err) {
+			c.logger.Error("SteamCmd still not found after download at path: %s", steamCmdPath)
+			c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("SteamCmd not found after download at %s", steamCmdPath))
+			return
+		}
 	}
 	c.logger.Info("SteamCmd found at: %s", steamCmdPath)
 
@@ -705,9 +749,10 @@ func (c *Client) downloadSteamCmd() error {
 	steamCmdURL := _const.DefaultSteamCmdURL
 	steamCmdDir := _const.DefaultSteamCmdDir
 
-	c.logger.Info("Downloading SteamCmd from %s", steamCmdURL)
+	c.logger.Info("Downloading SteamCmd from %s to directory %s", steamCmdURL, steamCmdDir)
 
 	// 创建目录
+	c.logger.Info("Creating directory: %s", steamCmdDir)
 	if err := os.MkdirAll(steamCmdDir, 0755); err != nil {
 		return fmt.Errorf("failed to create steamcmd directory: %w", err)
 	}
@@ -734,14 +779,23 @@ func (c *Client) downloadSteamCmd() error {
 	}
 
 	// 解压文件
+	c.logger.Info("Extracting SteamCmd from %s to %s", tempFile, steamCmdDir)
 	if err := c.extractZip(tempFile, steamCmdDir); err != nil {
 		return fmt.Errorf("failed to extract steamcmd.zip: %w", err)
 	}
 
 	// 删除临时文件
+	c.logger.Info("Cleaning up temporary file: %s", tempFile)
 	os.Remove(tempFile)
 
-	c.logger.Info("SteamCmd downloaded and extracted successfully")
+	// 验证SteamCmd是否成功解压
+	expectedPath := _const.DefaultSteamCmdPath
+	c.logger.Info("Verifying SteamCmd at expected path: %s", expectedPath)
+	if _, err := os.Stat(expectedPath); err != nil {
+		return fmt.Errorf("steamcmd.exe not found after extraction at %s: %w", expectedPath, err)
+	}
+
+	c.logger.Info("SteamCmd downloaded and extracted successfully to %s", expectedPath)
 	return nil
 }
 
