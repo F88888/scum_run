@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"scum_run/internal/logger"
 )
@@ -94,38 +95,64 @@ func (d *Detector) isValidSteamDirectory(path string) bool {
 
 // GetSCUMServerPath returns the path to the SCUM Server executable
 func (d *Detector) GetSCUMServerPath(steamDir string) string {
+	// Try direct installation path first (for SteamCmd installations)
+	directPath := filepath.Join(steamDir, "SCUM", "Binaries", "Win64", "SCUMServer.exe")
+	if _, err := os.Stat(directPath); err == nil {
+		return directPath
+	}
+
+	// Fall back to standard Steam installation path
 	return filepath.Join(steamDir, "steamapps", "common", "SCUM Dedicated Server", "SCUM", "Binaries", "Win64", "SCUMServer.exe")
 }
 
 // GetSCUMDatabasePath returns the path to the SCUM database
 func (d *Detector) GetSCUMDatabasePath(steamDir string) string {
-	return filepath.Join(steamDir, "steamapps", "common", "SCUM Dedicated Server", "SCUM", "Saved", "SaveGames", "SCUM.db")
+	// Try direct installation path first (for SteamCmd installations)
+	directPath := filepath.Join(steamDir, "SCUM", "Saved", "SaveFiles", "SCUM.db")
+	if _, err := os.Stat(filepath.Dir(directPath)); err == nil {
+		return directPath
+	}
+
+	// Fall back to standard Steam installation path
+	return filepath.Join(steamDir, "steamapps", "common", "SCUM Dedicated Server", "SCUM", "Saved", "SaveFiles", "SCUM.db")
 }
 
 // GetSCUMLogsPath returns the path to the SCUM logs directory
 func (d *Detector) GetSCUMLogsPath(steamDir string) string {
+	// Try direct installation path first (for SteamCmd installations)
+	directPath := filepath.Join(steamDir, "SCUM", "Saved", "Logs")
+	if _, err := os.Stat(directPath); err == nil {
+		return directPath
+	}
+
+	// Fall back to standard Steam installation path
 	return filepath.Join(steamDir, "steamapps", "common", "SCUM Dedicated Server", "SCUM", "Saved", "Logs")
 }
 
 // IsSCUMServerInstalled checks if SCUM Dedicated Server is installed
 func (d *Detector) IsSCUMServerInstalled(steamDir string) bool {
 	serverPath := d.GetSCUMServerPath(steamDir)
-	d.logger.Debug("Checking SCUM server installation at: %s", serverPath)
-
 	if _, err := os.Stat(serverPath); os.IsNotExist(err) {
 		d.logger.Debug("SCUM Server executable not found: %s", serverPath)
 		return false
 	}
 
-	// Check if the server directory structure exists
-	serverDir := filepath.Dir(filepath.Dir(filepath.Dir(serverPath))) // Go up to SCUM Dedicated Server directory
+	// Determine the server directory based on installation path
+	var serverDir string
+	if strings.Contains(serverPath, "steamapps") {
+		// Standard Steam installation
+		serverDir = filepath.Dir(filepath.Dir(filepath.Dir(serverPath))) // Go up to SCUM Dedicated Server directory
+	} else {
+		// Direct SteamCmd installation
+		serverDir = filepath.Dir(filepath.Dir(filepath.Dir(serverPath))) // Go up to steamDir/SCUM directory
+	}
+
 	if _, err := os.Stat(serverDir); os.IsNotExist(err) {
-		d.logger.Debug("SCUM Dedicated Server directory not found: %s", serverDir)
+		d.logger.Debug("SCUM server directory not found: %s", serverDir)
 		return false
 	}
 
 	d.logger.Debug("SCUM Dedicated Server is installed at: %s", serverDir)
-	d.logger.Debug("SCUM Server executable found at: %s", serverPath)
 	return true
 }
 
