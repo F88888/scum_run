@@ -110,6 +110,8 @@ func (d *Detector) GetSCUMLogsPath(steamDir string) string {
 // IsSCUMServerInstalled checks if SCUM Dedicated Server is installed
 func (d *Detector) IsSCUMServerInstalled(steamDir string) bool {
 	serverPath := d.GetSCUMServerPath(steamDir)
+	d.logger.Debug("Checking SCUM server installation at: %s", serverPath)
+
 	if _, err := os.Stat(serverPath); os.IsNotExist(err) {
 		d.logger.Debug("SCUM Server executable not found: %s", serverPath)
 		return false
@@ -123,6 +125,7 @@ func (d *Detector) IsSCUMServerInstalled(steamDir string) bool {
 	}
 
 	d.logger.Debug("SCUM Dedicated Server is installed at: %s", serverDir)
+	d.logger.Debug("SCUM Server executable found at: %s", serverPath)
 	return true
 }
 

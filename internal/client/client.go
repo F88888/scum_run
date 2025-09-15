@@ -598,29 +598,28 @@ func (c *Client) performAutoInstall() {
 func (c *Client) initializeComponentsAfterInstall() {
 	c.logger.Info("Initializing components after server installation...")
 
-	// 使用安装路径而不是steamDir来验证安装
-	installPath := c.config.AutoInstall.InstallPath
-	if installPath == "" {
-		installPath = _const.DefaultInstallPath
-	}
-
-	// 转换为绝对路径
-	absInstallPath, err := filepath.Abs(installPath)
-	if err != nil {
-		c.logger.Warn("Failed to get absolute path for install directory: %v", err)
-		absInstallPath = installPath
-	}
-
+	// 使用当前steamDir（已在performServerInstallation中更新）来验证安装
 	steamDetector := steam.NewDetector(c.logger)
-	if !steamDetector.IsSCUMServerInstalled(absInstallPath) {
-		c.logger.Error("Server installation failed, SCUM server still not found")
-		return
+
+	// 添加重试机制，因为文件系统可能需要一些时间来同步
+	maxRetries := 3
+	for i := 0; i < maxRetries; i++ {
+		if steamDetector.IsSCUMServerInstalled(c.steamDir) {
+			c.logger.Info("SCUM Dedicated Server installation verified on attempt %d", i+1)
+			break
+		}
+
+		if i < maxRetries-1 {
+			c.logger.Warn("Server installation verification failed on attempt %d, retrying in 2 seconds...", i+1)
+			time.Sleep(2 * time.Second)
+		} else {
+			c.logger.Error("Server installation failed, SCUM server still not found after %d attempts", maxRetries)
+			c.logger.Error("Expected path: %s", steamDetector.GetSCUMServerPath(c.steamDir))
+			return
+		}
 	}
 
 	c.logger.Info("SCUM Dedicated Server installation verified, initializing components...")
-
-	// 更新steamDir为实际安装路径
-	c.steamDir = absInstallPath
 
 	// Initialize database connection
 	if steamDetector.IsSCUMDatabaseAvailable(c.steamDir) {
@@ -628,6 +627,8 @@ func (c *Client) initializeComponentsAfterInstall() {
 		if err := c.db.Initialize(); err != nil {
 			c.logger.Warn("Failed to initialize database after installation: %v", err)
 		}
+	} else {
+		c.logger.Info("SCUM database not found, will be created when server starts")
 	}
 
 	// Initialize log monitor
@@ -637,6 +638,8 @@ func (c *Client) initializeComponentsAfterInstall() {
 		if err := c.logMonitor.Start(); err != nil {
 			c.logger.Warn("Failed to start log monitor after installation: %v", err)
 		}
+	} else {
+		c.logger.Info("SCUM logs directory not found, will be created when server starts")
 	}
 
 	c.logger.Info("Components initialized successfully after installation")
@@ -825,14 +828,26 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	}
 
 	c.logger.Info("SCUM server installation completed successfully")
+
+	// 立即更新steamDir为安装路径，确保后续检测使用正确路径
+	c.steamDir = installPath
+	c.logger.Info("Updated steamDir to installation path: %s", c.steamDir)
 }
 
 // checkServerInstallation checks if SCUM server is installed in multiple possible locations
 func (c *Client) checkServerInstallation(steamDetector *steam.Detector) bool {
+	c.logger.Debug("Checking SCUM server installation in multiple locations...")
+
 	// 首先检查配置的steamDir
-	if c.steamDir != "" && steamDetector.IsSCUMServerInstalled(c.steamDir) {
-		c.logger.Debug("SCUM server found in configured steam directory: %s", c.steamDir)
-		return true
+	if c.steamDir != "" {
+		c.logger.Debug("Checking configured steam directory: %s", c.steamDir)
+		expectedPath := steamDetector.GetSCUMServerPath(c.steamDir)
+		c.logger.Debug("Expected SCUM server path: %s", expectedPath)
+
+		if steamDetector.IsSCUMServerInstalled(c.steamDir) {
+			c.logger.Debug("SCUM server found in configured steam directory: %s", c.steamDir)
+			return true
+		}
 	}
 
 	// 检查自动安装路径
@@ -842,7 +857,16 @@ func (c *Client) checkServerInstallation(steamDetector *steam.Detector) bool {
 	}
 
 	absInstallPath, err := filepath.Abs(installPath)
-	if err == nil && steamDetector.IsSCUMServerInstalled(absInstallPath) {
+	if err != nil {
+		c.logger.Debug("Failed to get absolute path for install directory: %v", err)
+		absInstallPath = installPath
+	}
+
+	c.logger.Debug("Checking auto-install directory: %s", absInstallPath)
+	expectedPath := steamDetector.GetSCUMServerPath(absInstallPath)
+	c.logger.Debug("Expected SCUM server path: %s", expectedPath)
+
+	if steamDetector.IsSCUMServerInstalled(absInstallPath) {
 		c.logger.Debug("SCUM server found in auto-install directory: %s", absInstallPath)
 		// 更新steamDir为实际安装路径
 		c.steamDir = absInstallPath
