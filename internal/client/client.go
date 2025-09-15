@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -68,6 +69,11 @@ const (
 	MsgTypeCommandResult    = "command_result"    // 命令结果
 	MsgTypeLogData          = "log_data"          // 日志数据
 	MsgTypeClientUpdate     = "client_update"     // 客户端更新
+
+	// File management
+	MsgTypeFileBrowse    = "file_browse"    // 文件浏览
+	MsgTypeFileList      = "file_list"      // 文件列表响应
+	MsgTypeFileOperation = "file_operation" // 文件操作
 )
 
 // New creates a new SCUM Run client
@@ -112,19 +118,43 @@ func (c *Client) Start() error {
 	}
 
 	c.wsClient = websocket_client.New(u.String(), c.logger)
-	if err := c.wsClient.Connect(); err != nil {
-		return fmt.Errorf("failed to connect to WebSocket server: %w", err)
-	}
 
-	// Authenticate
-	authMsg := request.WebSocketMessage{
-		Type: MsgTypeAuth,
-		Data: map[string]string{
-			"token": c.config.Token,
+	// 设置重连回调
+	c.wsClient.SetCallbacks(
+		func() {
+			c.logger.Info("WebSocket connected, sending authentication...")
+			// 连接成功后自动发送认证
+			authMsg := request.WebSocketMessage{
+				Type: MsgTypeAuth,
+				Data: map[string]string{
+					"token": c.config.Token,
+				},
+			}
+			if err := c.wsClient.SendMessage(authMsg); err != nil {
+				c.logger.Error("Failed to send authentication: %v", err)
+			}
 		},
-	}
-	if err := c.wsClient.SendMessage(authMsg); err != nil {
-		return fmt.Errorf("failed to send authentication: %w", err)
+		func() {
+			c.logger.Warn("WebSocket disconnected")
+		},
+		func() {
+			c.logger.Info("WebSocket reconnected, re-authenticating...")
+			// 重连成功后重新发送认证
+			authMsg := request.WebSocketMessage{
+				Type: MsgTypeAuth,
+				Data: map[string]string{
+					"token": c.config.Token,
+				},
+			}
+			if err := c.wsClient.SendMessage(authMsg); err != nil {
+				c.logger.Error("Failed to send re-authentication: %v", err)
+			}
+		},
+	)
+
+	// 使用自动重连连接
+	if err := c.wsClient.ConnectWithAutoReconnect(); err != nil {
+		return fmt.Errorf("failed to connect to WebSocket server: %w", err)
 	}
 
 	// Request configuration sync after authentication
@@ -258,6 +288,10 @@ func (c *Client) handleMessage(msg request.WebSocketMessage) {
 		c.handleServerCommand(msg.Data)
 	case MsgTypeClientUpdate:
 		c.handleClientUpdate(msg.Data)
+	case MsgTypeFileBrowse:
+		c.handleFileBrowse(msg.Data)
+	case MsgTypeFileList:
+		c.handleFileList(msg.Data)
 	case MsgTypeHeartbeat:
 		// Heartbeat messages from server are handled silently
 		c.logger.Debug("Received heartbeat from server")
@@ -1479,3 +1513,158 @@ func (c *Client) checkForUpdates() (version string, downloadURL string, err erro
 }
 
 // sendInstallStatus function removed - installation no longer sends status messages
+
+// handleFileBrowse 处理文件浏览请求
+func (c *Client) handleFileBrowse(data interface{}) {
+	c.logger.Debug("Handling file browse request")
+
+	dataMap, ok := data.(map[string]interface{})
+	if !ok {
+		c.logger.Error("Invalid file browse request data")
+		c.sendResponse(MsgTypeFileList, nil, "Invalid request data")
+		return
+	}
+
+	path, _ := dataMap["path"].(string)
+	if path == "" {
+		path = "/"
+	}
+
+	// 扫描指定路径的文件和目录
+	fileList, err := c.scanDirectory(path)
+	if err != nil {
+		c.logger.Error("Failed to scan directory %s: %v", path, err)
+		c.sendResponse(MsgTypeFileList, nil, fmt.Sprintf("Failed to scan directory: %v", err))
+		return
+	}
+
+	// 发送文件列表响应
+	responseData := map[string]interface{}{
+		"current_path": path,
+		"files":        fileList,
+		"total":        len(fileList),
+	}
+
+	c.sendResponse(MsgTypeFileList, responseData, "")
+	c.logger.Debug("Sent file list for path: %s (%d items)", path, len(fileList))
+}
+
+// handleFileList 处理文件列表响应（通常不会在客户端收到）
+func (c *Client) handleFileList(data interface{}) {
+	c.logger.Debug("Received file list response (unexpected)")
+}
+
+// scanDirectory 扫描指定目录并返回文件列表
+func (c *Client) scanDirectory(path string) ([]map[string]interface{}, error) {
+	// 构建完整路径
+	var fullPath string
+	if path == "/" {
+		fullPath = c.steamDir
+	} else {
+		fullPath = filepath.Join(c.steamDir, path)
+	}
+
+	// 检查路径是否存在
+	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("path does not exist: %s", path)
+	}
+
+	// 读取目录内容
+	entries, err := os.ReadDir(fullPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read directory: %v", err)
+	}
+
+	var fileList []map[string]interface{}
+
+	for _, entry := range entries {
+		// 跳过隐藏文件（以.开头）
+		if strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+
+		entryPath := filepath.Join(fullPath, entry.Name())
+		info, err := entry.Info()
+		if err != nil {
+			c.logger.Warn("Failed to get file info for %s: %v", entry.Name(), err)
+			continue
+		}
+
+		// 构建相对路径
+		relativePath := filepath.Join(path, entry.Name())
+		if path == "/" {
+			relativePath = "/" + entry.Name()
+		}
+
+		fileInfo := map[string]interface{}{
+			"name":         entry.Name(),
+			"path":         relativePath,
+			"size":         info.Size(),
+			"type":         getFileType(info),
+			"is_directory": info.IsDir(),
+			"permissions":  getFilePermissions(info.Mode()),
+			"owner":        getFileOwner(info),
+			"created_at":   info.ModTime().Format("2006-01-02 15:04:05"),
+			"updated_at":   info.ModTime().Format("2006-01-02 15:04:05"),
+		}
+
+		fileList = append(fileList, fileInfo)
+	}
+
+	// 排序：目录在前，文件在后，按名称排序
+	sort.Slice(fileList, func(i, j int) bool {
+		iIsDir, _ := fileList[i]["is_directory"].(bool)
+		jIsDir, _ := fileList[j]["is_directory"].(bool)
+		iName, _ := fileList[i]["name"].(string)
+		jName, _ := fileList[j]["name"].(string)
+
+		if iIsDir != jIsDir {
+			return iIsDir // 目录在前
+		}
+		return iName < jName // 按名称排序
+	})
+
+	return fileList, nil
+}
+
+// getFileType 获取文件类型
+func getFileType(info os.FileInfo) string {
+	if info.IsDir() {
+		return "directory"
+	}
+
+	ext := strings.ToLower(filepath.Ext(info.Name()))
+	switch ext {
+	case ".exe":
+		return "executable"
+	case ".dll":
+		return "library"
+	case ".ini", ".cfg", ".conf":
+		return "config"
+	case ".log", ".txt":
+		return "text"
+	case ".zip", ".rar", ".7z":
+		return "archive"
+	case ".jpg", ".jpeg", ".png", ".gif", ".bmp":
+		return "image"
+	case ".mp3", ".wav", ".ogg":
+		return "audio"
+	case ".mp4", ".avi", ".mkv":
+		return "video"
+	default:
+		return "file"
+	}
+}
+
+// getFilePermissions 获取文件权限字符串
+func getFilePermissions(mode os.FileMode) string {
+	perm := mode.Perm()
+	return fmt.Sprintf("%o", perm)
+}
+
+// getFileOwner 获取文件所有者（简化版本）
+func getFileOwner(info os.FileInfo) string {
+	// 在Windows上，这个功能比较复杂，暂时返回"system"
+	// 在Linux上可以使用syscall.Getuid()等
+	return "system"
+}
