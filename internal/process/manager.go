@@ -17,13 +17,17 @@ import (
 	"scum_run/model"
 )
 
+// OutputCallback is a function type for handling real-time output
+type OutputCallback func(source string, line string)
+
 // Manager manages the SCUM server process
 type Manager struct {
-	config *model.ServerConfig
-	logger *logger.Logger
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	mutex  sync.Mutex
+	config         *model.ServerConfig
+	logger         *logger.Logger
+	cmd            *exec.Cmd
+	stdin          io.WriteCloser
+	mutex          sync.Mutex
+	outputCallback OutputCallback
 }
 
 // New creates a new process manager
@@ -47,6 +51,13 @@ func NewWithConfig(config *model.ServerConfig, logger *logger.Logger) *Manager {
 		config: config,
 		logger: logger,
 	}
+}
+
+// SetOutputCallback sets the callback function for real-time output
+func (m *Manager) SetOutputCallback(callback OutputCallback) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.outputCallback = callback
 }
 
 // UpdateConfig updates the server configuration
@@ -260,6 +271,11 @@ func (m *Manager) readOutput(pipe io.ReadCloser, source string) {
 	for scanner.Scan() {
 		line := scanner.Text()
 		m.logger.Info("[%s] %s", source, line)
+
+		// 调用回调函数发送实时输出
+		if m.outputCallback != nil {
+			m.outputCallback(source, line)
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		m.logger.Error("Error reading %s: %v", source, err)
@@ -268,25 +284,36 @@ func (m *Manager) readOutput(pipe io.ReadCloser, source string) {
 
 // SendCommand sends a command to the running SCUM server
 func (m *Manager) SendCommand(command string) error {
+	m.logger.Info("DEBUG: SendCommand called with command: %s", command)
+
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	if m.cmd == nil || m.cmd.Process == nil {
-		return fmt.Errorf("server is not running")
+	if m.cmd == nil {
+		m.logger.Error("DEBUG: cmd is nil")
+		return fmt.Errorf("server process is not initialized")
+	}
+
+	if m.cmd.Process == nil {
+		m.logger.Error("DEBUG: cmd.Process is nil")
+		return fmt.Errorf("server process is not running")
 	}
 
 	if m.stdin == nil {
+		m.logger.Error("DEBUG: stdin pipe is nil")
 		return fmt.Errorf("stdin pipe is not available")
 	}
 
-	m.logger.Info("Sending command to server: %s", command)
+	m.logger.Info("DEBUG: Sending command to server: %s", command)
 
 	// Write command to stdin with newline
 	_, err := fmt.Fprintf(m.stdin, "%s\n", command)
 	if err != nil {
+		m.logger.Error("DEBUG: Failed to write command to stdin: %v", err)
 		return fmt.Errorf("failed to send command: %w", err)
 	}
 
+	m.logger.Info("DEBUG: Command written to stdin successfully: %s", command)
 	return nil
 }
 

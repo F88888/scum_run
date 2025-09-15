@@ -74,7 +74,7 @@ func New(cfg *config.Config, steamDir string, logger *logger.Logger) *Client {
 
 	steamDetector := steam.NewDetector(logger)
 
-	return &Client{
+	client := &Client{
 		config:     cfg,
 		steamDir:   steamDir,
 		logger:     logger,
@@ -84,6 +84,11 @@ func New(cfg *config.Config, steamDir string, logger *logger.Logger) *Client {
 		process:    process.New(steamDetector.GetSCUMServerPath(steamDir), logger),
 		steamTools: steamtools.New(&cfg.SteamTools, logger),
 	}
+
+	// 设置进程输出回调函数
+	client.process.SetOutputCallback(client.handleProcessOutput)
+
+	return client
 }
 
 // Start starts the client
@@ -1226,10 +1231,11 @@ func (c *Client) extractZip(src, dest string) error {
 
 // handleServerCommand handles server command requests from web terminal
 func (c *Client) handleServerCommand(data interface{}) {
-	c.logger.Info("Received server command request")
+	c.logger.Info("DEBUG: Received server command request")
 
 	commandData, ok := data.(map[string]interface{})
 	if !ok {
+		c.logger.Error("DEBUG: Invalid command data format")
 		c.sendResponse(MsgTypeCommandResult, map[string]interface{}{
 			"success": false,
 			"output":  "Invalid command data format",
@@ -1239,6 +1245,7 @@ func (c *Client) handleServerCommand(data interface{}) {
 
 	command, ok := commandData["command"].(string)
 	if !ok || command == "" {
+		c.logger.Error("DEBUG: Command is empty or not a string")
 		c.sendResponse(MsgTypeCommandResult, map[string]interface{}{
 			"success": false,
 			"output":  "Command is required",
@@ -1246,17 +1253,19 @@ func (c *Client) handleServerCommand(data interface{}) {
 		return
 	}
 
-	c.logger.Info("Executing server command: %s", command)
+	c.logger.Info("DEBUG: Executing server command: %s", command)
 
 	// 执行服务器命令
 	output, err := c.executeServerCommand(command)
 	if err != nil {
+		c.logger.Error("DEBUG: Command execution failed: %v", err)
 		c.sendResponse(MsgTypeCommandResult, map[string]interface{}{
 			"command": command,
 			"success": false,
 			"output":  fmt.Sprintf("Command execution failed: %v", err),
 		}, "")
 	} else {
+		c.logger.Info("DEBUG: Command executed successfully: %s", command)
 		c.sendResponse(MsgTypeCommandResult, map[string]interface{}{
 			"command": command,
 			"success": true,
@@ -1267,18 +1276,28 @@ func (c *Client) handleServerCommand(data interface{}) {
 
 // executeServerCommand executes a SCUM server command
 func (c *Client) executeServerCommand(command string) (string, error) {
+	c.logger.Info("DEBUG: executeServerCommand called with command: %s", command)
+
 	// 检查服务器是否在运行
-	if c.process == nil || !c.process.IsRunning() {
+	if c.process == nil {
+		c.logger.Error("DEBUG: Process manager is nil")
+		return "", fmt.Errorf("process manager is not initialized")
+	}
+
+	if !c.process.IsRunning() {
+		c.logger.Error("DEBUG: Server is not running")
 		return "", fmt.Errorf("server is not running")
 	}
 
+	c.logger.Info("DEBUG: Server is running, sending command to process manager")
+
 	// 发送命令到SCUM服务器
 	if err := c.process.SendCommand(command); err != nil {
-		c.logger.Error("Failed to send command to server: %v", err)
+		c.logger.Error("DEBUG: Failed to send command to server: %v", err)
 		return "", fmt.Errorf("failed to send command to server: %w", err)
 	}
 
-	c.logger.Info("Successfully sent command to server: %s", command)
+	c.logger.Info("DEBUG: Successfully sent command to server: %s", command)
 
 	// 发送日志数据显示命令已执行
 	c.sendLogData(fmt.Sprintf("Command executed: %s", command))
@@ -1294,6 +1313,15 @@ func (c *Client) sendLogData(content string) {
 	}
 
 	c.sendResponse(MsgTypeLogData, logData, "")
+}
+
+// handleProcessOutput handles real-time output from SCUM server process
+func (c *Client) handleProcessOutput(source string, line string) {
+	// 格式化输出内容
+	formattedLine := fmt.Sprintf("[%s] %s", source, line)
+
+	// 发送到WebSocket终端
+	c.sendLogData(formattedLine)
 }
 
 // sendInstallStatus function removed - installation no longer sends status messages
