@@ -63,6 +63,9 @@ const (
 	MsgTypeDownloadSteamCmd = "download_steamcmd" // 下载SteamCmd
 	MsgTypeServerUpdate     = "server_update"     // 服务器更新
 	MsgTypeScheduledRestart = "scheduled_restart" // 定时重启
+	MsgTypeServerCommand    = "server_command"    // 服务器命令
+	MsgTypeCommandResult    = "command_result"    // 命令结果
+	MsgTypeLogData          = "log_data"          // 日志数据
 )
 
 // New creates a new SCUM Run client
@@ -244,6 +247,8 @@ func (c *Client) handleMessage(msg request.WebSocketMessage) {
 		c.handleServerUpdate(msg.Data)
 	case MsgTypeScheduledRestart:
 		c.handleScheduledRestart(msg.Data)
+	case MsgTypeServerCommand:
+		c.handleServerCommand(msg.Data)
 	case MsgTypeHeartbeat:
 		// Heartbeat messages from server are handled silently
 		c.logger.Debug("Received heartbeat from server")
@@ -392,6 +397,13 @@ func (c *Client) onLogUpdate(filename string, lines []string) {
 	}
 
 	c.sendResponse(MsgTypeLogUpdate, logData, "")
+
+	// 同时发送实时日志数据给Web终端
+	for _, line := range lines {
+		if strings.TrimSpace(line) != "" {
+			c.sendLogData(line)
+		}
+	}
 }
 
 // heartbeat sends periodic heartbeat messages
@@ -1210,6 +1222,78 @@ func (c *Client) extractZip(src, dest string) error {
 
 	c.logger.Info("Zip extraction completed successfully")
 	return nil
+}
+
+// handleServerCommand handles server command requests from web terminal
+func (c *Client) handleServerCommand(data interface{}) {
+	c.logger.Info("Received server command request")
+
+	commandData, ok := data.(map[string]interface{})
+	if !ok {
+		c.sendResponse(MsgTypeCommandResult, map[string]interface{}{
+			"success": false,
+			"output":  "Invalid command data format",
+		}, "Invalid command data format")
+		return
+	}
+
+	command, ok := commandData["command"].(string)
+	if !ok || command == "" {
+		c.sendResponse(MsgTypeCommandResult, map[string]interface{}{
+			"success": false,
+			"output":  "Command is required",
+		}, "Command is required")
+		return
+	}
+
+	c.logger.Info("Executing server command: %s", command)
+
+	// 执行服务器命令
+	output, err := c.executeServerCommand(command)
+	if err != nil {
+		c.sendResponse(MsgTypeCommandResult, map[string]interface{}{
+			"command": command,
+			"success": false,
+			"output":  fmt.Sprintf("Command execution failed: %v", err),
+		}, "")
+	} else {
+		c.sendResponse(MsgTypeCommandResult, map[string]interface{}{
+			"command": command,
+			"success": true,
+			"output":  output,
+		}, "")
+	}
+}
+
+// executeServerCommand executes a SCUM server command
+func (c *Client) executeServerCommand(command string) (string, error) {
+	// 检查服务器是否在运行
+	if c.process == nil || !c.process.IsRunning() {
+		return "", fmt.Errorf("server is not running")
+	}
+
+	// 发送命令到SCUM服务器
+	if err := c.process.SendCommand(command); err != nil {
+		c.logger.Error("Failed to send command to server: %v", err)
+		return "", fmt.Errorf("failed to send command to server: %w", err)
+	}
+
+	c.logger.Info("Successfully sent command to server: %s", command)
+
+	// 发送日志数据显示命令已执行
+	c.sendLogData(fmt.Sprintf("Command executed: %s", command))
+
+	return fmt.Sprintf("Command '%s' has been sent to the server", command), nil
+}
+
+// sendLogData sends real-time log data to web terminals
+func (c *Client) sendLogData(content string) {
+	logData := map[string]interface{}{
+		"content":   content,
+		"timestamp": float64(time.Now().Unix()),
+	}
+
+	c.sendResponse(MsgTypeLogData, logData, "")
 }
 
 // sendInstallStatus function removed - installation no longer sends status messages

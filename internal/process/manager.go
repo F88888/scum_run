@@ -22,6 +22,7 @@ type Manager struct {
 	config *model.ServerConfig
 	logger *logger.Logger
 	cmd    *exec.Cmd
+	stdin  io.WriteCloser
 	mutex  sync.Mutex
 }
 
@@ -118,7 +119,13 @@ func (m *Manager) Start() error {
 		m.logger.Info("Setting working directory to: %s", execDir)
 	}
 
-	// Set up stdout and stderr pipes for logging
+	// Set up stdin, stdout and stderr pipes
+	stdin, err := m.cmd.StdinPipe()
+	if err != nil {
+		return fmt.Errorf("failed to create stdin pipe: %w", err)
+	}
+	m.stdin = stdin
+
 	stdout, err := m.cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("failed to create stdout pipe: %w", err)
@@ -187,6 +194,12 @@ func (m *Manager) Stop() error {
 		<-done // Wait for the process to actually exit
 	}
 
+	// Close stdin pipe
+	if m.stdin != nil {
+		m.stdin.Close()
+		m.stdin = nil
+	}
+
 	m.cmd = nil
 	return nil
 }
@@ -253,6 +266,30 @@ func (m *Manager) readOutput(pipe io.ReadCloser, source string) {
 	}
 }
 
+// SendCommand sends a command to the running SCUM server
+func (m *Manager) SendCommand(command string) error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	if m.cmd == nil || m.cmd.Process == nil {
+		return fmt.Errorf("server is not running")
+	}
+
+	if m.stdin == nil {
+		return fmt.Errorf("stdin pipe is not available")
+	}
+
+	m.logger.Info("Sending command to server: %s", command)
+
+	// Write command to stdin with newline
+	_, err := fmt.Fprintf(m.stdin, "%s\n", command)
+	if err != nil {
+		return fmt.Errorf("failed to send command: %w", err)
+	}
+
+	return nil
+}
+
 // waitForCompletion waits for the process to complete
 func (m *Manager) waitForCompletion() {
 	if m.cmd != nil {
@@ -261,6 +298,11 @@ func (m *Manager) waitForCompletion() {
 		pid := 0
 		if m.cmd.Process != nil {
 			pid = m.cmd.Process.Pid
+		}
+		// Close stdin pipe when process completes
+		if m.stdin != nil {
+			m.stdin.Close()
+			m.stdin = nil
 		}
 		m.cmd = nil
 		m.mutex.Unlock()
