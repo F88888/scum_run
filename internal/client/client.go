@@ -250,7 +250,12 @@ func (c *Client) handleMessage(msg request.WebSocketMessage) {
 	case MsgTypeConfigUpdate:
 		c.handleConfigUpdate(msg.Data)
 	case MsgTypeInstallServer:
-		c.handleInstallServer(msg.Data)
+		// 不再处理服务器端的安装请求，客户端自动处理安装
+		c.logger.Info("Received install_server message, but client handles installation automatically")
+		c.sendResponse(MsgTypeInstallServer, map[string]interface{}{
+			"status":  "ignored",
+			"message": "Client handles installation automatically",
+		}, "")
 	case MsgTypeDownloadSteamCmd:
 		c.handleDownloadSteamCmd(msg.Data)
 	case MsgTypeHeartbeat:
@@ -537,42 +542,7 @@ func (c *Client) updateServerConfig(configData map[string]interface{}) {
 	c.wsClient.SendMessage(response)
 }
 
-// handleInstallServer handles server installation requests
-func (c *Client) handleInstallServer(data interface{}) {
-	installData, ok := data.(map[string]interface{})
-	if !ok {
-		c.sendResponse(MsgTypeInstallServer, nil, "Invalid installation data format")
-		return
-	}
-
-	c.logger.Info("Received server installation request")
-
-	// 检查是否已经在安装中
-	c.installMux.Lock()
-	if c.installing {
-		c.installMux.Unlock()
-		c.logger.Info("Installation already in progress, ignoring duplicate request")
-		c.sendResponse(MsgTypeInstallServer, nil, "Installation already in progress")
-		return
-	}
-	c.installing = true
-	c.installMux.Unlock()
-
-	// 获取安装参数
-	installPath, _ := installData["install_path"].(string)
-	steamCmdPath, _ := installData["steamcmd_path"].(string)
-	forceReinstall, _ := installData["force_reinstall"].(bool)
-
-	// 在后台执行安装
-	go func() {
-		defer func() {
-			c.installMux.Lock()
-			c.installing = false
-			c.installMux.Unlock()
-		}()
-		c.performServerInstallation(installPath, steamCmdPath, forceReinstall)
-	}()
-}
+// handleInstallServer 已移除 - 客户端自动处理安装，不再响应服务器端安装请求
 
 // handleDownloadSteamCmd handles SteamCmd download requests
 func (c *Client) handleDownloadSteamCmd(data interface{}) {
@@ -752,39 +722,90 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	// 执行SteamCmd安装
 	cmd := exec.Command(steamCmdPath, args...)
 
-	// 设置工作目录为当前目录而不是steamcmd目录
-	currentDir, _ := os.Getwd()
-	cmd.Dir = currentDir
+	// 设置工作目录为steamcmd的父目录
+	steamCmdDir := filepath.Dir(steamCmdPath)
+	cmd.Dir = steamCmdDir
 
 	// 设置环境变量
 	cmd.Env = os.Environ()
 
 	c.logger.Info("Working directory: %s", cmd.Dir)
-	output, err := cmd.CombinedOutput()
+	c.logger.Info("Full command: %s %v", steamCmdPath, args)
 
-	c.logger.Info("SteamCmd execution completed. Output length: %d bytes", len(output))
-	if len(output) > 0 {
-		c.logger.Info("SteamCmd output: %s", string(output))
+	c.sendInstallStatus(_const.InstallStatusInstalling, 50, "Executing SteamCmd installation...")
+
+	// 使用管道获取实时输出
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		c.logger.Error("Failed to create stdout pipe: %v", err)
+		c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("Failed to create stdout pipe: %v", err))
+		return
 	}
 
+	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		// 提供更详细的错误信息
-		errorMsg := fmt.Sprintf("SteamCmd installation failed: %v", err)
-		if len(output) > 0 {
-			errorMsg += fmt.Sprintf(", output: %s", string(output))
+		c.logger.Error("Failed to create stderr pipe: %v", err)
+		c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("Failed to create stderr pipe: %v", err))
+		return
+	}
+
+	// 启动命令
+	if err := cmd.Start(); err != nil {
+		c.logger.Error("Failed to start SteamCmd: %v", err)
+		c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("Failed to start SteamCmd: %v", err))
+		return
+	}
+
+	// 读取输出
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, err := stdout.Read(buf)
+			if n > 0 {
+				output := string(buf[:n])
+				c.logger.Info("SteamCmd stdout: %s", strings.TrimSpace(output))
+
+				// 检查安装进度
+				if strings.Contains(output, "Update state") && strings.Contains(output, "downloading") {
+					c.sendInstallStatus(_const.InstallStatusInstalling, 75, "Downloading SCUM server files...")
+				} else if strings.Contains(output, "Update state") && strings.Contains(output, "verifying") {
+					c.sendInstallStatus(_const.InstallStatusInstalling, 90, "Verifying SCUM server files...")
+				}
+			}
+			if err != nil {
+				break
+			}
 		}
+	}()
 
-		c.logger.Error(errorMsg)
-
-		// 检查是否是路径相关的错误
-		if strings.Contains(err.Error(), "system cannot find the path specified") ||
-			strings.Contains(err.Error(), "fork/exec") {
-			c.logger.Error("Path resolution error detected. SteamCmd path: %s", steamCmdPath)
-			c.logger.Error("Working directory: %s", cmd.Dir)
-			c.logger.Error("Please check if SteamCmd file exists and has proper permissions")
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, err := stderr.Read(buf)
+			if n > 0 {
+				output := string(buf[:n])
+				c.logger.Warn("SteamCmd stderr: %s", strings.TrimSpace(output))
+			}
+			if err != nil {
+				break
+			}
 		}
+	}()
 
+	// 等待命令完成
+	err = cmd.Wait()
+
+	if err != nil {
+		c.logger.Error("SteamCmd installation failed: %v", err)
 		c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("Installation failed: %v", err))
+		return
+	}
+
+	// 验证安装是否成功
+	scumServerExe := filepath.Join(installPath, "steamapps", "common", "SCUM Dedicated Server", "SCUM", "Binaries", "Win64", "SCUMServer.exe")
+	if _, err := os.Stat(scumServerExe); err != nil {
+		c.logger.Error("SCUM server executable not found after installation: %s", scumServerExe)
+		c.sendInstallStatus(_const.InstallStatusFailed, 95, "Installation completed but SCUM server executable not found")
 		return
 	}
 
