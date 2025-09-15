@@ -24,6 +24,7 @@ import (
 	"scum_run/internal/process"
 	"scum_run/internal/steam"
 	"scum_run/internal/steamtools"
+	"scum_run/internal/updater"
 	"scum_run/internal/websocket_client"
 	"scum_run/model"
 	"scum_run/model/request"
@@ -66,6 +67,7 @@ const (
 	MsgTypeServerCommand    = "server_command"    // 服务器命令
 	MsgTypeCommandResult    = "command_result"    // 命令结果
 	MsgTypeLogData          = "log_data"          // 日志数据
+	MsgTypeClientUpdate     = "client_update"     // 客户端更新
 )
 
 // New creates a new SCUM Run client
@@ -254,6 +256,8 @@ func (c *Client) handleMessage(msg request.WebSocketMessage) {
 		c.handleScheduledRestart(msg.Data)
 	case MsgTypeServerCommand:
 		c.handleServerCommand(msg.Data)
+	case MsgTypeClientUpdate:
+		c.handleClientUpdate(msg.Data)
 	case MsgTypeHeartbeat:
 		// Heartbeat messages from server are handled silently
 		c.logger.Debug("Received heartbeat from server")
@@ -1322,6 +1326,156 @@ func (c *Client) handleProcessOutput(source string, line string) {
 
 	// 发送到WebSocket终端
 	c.sendLogData(formattedLine)
+}
+
+// handleClientUpdate handles client update requests
+func (c *Client) handleClientUpdate(data interface{}) {
+	c.logger.Info("Received client update request")
+
+	updateData, ok := data.(map[string]interface{})
+	if !ok {
+		c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
+			"type":   "self_update",
+			"status": _const.UpdateStatusFailed,
+		}, "Invalid update request data format")
+		return
+	}
+
+	// 检查更新动作
+	action, ok := updateData["action"].(string)
+	if !ok {
+		c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
+			"type":   "self_update",
+			"status": _const.UpdateStatusFailed,
+		}, "Missing update action")
+		return
+	}
+
+	switch action {
+	case "update":
+		// 检查是否需要先停止服务器
+		stopServer, _ := updateData["stop_server"].(bool)
+		if stopServer {
+			c.logger.Info("Stopping SCUM server before client update...")
+			if c.process != nil && c.process.IsRunning() {
+				if err := c.process.Stop(); err != nil {
+					c.logger.Error("Failed to stop server before update: %v", err)
+					c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
+						"type":   "self_update",
+						"status": _const.UpdateStatusFailed,
+					}, fmt.Sprintf("Failed to stop server: %v", err))
+					return
+				}
+				c.logger.Info("Server stopped successfully, proceeding with client update")
+			}
+		}
+
+		// 启动自我更新流程
+		go c.performSelfUpdate()
+	default:
+		c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
+			"type":   "self_update",
+			"status": _const.UpdateStatusFailed,
+		}, fmt.Sprintf("Unknown update action: %s", action))
+	}
+}
+
+// performSelfUpdate performs the self-update process using external updater
+func (c *Client) performSelfUpdate() {
+	c.logger.Info("Starting self-update process...")
+
+	// 发送更新开始状态
+	c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
+		"type":   "self_update",
+		"status": _const.UpdateStatusChecking,
+	}, "Checking for updates...")
+
+	// 1. 检查更新
+	latestVersion, downloadURL, err := c.checkForUpdates()
+	if err != nil {
+		c.logger.Error("Failed to check for updates: %v", err)
+		c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
+			"type":   "self_update",
+			"status": _const.UpdateStatusFailed,
+		}, fmt.Sprintf("Failed to check for updates: %v", err))
+		return
+	}
+
+	if latestVersion == "" {
+		c.logger.Info("No updates available")
+		c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
+			"type":   "self_update",
+			"status": _const.UpdateStatusNoUpdate,
+		}, "No updates available")
+		return
+	}
+
+	c.logger.Info("New version available: %s", latestVersion)
+
+	// 2. 准备更新配置
+	currentExe, err := os.Executable()
+	if err != nil {
+		c.logger.Error("Failed to get executable path: %v", err)
+		c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
+			"type":   "self_update",
+			"status": _const.UpdateStatusFailed,
+		}, fmt.Sprintf("Failed to get executable path: %v", err))
+		return
+	}
+
+	updateConfig := updater.UpdaterConfig{
+		CurrentExePath: currentExe,
+		UpdateURL:      downloadURL,
+		Args:           os.Args[1:], // 排除程序名本身
+	}
+
+	// 3. 发送更新状态并启动外部更新器
+	c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
+		"type":   "self_update",
+		"status": _const.UpdateStatusDownloading,
+	}, fmt.Sprintf("Starting updater for version %s...", latestVersion))
+
+	// 启动外部更新器
+	if err := updater.ExecuteUpdate(updateConfig); err != nil {
+		c.logger.Error("Failed to start updater: %v", err)
+		c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
+			"type":   "self_update",
+			"status": _const.UpdateStatusFailed,
+		}, fmt.Sprintf("Failed to start updater: %v", err))
+		return
+	}
+
+	c.logger.Info("External updater started, shutting down current process...")
+
+	// 发送最终状态
+	c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
+		"type":   "self_update",
+		"status": _const.UpdateStatusInstalling,
+	}, "Updater started, shutting down for update...")
+
+	// 延迟一段时间让消息发送完成，然后退出让更新器接管
+	go func() {
+		time.Sleep(2 * time.Second)
+		c.logger.Info("Exiting for update...")
+		os.Exit(0)
+	}()
+}
+
+// checkForUpdates checks if there are any available updates
+func (c *Client) checkForUpdates() (version string, downloadURL string, err error) {
+	// 这里应该实现检查更新的逻辑
+	// 可以从GitHub API获取最新版本信息
+	// 目前返回空表示无更新可用
+
+	c.logger.Info("Checking for updates from: %s", _const.UpdateCheckURL)
+
+	// TODO: 实现实际的更新检查逻辑
+	// 1. 获取当前版本
+	// 2. 从GitHub API获取最新版本
+	// 3. 比较版本号
+	// 4. 如果有新版本，返回版本号和下载URL
+
+	return "", "", nil // 暂时返回无更新
 }
 
 // sendInstallStatus function removed - installation no longer sends status messages
