@@ -317,7 +317,7 @@ func (m *Manager) Start() error {
 	// Wait for Steam++ to initialize
 	if m.config.AutoAccelerate {
 		m.logger.Info("等待 Steam++ 初始化完成...")
-		time.Sleep(time.Duration(m.config.WaitTimeout) * time.Second)
+		time.Sleep(time.Second)
 
 		// Enable acceleration
 		return m.enableAcceleration()
