@@ -28,11 +28,12 @@ type SteamToolsConfig struct {
 
 // AutoInstallConfig holds auto installation configuration
 type AutoInstallConfig struct {
-	Enabled        bool   `json:"enabled"`                 // 是否启用自动安装
-	InstallPath    string `json:"install_path,omitempty"`  // SCUM 服务器安装路径
-	SteamCmdPath   string `json:"steamcmd_path,omitempty"` // SteamCmd 路径
-	ForceReinstall bool   `json:"force_reinstall"`         // 是否强制重新安装
-	InstallTimeout int    `json:"install_timeout"`         // 安装超时时间（秒）
+	Enabled               bool   `json:"enabled"`                  // 是否启用自动安装
+	InstallPath           string `json:"install_path,omitempty"`   // SCUM 服务器安装路径
+	SteamCmdPath          string `json:"steamcmd_path,omitempty"`  // SteamCmd 路径
+	ForceReinstall        bool   `json:"force_reinstall"`          // 是否强制重新安装
+	InstallTimeout        int    `json:"install_timeout"`          // 安装超时时间（秒）
+	AutoStartAfterInstall bool   `json:"auto_start_after_install"` // 安装完成后是否自动启动服务器
 }
 
 // Config holds the configuration for the SCUM Run client

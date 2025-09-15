@@ -13,7 +13,8 @@ const (
 	SCUMServerExecutable = "SCUMServer.exe"
 
 	// 自动安装配置
-	DefaultAutoInstall    = true
-	DefaultForceReinstall = false
-	DefaultInstallTimeout = 600 // 10分钟
+	DefaultAutoInstall           = true
+	DefaultForceReinstall        = false
+	DefaultInstallTimeout        = 600  // 10分钟
+	DefaultAutoStartAfterInstall = true // 默认安装完成后自动启动
 )

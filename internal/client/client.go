@@ -61,6 +61,8 @@ const (
 	MsgTypeConfigUpdate     = "config_update"     // 配置更新
 	MsgTypeInstallServer    = "install_server"    // 安装服务器
 	MsgTypeDownloadSteamCmd = "download_steamcmd" // 下载SteamCmd
+	MsgTypeServerUpdate     = "server_update"     // 服务器更新
+	MsgTypeScheduledRestart = "scheduled_restart" // 定时重启
 )
 
 // New creates a new SCUM Run client
@@ -134,7 +136,11 @@ func (c *Client) Start() error {
 
 	// Check if SCUM server is installed before initializing database and log monitor
 	steamDetector := steam.NewDetector(c.logger)
-	if !steamDetector.IsSCUMServerInstalled(c.steamDir) {
+
+	// 检查SCUM服务器是否已安装
+	isInstalled := c.checkServerInstallation(steamDetector)
+
+	if !isInstalled {
 		c.logger.Warn("SCUM Dedicated Server is not installed")
 
 		// 检查是否启用自动安装
@@ -147,28 +153,7 @@ func (c *Client) Start() error {
 		c.logger.Info("Database and log monitoring will be initialized when server is installed")
 	} else {
 		c.logger.Info("SCUM Dedicated Server is installed, initializing components...")
-
-		// Initialize database connection and set WAL mode
-		if steamDetector.IsSCUMDatabaseAvailable(c.steamDir) {
-			c.logger.Info("Initializing SCUM database connection...")
-			if err := c.db.Initialize(); err != nil {
-				c.logger.Warn("Failed to initialize database on startup: %v", err)
-				c.logger.Info("Database will be initialized when server starts")
-			}
-		} else {
-			c.logger.Info("SCUM database not found, will be created when server starts")
-		}
-
-		// Initialize log monitor
-		if steamDetector.IsSCUMLogsDirectoryAvailable(c.steamDir) {
-			logsPath := steamDetector.GetSCUMLogsPath(c.steamDir)
-			c.logMonitor = logmonitor.New(logsPath, c.logger, c.onLogUpdate)
-			if err := c.logMonitor.Start(); err != nil {
-				c.logger.Warn("Failed to start log monitor: %v", err)
-			}
-		} else {
-			c.logger.Info("SCUM logs directory not found, will be created when server starts")
-		}
+		c.initializeServerComponents(steamDetector)
 	}
 
 	c.logger.Info("SCUM Run client started successfully")
@@ -255,6 +240,10 @@ func (c *Client) handleMessage(msg request.WebSocketMessage) {
 		c.logger.Debug("Received install_server message (deprecated)")
 	case MsgTypeDownloadSteamCmd:
 		c.handleDownloadSteamCmd(msg.Data)
+	case MsgTypeServerUpdate:
+		c.handleServerUpdate(msg.Data)
+	case MsgTypeScheduledRestart:
+		c.handleScheduledRestart(msg.Data)
 	case MsgTypeHeartbeat:
 		// Heartbeat messages from server are handled silently
 		c.logger.Debug("Received heartbeat from server")
@@ -407,8 +396,7 @@ func (c *Client) heartbeat() {
 			heartbeatMsg := request.WebSocketMessage{
 				Type: MsgTypeHeartbeat,
 				Data: map[string]interface{}{
-					"timestamp":         time.Now().Unix(),
-					"steamtools_status": c.steamTools.GetStatus(),
+					"timestamp": time.Now().Unix(),
 				},
 				Success: true,
 			}
@@ -610,13 +598,29 @@ func (c *Client) performAutoInstall() {
 func (c *Client) initializeComponentsAfterInstall() {
 	c.logger.Info("Initializing components after server installation...")
 
+	// 使用安装路径而不是steamDir来验证安装
+	installPath := c.config.AutoInstall.InstallPath
+	if installPath == "" {
+		installPath = _const.DefaultInstallPath
+	}
+
+	// 转换为绝对路径
+	absInstallPath, err := filepath.Abs(installPath)
+	if err != nil {
+		c.logger.Warn("Failed to get absolute path for install directory: %v", err)
+		absInstallPath = installPath
+	}
+
 	steamDetector := steam.NewDetector(c.logger)
-	if !steamDetector.IsSCUMServerInstalled(c.steamDir) {
+	if !steamDetector.IsSCUMServerInstalled(absInstallPath) {
 		c.logger.Error("Server installation failed, SCUM server still not found")
 		return
 	}
 
 	c.logger.Info("SCUM Dedicated Server installation verified, initializing components...")
+
+	// 更新steamDir为实际安装路径
+	c.steamDir = absInstallPath
 
 	// Initialize database connection
 	if steamDetector.IsSCUMDatabaseAvailable(c.steamDir) {
@@ -636,6 +640,16 @@ func (c *Client) initializeComponentsAfterInstall() {
 	}
 
 	c.logger.Info("Components initialized successfully after installation")
+
+	// 检查是否需要自动启动服务器
+	if c.config.AutoInstall.AutoStartAfterInstall {
+		c.logger.Info("Auto-start is enabled, starting SCUM server after installation...")
+		go func() {
+			// 等待一段时间让组件完全初始化
+			time.Sleep(2 * time.Second)
+			c.handleServerStart()
+		}()
+	}
 }
 
 // performServerInstallation performs the actual server installation
@@ -811,6 +825,205 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	}
 
 	c.logger.Info("SCUM server installation completed successfully")
+}
+
+// checkServerInstallation checks if SCUM server is installed in multiple possible locations
+func (c *Client) checkServerInstallation(steamDetector *steam.Detector) bool {
+	// 首先检查配置的steamDir
+	if c.steamDir != "" && steamDetector.IsSCUMServerInstalled(c.steamDir) {
+		c.logger.Debug("SCUM server found in configured steam directory: %s", c.steamDir)
+		return true
+	}
+
+	// 检查自动安装路径
+	installPath := c.config.AutoInstall.InstallPath
+	if installPath == "" {
+		installPath = _const.DefaultInstallPath
+	}
+
+	absInstallPath, err := filepath.Abs(installPath)
+	if err == nil && steamDetector.IsSCUMServerInstalled(absInstallPath) {
+		c.logger.Debug("SCUM server found in auto-install directory: %s", absInstallPath)
+		// 更新steamDir为实际安装路径
+		c.steamDir = absInstallPath
+		return true
+	}
+
+	c.logger.Debug("SCUM server not found in any configured locations")
+	return false
+}
+
+// initializeServerComponents initializes database and log monitoring components
+func (c *Client) initializeServerComponents(steamDetector *steam.Detector) {
+	// Initialize database connection and set WAL mode
+	if steamDetector.IsSCUMDatabaseAvailable(c.steamDir) {
+		c.logger.Info("Initializing SCUM database connection...")
+		if err := c.db.Initialize(); err != nil {
+			c.logger.Warn("Failed to initialize database on startup: %v", err)
+			c.logger.Info("Database will be initialized when server starts")
+		}
+	} else {
+		c.logger.Info("SCUM database not found, will be created when server starts")
+	}
+
+	// Initialize log monitor
+	if steamDetector.IsSCUMLogsDirectoryAvailable(c.steamDir) {
+		logsPath := steamDetector.GetSCUMLogsPath(c.steamDir)
+		c.logMonitor = logmonitor.New(logsPath, c.logger, c.onLogUpdate)
+		if err := c.logMonitor.Start(); err != nil {
+			c.logger.Warn("Failed to start log monitor: %v", err)
+		}
+	} else {
+		c.logger.Info("SCUM logs directory not found, will be created when server starts")
+	}
+}
+
+// handleServerUpdate handles server update requests from the web interface
+func (c *Client) handleServerUpdate(data interface{}) {
+	c.logger.Info("Received server update request")
+
+	updateData, ok := data.(map[string]interface{})
+	if !ok {
+		c.sendResponse(MsgTypeServerUpdate, nil, "Invalid update request data format")
+		return
+	}
+
+	// 检查更新类型
+	updateType, ok := updateData["type"].(string)
+	if !ok {
+		c.sendResponse(MsgTypeServerUpdate, nil, "Missing update type")
+		return
+	}
+
+	switch updateType {
+	case "check":
+		c.handleServerUpdateCheck()
+	case "install":
+		c.handleServerUpdateInstall(updateData)
+	default:
+		c.sendResponse(MsgTypeServerUpdate, nil, fmt.Sprintf("Unknown update type: %s", updateType))
+	}
+}
+
+// handleServerUpdateCheck checks for server updates
+func (c *Client) handleServerUpdateCheck() {
+	c.logger.Info("Checking for SCUM server updates...")
+
+	// 这里可以实现检查更新的逻辑
+	// 比如检查Steam上的最新版本信息
+
+	c.sendResponse(MsgTypeServerUpdate, map[string]interface{}{
+		"type":    "check",
+		"status":  "completed",
+		"message": "Update check completed",
+	}, "")
+}
+
+// handleServerUpdateInstall performs server update installation
+func (c *Client) handleServerUpdateInstall(updateData map[string]interface{}) {
+	c.logger.Info("Starting SCUM server update installation...")
+
+	// 检查是否已经在安装中
+	c.installMux.Lock()
+	if c.installing {
+		c.installMux.Unlock()
+		c.sendResponse(MsgTypeServerUpdate, nil, "Update installation already in progress")
+		return
+	}
+	c.installing = true
+	c.installMux.Unlock()
+
+	defer func() {
+		c.installMux.Lock()
+		c.installing = false
+		c.installMux.Unlock()
+	}()
+
+	// 在更新前先优雅关闭SCUM服务端
+	if c.process != nil && c.process.IsRunning() {
+		c.logger.Info("Stopping SCUM server before update...")
+		if err := c.process.Stop(); err != nil {
+			c.logger.Warn("Failed to stop server before update: %v", err)
+		} else {
+			c.logger.Info("SCUM server stopped successfully before update")
+		}
+	}
+
+	// 强制重新安装以更新到最新版本
+	forceReinstall := true
+	installPath := c.config.AutoInstall.InstallPath
+	if installPath == "" {
+		installPath = _const.DefaultInstallPath
+	}
+
+	steamCmdPath := c.config.AutoInstall.SteamCmdPath
+	if steamCmdPath == "" {
+		steamCmdPath = _const.DefaultSteamCmdPath
+	}
+
+	// 执行更新安装
+	c.logger.Info("Performing server update installation (force reinstall)...")
+	go func() {
+		c.performServerInstallation(installPath, steamCmdPath, forceReinstall)
+
+		// 安装完成后重新初始化组件
+		c.initializeComponentsAfterInstall()
+
+		c.sendResponse(MsgTypeServerUpdate, map[string]interface{}{
+			"type":    "install",
+			"status":  "completed",
+			"message": "Server update installation completed",
+		}, "")
+	}()
+
+	c.sendResponse(MsgTypeServerUpdate, map[string]interface{}{
+		"type":    "install",
+		"status":  "started",
+		"message": "Server update installation started",
+	}, "")
+}
+
+// handleScheduledRestart handles scheduled restart requests
+func (c *Client) handleScheduledRestart(data interface{}) {
+	c.logger.Info("Received scheduled restart request")
+
+	restartData, ok := data.(map[string]interface{})
+	if !ok {
+		c.sendResponse(MsgTypeScheduledRestart, nil, "Invalid restart request data format")
+		return
+	}
+
+	// 获取重启原因
+	reason := "Scheduled restart"
+	if reasonStr, exists := restartData["reason"].(string); exists && reasonStr != "" {
+		reason = reasonStr
+	}
+
+	c.logger.Info("Performing scheduled restart: %s", reason)
+
+	// 检查服务器是否在运行
+	if c.process == nil || !c.process.IsRunning() {
+		c.logger.Info("Server is not running, skipping scheduled restart")
+		c.sendResponse(MsgTypeScheduledRestart, map[string]interface{}{
+			"status":  "skipped",
+			"reason":  "Server is not running",
+			"message": "Scheduled restart skipped - server is not running",
+		}, "")
+		return
+	}
+
+	// 执行重启
+	if err := c.process.Restart(); err != nil {
+		c.sendResponse(MsgTypeScheduledRestart, nil, fmt.Sprintf("Failed to restart server: %v", err))
+		return
+	}
+
+	c.sendResponse(MsgTypeScheduledRestart, map[string]interface{}{
+		"status":  "restarted",
+		"reason":  reason,
+		"pid":     c.process.GetPID(),
+		"message": "Scheduled restart completed successfully",
+	}, "")
 }
 
 // validateSteamCmdExecutable validates that the SteamCmd executable is valid and accessible

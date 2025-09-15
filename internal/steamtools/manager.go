@@ -43,6 +43,11 @@ func New(cfg *config.SteamToolsConfig, logger *logger.Logger) *Manager {
 
 // DetectSteamTools tries to detect Steam++ installation
 func (m *Manager) DetectSteamTools() string {
+	// 如果 Steam++ 被禁用，直接返回空
+	if !m.config.Enabled {
+		return ""
+	}
+
 	m.logger.Info("正在检测 Steam++ 安装路径...")
 
 	// If path is specified in config, use it
@@ -430,12 +435,15 @@ func (m *Manager) getCachedExecutablePath() string {
 		return m.cachedExecutablePath
 	}
 
+	// 如果最近检测失败过（1分钟内），不重复检测，避免频繁日志
+	if m.cachedExecutablePath == "" && time.Since(m.lastDetectionTime) < 1*time.Minute {
+		return ""
+	}
+
 	// 缓存过期或为空，重新检测
 	execPath := m.DetectSteamTools()
-	if execPath != "" {
-		m.cachedExecutablePath = execPath
-		m.lastDetectionTime = time.Now()
-	}
+	m.cachedExecutablePath = execPath // 即使为空也缓存，避免重复检测
+	m.lastDetectionTime = time.Now()
 
 	return execPath
 }
