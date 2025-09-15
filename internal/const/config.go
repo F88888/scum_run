@@ -17,4 +17,5 @@ const (
 	DefaultForceReinstall        = false
 	DefaultInstallTimeout        = 600  // 10分钟
 	DefaultAutoStartAfterInstall = true // 默认安装完成后自动启动
+	DefaultAutoStartAfterConfig  = true // 默认配置同步后自动启动
 )

@@ -511,6 +511,19 @@ func (c *Client) updateServerConfig(configData map[string]interface{}) {
 		c.logger.Info("Created new process manager with server configuration")
 	}
 
+	// 检查是否需要自动启动服务器（仅在配置同步时，而非配置更新时）
+	if c.config.AutoInstall.AutoStartAfterConfig {
+		steamDetector := steam.NewDetector(c.logger)
+		if steamDetector.IsSCUMServerInstalled(c.steamDir) && !c.process.IsRunning() {
+			c.logger.Info("Auto-start after config sync is enabled and server is installed, starting SCUM server...")
+			go func() {
+				// 等待一段时间让配置完全更新
+				time.Sleep(2 * time.Second)
+				c.handleServerStart()
+			}()
+		}
+	}
+
 	// 发送配置更新确认
 	response := request.WebSocketMessage{
 		Type:    MsgTypeConfigUpdate,

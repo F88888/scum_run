@@ -81,9 +81,6 @@ func (m *Manager) buildStartArgs() []string {
 		args = append(args, "-nobattleye")
 	}
 
-	// 默认添加日志参数
-	args = append(args, "-log")
-
 	// 添加额外参数
 	if m.config.AdditionalArgs != "" {
 		additionalArgs := strings.Fields(m.config.AdditionalArgs)

@@ -34,6 +34,7 @@ type AutoInstallConfig struct {
 	ForceReinstall        bool   `json:"force_reinstall"`          // 是否强制重新安装
 	InstallTimeout        int    `json:"install_timeout"`          // 安装超时时间（秒）
 	AutoStartAfterInstall bool   `json:"auto_start_after_install"` // 安装完成后是否自动启动服务器
+	AutoStartAfterConfig  bool   `json:"auto_start_after_config"`  // 配置同步后是否自动启动服务器
 }
 
 // Config holds the configuration for the SCUM Run client

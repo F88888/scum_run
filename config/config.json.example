@@ -8,7 +8,8 @@
     "steamcmd_path": "./steamcmd/steamcmd.exe",
     "force_reinstall": false,
     "install_timeout": 600,
-    "auto_start_after_install": true
+    "auto_start_after_install": true,
+    "auto_start_after_config": true
   },
   "steam_tools": {
     "accelerate_items": [
