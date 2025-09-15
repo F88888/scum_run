@@ -266,13 +266,6 @@ func (c *Client) handleServerStart() {
 		return
 	}
 
-	// Ensure database connection is initialized and set WAL mode before starting server
-	c.logger.Info("Ensuring SCUM database connection is ready...")
-	if err := c.db.Initialize(); err != nil {
-		c.sendResponse(MsgTypeServerStart, nil, fmt.Sprintf("Failed to initialize database: %v", err))
-		return
-	}
-
 	// Initialize log monitor if not already done
 	if c.logMonitor == nil && steamDetector.IsSCUMLogsDirectoryAvailable(c.steamDir) {
 		logsPath := steamDetector.GetSCUMLogsPath(c.steamDir)
@@ -282,10 +275,30 @@ func (c *Client) handleServerStart() {
 		}
 	}
 
+	// Start the server process first
 	if err := c.process.Start(); err != nil {
 		c.sendResponse(MsgTypeServerStart, nil, fmt.Sprintf("Failed to start server: %v", err))
 		return
 	}
+
+	// After server starts, try to initialize database connection
+	// This is done after server start because the database file is created by SCUM server
+	go func() {
+		// Wait a bit for the server to create the database file
+		time.Sleep(5 * time.Second)
+		c.logger.Info("Attempting to initialize database connection after server start...")
+
+		// Check if database is available before trying to initialize
+		if c.db.IsAvailable() {
+			if err := c.db.Initialize(); err != nil {
+				c.logger.Warn("Failed to initialize database after server start: %v", err)
+			} else {
+				c.logger.Info("Database connection initialized successfully after server start")
+			}
+		} else {
+			c.logger.Info("Database file not yet available, will retry later")
+		}
+	}()
 
 	c.sendResponse(MsgTypeServerStart, map[string]interface{}{
 		"status": "started",
@@ -868,9 +881,9 @@ func (c *Client) checkServerInstallation(steamDetector *steam.Detector) bool {
 
 // initializeServerComponents initializes database and log monitoring components
 func (c *Client) initializeServerComponents(steamDetector *steam.Detector) {
-	// Initialize database connection and set WAL mode
+	// Check if database is available and initialize if possible
 	if steamDetector.IsSCUMDatabaseAvailable(c.steamDir) {
-		c.logger.Info("Initializing SCUM database connection...")
+		c.logger.Info("SCUM database found, initializing connection...")
 		if err := c.db.Initialize(); err != nil {
 			c.logger.Warn("Failed to initialize database on startup: %v", err)
 			c.logger.Info("Database will be initialized when server starts")

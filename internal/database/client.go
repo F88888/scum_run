@@ -26,6 +26,14 @@ func New(dbPath string, logger *logger.Logger) *Client {
 	}
 }
 
+// IsAvailable checks if the database file exists and is accessible
+func (c *Client) IsAvailable() bool {
+	if _, err := os.Stat(c.dbPath); os.IsNotExist(err) {
+		return false
+	}
+	return true
+}
+
 // Initialize initializes the database connection and sets WAL mode
 func (c *Client) Initialize() error {
 	// If already initialized, just check the connection
@@ -42,8 +50,9 @@ func (c *Client) Initialize() error {
 
 	c.logger.Info("Initializing database connection: %s", c.dbPath)
 
-	// Check if database file exists, if not, provide helpful error message
+	// Check if database file exists, if not, provide helpful warning message
 	if _, err := os.Stat(c.dbPath); os.IsNotExist(err) {
+		c.logger.Warn("Database file does not exist: %s. This usually means SCUM server has not been started yet or the server is not installed", c.dbPath)
 		return fmt.Errorf("database file does not exist: %s. This usually means SCUM server has not been started yet or the server is not installed", c.dbPath)
 	}
 
