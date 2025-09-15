@@ -2,6 +2,7 @@ package client
 
 import (
 	"archive/zip"
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -250,17 +251,16 @@ func (c *Client) handleMessage(msg request.WebSocketMessage) {
 	case MsgTypeConfigUpdate:
 		c.handleConfigUpdate(msg.Data)
 	case MsgTypeInstallServer:
-		// 不再处理服务器端的安装请求，客户端自动处理安装
-		c.logger.Info("Received install_server message, but client handles installation automatically")
-		c.sendResponse(MsgTypeInstallServer, map[string]interface{}{
-			"status":  "ignored",
-			"message": "Client handles installation automatically",
-		}, "")
+		// 安装消息已移除，不再处理此消息类型
+		c.logger.Debug("Received install_server message (deprecated)")
 	case MsgTypeDownloadSteamCmd:
 		c.handleDownloadSteamCmd(msg.Data)
 	case MsgTypeHeartbeat:
 		// Heartbeat messages from server are handled silently
 		c.logger.Debug("Received heartbeat from server")
+	case MsgTypeAuth:
+		// Handle authentication response from server
+		c.handleAuthResponse(msg)
 	default:
 		c.logger.Warn("Unknown message type: %s", msg.Type)
 	}
@@ -544,6 +544,20 @@ func (c *Client) updateServerConfig(configData map[string]interface{}) {
 
 // handleInstallServer 已移除 - 客户端自动处理安装，不再响应服务器端安装请求
 
+// handleAuthResponse handles authentication response from server
+func (c *Client) handleAuthResponse(msg request.WebSocketMessage) {
+	if msg.Success {
+		c.logger.Info("Authentication successful")
+		if data, ok := msg.Data.(map[string]interface{}); ok {
+			if serverName, exists := data["server_name"]; exists {
+				c.logger.Info("Connected to server: %v", serverName)
+			}
+		}
+	} else {
+		c.logger.Error("Authentication failed: %s", msg.Error)
+	}
+}
+
 // handleDownloadSteamCmd handles SteamCmd download requests
 func (c *Client) handleDownloadSteamCmd(data interface{}) {
 	c.logger.Info("Received SteamCmd download request")
@@ -629,8 +643,7 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	c.logger.Info("Starting SCUM server installation...")
 	c.logger.Info("Installation parameters - installPath: %s, steamCmdPath: %s, forceReinstall: %t", installPath, steamCmdPath, forceReinstall)
 
-	// 更新安装状态
-	c.sendInstallStatus(_const.InstallStatusDownloading, 0, "Starting installation...")
+	// 开始安装 - 不再发送状态消息
 
 	// 设置默认SteamCmd路径（如果为空）
 	if steamCmdPath == "" {
@@ -657,7 +670,6 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 		c.logger.Info("SteamCmd not found at path: %s, downloading...", steamCmdPath)
 		if err := c.downloadSteamCmd(); err != nil {
 			c.logger.Error("Failed to download SteamCmd: %v", err)
-			c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("Failed to download SteamCmd: %v", err))
 			return
 		}
 		c.logger.Info("SteamCmd downloaded successfully")
@@ -666,7 +678,6 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 		absDownloadPath, _ := filepath.Abs(_const.DefaultSteamCmdPath)
 		if _, err := os.Stat(absDownloadPath); os.IsNotExist(err) {
 			c.logger.Error("SteamCmd still not found after download at path: %s", absDownloadPath)
-			c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("SteamCmd not found after download at %s", absDownloadPath))
 			return
 		}
 		// 更新steamCmdPath为下载后的绝对路径
@@ -696,11 +707,10 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	// 创建安装目录
 	if err := os.MkdirAll(installPath, 0755); err != nil {
 		c.logger.Error("Failed to create install directory: %v", err)
-		c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("Failed to create install directory: %v", err))
 		return
 	}
 
-	c.sendInstallStatus(_const.InstallStatusInstalling, 25, "Installing SCUM server...")
+	c.logger.Info("Installing SCUM server...")
 
 	// 构建SteamCmd命令
 	args := []string{
@@ -715,7 +725,6 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	// 再次验证SteamCmd文件是否存在且可执行
 	if err := c.validateSteamCmdExecutable(steamCmdPath); err != nil {
 		c.logger.Error("SteamCmd validation failed: %v", err)
-		c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("SteamCmd validation failed: %v", err))
 		return
 	}
 
@@ -732,63 +741,56 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	c.logger.Info("Working directory: %s", cmd.Dir)
 	c.logger.Info("Full command: %s %v", steamCmdPath, args)
 
-	c.sendInstallStatus(_const.InstallStatusInstalling, 50, "Executing SteamCmd installation...")
-
 	// 使用管道获取实时输出
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		c.logger.Error("Failed to create stdout pipe: %v", err)
-		c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("Failed to create stdout pipe: %v", err))
 		return
 	}
 
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		c.logger.Error("Failed to create stderr pipe: %v", err)
-		c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("Failed to create stderr pipe: %v", err))
 		return
 	}
 
 	// 启动命令
 	if err := cmd.Start(); err != nil {
 		c.logger.Error("Failed to start SteamCmd: %v", err)
-		c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("Failed to start SteamCmd: %v", err))
 		return
 	}
 
-	// 读取输出
+	// 读取输出 - 使用 bufio.Scanner 进行逐行读取
 	go func() {
-		buf := make([]byte, 1024)
-		for {
-			n, err := stdout.Read(buf)
-			if n > 0 {
-				output := string(buf[:n])
-				c.logger.Info("SteamCmd stdout: %s", strings.TrimSpace(output))
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			line := scanner.Text()
+			c.logger.Info("SteamCmd stdout: %s", line)
 
-				// 检查安装进度
-				if strings.Contains(output, "Update state") && strings.Contains(output, "downloading") {
-					c.sendInstallStatus(_const.InstallStatusInstalling, 75, "Downloading SCUM server files...")
-				} else if strings.Contains(output, "Update state") && strings.Contains(output, "verifying") {
-					c.sendInstallStatus(_const.InstallStatusInstalling, 90, "Verifying SCUM server files...")
-				}
+			// 检查安装进度 - 仅记录日志，不发送状态消息
+			if strings.Contains(line, "Update state") && strings.Contains(line, "downloading") {
+				c.logger.Info("SteamCmd: Downloading SCUM server files...")
+			} else if strings.Contains(line, "Update state") && strings.Contains(line, "verifying") {
+				c.logger.Info("SteamCmd: Verifying SCUM server files...")
+			} else if strings.Contains(line, "Success") {
+				c.logger.Info("SteamCmd operation completed successfully")
+			} else if strings.Contains(line, "Error") || strings.Contains(line, "Failed") {
+				c.logger.Error("SteamCmd error detected: %s", line)
 			}
-			if err != nil {
-				break
-			}
+		}
+		if err := scanner.Err(); err != nil {
+			c.logger.Error("Error reading SteamCmd stdout: %v", err)
 		}
 	}()
 
 	go func() {
-		buf := make([]byte, 1024)
-		for {
-			n, err := stderr.Read(buf)
-			if n > 0 {
-				output := string(buf[:n])
-				c.logger.Warn("SteamCmd stderr: %s", strings.TrimSpace(output))
-			}
-			if err != nil {
-				break
-			}
+		scanner := bufio.NewScanner(stderr)
+		for scanner.Scan() {
+			line := scanner.Text()
+			c.logger.Warn("SteamCmd stderr: %s", line)
+		}
+		if err := scanner.Err(); err != nil {
+			c.logger.Error("Error reading SteamCmd stderr: %v", err)
 		}
 	}()
 
@@ -797,7 +799,6 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 
 	if err != nil {
 		c.logger.Error("SteamCmd installation failed: %v", err)
-		c.sendInstallStatus(_const.InstallStatusFailed, 0, fmt.Sprintf("Installation failed: %v", err))
 		return
 	}
 
@@ -805,11 +806,10 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	scumServerExe := filepath.Join(installPath, "steamapps", "common", "SCUM Dedicated Server", "SCUM", "Binaries", "Win64", "SCUMServer.exe")
 	if _, err := os.Stat(scumServerExe); err != nil {
 		c.logger.Error("SCUM server executable not found after installation: %s", scumServerExe)
-		c.sendInstallStatus(_const.InstallStatusFailed, 95, "Installation completed but SCUM server executable not found")
+		c.logger.Error("Installation completed but SCUM server executable not found")
 		return
 	}
 
-	c.sendInstallStatus(_const.InstallStatusInstalled, 100, "SCUM server installation completed successfully")
 	c.logger.Info("SCUM server installation completed successfully")
 }
 
@@ -973,16 +973,4 @@ func (c *Client) extractZip(src, dest string) error {
 	return nil
 }
 
-// sendInstallStatus sends installation status to server
-func (c *Client) sendInstallStatus(status string, progress int, message string) {
-	statusMsg := request.WebSocketMessage{
-		Type:    MsgTypeInstallServer,
-		Success: status != "failed",
-		Data: map[string]interface{}{
-			"status":   status,
-			"progress": progress,
-			"message":  message,
-		},
-	}
-	c.wsClient.SendMessage(statusMsg)
-}
+// sendInstallStatus function removed - installation no longer sends status messages
