@@ -1815,9 +1815,8 @@ func (c *Client) sendBatchLogData(logs []string) {
 	}
 
 	logData := map[string]interface{}{
-		"content":   logContents,
-		"timestamp": float64(time.Now().Unix()),
-		"batch":     true, // 标识这是批量数据
+		"content": logContents,
+		"batch":   true, // 标识这是批量数据
 	}
 
 	c.logger.Debug("Sending batch log data: %d logs", len(logContents))
