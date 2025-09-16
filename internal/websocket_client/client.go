@@ -3,7 +3,6 @@ package websocket_client
 import (
 	"context"
 	"encoding/json"
-	_const "scum_run/internal/const"
 	"sync"
 	"time"
 
@@ -31,7 +30,11 @@ type Client struct {
 	// 心跳配置
 	heartbeatInterval time.Duration
 	heartbeatTimeout  time.Duration
-	lastHeartbeat     time.Time
+	// 连接稳定性配置
+	readBufferSize  int
+	writeBufferSize int
+	maxMessageSize  int64
+	lastHeartbeat   time.Time
 	// 回调函数
 	onConnect    func()
 	onDisconnect func()
@@ -52,7 +55,10 @@ func New(url string, logger *logger.Logger) *Client {
 		retryInterval:     5 * time.Second,
 		maxRetryInterval:  60 * time.Second,
 		heartbeatInterval: 30 * time.Second,
-		heartbeatTimeout:  60 * time.Second,
+		heartbeatTimeout:  90 * time.Second, // 增加心跳超时时间
+		readBufferSize:    128 * 1024,       // 增加读取缓冲区到128KB
+		writeBufferSize:   128 * 1024,       // 增加写入缓冲区到128KB
+		maxMessageSize:    2 * 1024 * 1024,  // 增加最大消息大小到2MB
 	}
 }
 
@@ -60,9 +66,9 @@ func New(url string, logger *logger.Logger) *Client {
 func (c *Client) Connect() error {
 	c.mutex.Lock()
 	dialer := websocket.Dialer{
-		HandshakeTimeout: 10 * time.Second,
-		ReadBufferSize:   _const.WebSocketReadBufferSize,  // 读取缓冲区
-		WriteBufferSize:  _const.WebSocketWriteBufferSize, // 写入缓冲区
+		HandshakeTimeout: 15 * time.Second,  // 增加握手超时时间
+		ReadBufferSize:   c.readBufferSize,  // 使用配置的读取缓冲区
+		WriteBufferSize:  c.writeBufferSize, // 使用配置的写入缓冲区
 	}
 
 	conn, _, err := dialer.Dial(c.url, nil)
@@ -72,15 +78,15 @@ func (c *Client) Connect() error {
 	}
 
 	// 设置连接参数
-	conn.SetReadLimit(_const.WebSocketMaxMessageSize) // 最大消息大小
-	conn.SetReadDeadline(time.Now().Add(time.Duration(_const.HeartbeatTimeout) * time.Second))
+	conn.SetReadLimit(c.maxMessageSize) // 使用配置的最大消息大小
+	conn.SetReadDeadline(time.Now().Add(c.heartbeatTimeout))
 	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(time.Duration(_const.HeartbeatTimeout) * time.Second))
+		conn.SetReadDeadline(time.Now().Add(c.heartbeatTimeout))
 		return nil
 	})
 
 	// 设置写超时，避免写操作阻塞
-	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
 
 	c.conn = conn
 	c.isRunning = true

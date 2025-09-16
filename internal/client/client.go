@@ -1729,10 +1729,10 @@ func (c *Client) addLogToBuffer(content string) {
 		content = content[:1024] + "... [truncated]"
 	}
 
-	// 检查频率限制
+	// 检查频率限制 - 放宽限制避免日志丢失
 	now := time.Now()
-	if now.Sub(c.lastLogSend) < c.logRateWindow {
-		// 如果发送频率过高，跳过这条日志
+	if now.Sub(c.lastLogSend) < c.logRateWindow && len(c.logBuffer) < _const.LogBatchSize/2 {
+		// 只有在缓冲区未满一半时才跳过日志
 		return
 	}
 
