@@ -51,14 +51,14 @@ func New(url string, logger *logger.Logger) *Client {
 		cancel:            cancel,
 		stopChan:          make(chan struct{}),
 		reconnectChan:     make(chan struct{}),
-		maxRetries:        -1, // 无限重试
-		retryInterval:     5 * time.Second,
-		maxRetryInterval:  60 * time.Second,
-		heartbeatInterval: 30 * time.Second,
-		heartbeatTimeout:  90 * time.Second, // 增加心跳超时时间
-		readBufferSize:    128 * 1024,       // 增加读取缓冲区到128KB
-		writeBufferSize:   128 * 1024,       // 增加写入缓冲区到128KB
-		maxMessageSize:    2 * 1024 * 1024,  // 增加最大消息大小到2MB
+		maxRetries:        -1,                // 无限重试
+		retryInterval:     3 * time.Second,   // 使用新的重连间隔配置
+		maxRetryInterval:  30 * time.Second,  // 使用新的最大重连间隔
+		heartbeatInterval: 30 * time.Second,  // 与服务端错开的心跳时间
+		heartbeatTimeout:  120 * time.Second, // 使用新的心跳超时配置
+		readBufferSize:    128 * 1024,        // 与服务端一致的缓冲区大小
+		writeBufferSize:   128 * 1024,        // 与服务端一致的缓冲区大小
+		maxMessageSize:    2 * 1024 * 1024,   // 与服务端一致的最大消息大小
 	}
 }
 
@@ -66,9 +66,11 @@ func New(url string, logger *logger.Logger) *Client {
 func (c *Client) Connect() error {
 	c.mutex.Lock()
 	dialer := websocket.Dialer{
-		HandshakeTimeout: 15 * time.Second,  // 增加握手超时时间
+		HandshakeTimeout: 15 * time.Second,  // 使用配置的握手超时时间
 		ReadBufferSize:   c.readBufferSize,  // 使用配置的读取缓冲区
 		WriteBufferSize:  c.writeBufferSize, // 使用配置的写入缓冲区
+		// 添加更多连接优化配置
+		EnableCompression: false, // 禁用压缩减少CPU开销
 	}
 
 	conn, _, err := dialer.Dial(c.url, nil)
@@ -85,8 +87,8 @@ func (c *Client) Connect() error {
 		return nil
 	})
 
-	// 设置写超时，避免写操作阻塞
-	conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
+	// 设置写超时，使用更长的超时时间避免连接断开
+	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 
 	c.conn = conn
 	c.isRunning = true
@@ -155,8 +157,8 @@ func (c *Client) SendMessage(message interface{}) error {
 	c.writeMutex.Lock()
 	defer c.writeMutex.Unlock()
 
-	// 设置写超时
-	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	// 设置写超时 - 使用更长的超时时间提高稳定性
+	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
 
 	c.logger.Debug("Sending message: %+v", message)
 	err := conn.WriteJSON(message)
