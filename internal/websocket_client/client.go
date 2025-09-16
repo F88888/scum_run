@@ -3,6 +3,7 @@ package websocket_client
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"sync"
 	"time"
 
@@ -61,9 +62,6 @@ func (c *Client) Connect() error {
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
-		CheckOrigin: func(r *http.Request) bool {
-			return true // Allow connections from any origin
-		},
 	}
 
 	// Set proper WebSocket headers
