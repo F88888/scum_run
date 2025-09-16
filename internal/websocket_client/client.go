@@ -79,6 +79,9 @@ func (c *Client) Connect() error {
 		return nil
 	})
 
+	// 设置写超时，避免写操作阻塞
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+
 	c.conn = conn
 	c.isRunning = true
 	c.logger.Info("Connected to WebSocket server: %s", c.url)
@@ -146,10 +149,15 @@ func (c *Client) SendMessage(message interface{}) error {
 	c.writeMutex.Lock()
 	defer c.writeMutex.Unlock()
 
+	// 设置写超时
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+
 	c.logger.Debug("Sending message: %+v", message)
 	err := conn.WriteJSON(message)
 	if err != nil {
 		c.logger.Error("Failed to send message: %v", err)
+		// 发送失败时触发重连
+		c.handleDisconnection()
 	} else {
 		c.logger.Debug("Message sent successfully")
 	}

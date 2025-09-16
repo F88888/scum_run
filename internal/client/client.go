@@ -1726,6 +1726,12 @@ func (c *Client) addLogToBuffer(content string) {
 	c.logBufferMux.Lock()
 	defer c.logBufferMux.Unlock()
 
+	// 检查消息大小限制（单条日志最大1KB）
+	if len(content) > 1024 {
+		c.logger.Warn("Log message too large, truncating: %d bytes", len(content))
+		content = content[:1024] + "... [truncated]"
+	}
+
 	// 检查频率限制
 	now := time.Now()
 	if now.Sub(c.lastLogSend) < c.logRateWindow {
@@ -1799,11 +1805,24 @@ func (c *Client) sendBatchLogData(logs []string) {
 		return
 	}
 
+	// 确保日志数据格式正确
+	var logContents []interface{}
+	for _, log := range logs {
+		if strings.TrimSpace(log) != "" {
+			logContents = append(logContents, log)
+		}
+	}
+
+	if len(logContents) == 0 {
+		return
+	}
+
 	logData := map[string]interface{}{
-		"content":   logs,
+		"content":   logContents,
 		"timestamp": float64(time.Now().Unix()),
 		"batch":     true, // 标识这是批量数据
 	}
 
+	c.logger.Debug("Sending batch log data: %d logs", len(logContents))
 	c.sendResponse(MsgTypeLogData, logData, "")
 }
