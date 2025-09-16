@@ -17,6 +17,7 @@ type Client struct {
 	conn          *websocket.Conn
 	logger        *logger.Logger
 	mutex         sync.RWMutex
+	writeMutex    sync.Mutex // 专门用于写操作的互斥锁
 	isRunning     bool
 	stopChan      chan struct{}
 	reconnectChan chan struct{}
@@ -120,16 +121,22 @@ func (c *Client) Close() error {
 
 // SendMessage sends a message via WebSocket
 func (c *Client) SendMessage(message interface{}) error {
+	// 使用读锁检查连接状态
 	c.mutex.RLock()
-	defer c.mutex.RUnlock()
-
 	if !c.isRunning || c.conn == nil {
+		c.mutex.RUnlock()
 		c.logger.Error("Cannot send message: connection not running or nil")
 		return websocket.ErrCloseSent
 	}
+	conn := c.conn
+	c.mutex.RUnlock()
+
+	// 使用专门的写锁确保同时只有一个写操作
+	c.writeMutex.Lock()
+	defer c.writeMutex.Unlock()
 
 	c.logger.Debug("Sending message: %+v", message)
-	err := c.conn.WriteJSON(message)
+	err := conn.WriteJSON(message)
 	if err != nil {
 		c.logger.Error("Failed to send message: %v", err)
 	} else {

@@ -174,9 +174,7 @@ func (c *Client) Start() error {
 	c.wg.Add(1)
 	go c.handleMessages()
 
-	// Start heartbeat
-	c.wg.Add(1)
-	go c.heartbeat()
+	// WebSocket client handles heartbeat automatically
 
 	// Check if SCUM server is installed before initializing database and log monitor
 	steamDetector := steam.NewDetector(c.logger)
@@ -452,33 +450,6 @@ func (c *Client) onLogUpdate(filename string, lines []string) {
 	for _, line := range lines {
 		if strings.TrimSpace(line) != "" {
 			c.sendLogData(line)
-		}
-	}
-}
-
-// heartbeat sends periodic heartbeat messages
-func (c *Client) heartbeat() {
-	defer c.wg.Done()
-
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		case <-ticker.C:
-			heartbeatMsg := request.WebSocketMessage{
-				Type: MsgTypeHeartbeat,
-				Data: map[string]interface{}{
-					"timestamp": time.Now().Unix(),
-				},
-				Success: true,
-			}
-
-			if err := c.wsClient.SendMessage(heartbeatMsg); err != nil {
-				c.logger.Error("Failed to send heartbeat: %v", err)
-			}
 		}
 	}
 }
