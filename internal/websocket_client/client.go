@@ -57,14 +57,13 @@ func New(url string, logger *logger.Logger) *Client {
 // Connect establishes a WebSocket connection
 func (c *Client) Connect() error {
 	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
 	}
 
 	conn, _, err := dialer.Dial(c.url, nil)
 	if err != nil {
+		c.mutex.Unlock()
 		return err
 	}
 
@@ -72,9 +71,13 @@ func (c *Client) Connect() error {
 	c.isRunning = true
 	c.logger.Info("Connected to WebSocket server: %s", c.url)
 
-	// 调用连接回调
-	if c.onConnect != nil {
-		c.onConnect()
+	// 获取回调函数的引用，然后释放锁
+	onConnect := c.onConnect
+	c.mutex.Unlock()
+
+	// 在锁外调用连接回调，避免死锁
+	if onConnect != nil {
+		onConnect()
 	}
 
 	return nil
