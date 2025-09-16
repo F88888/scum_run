@@ -46,6 +46,14 @@ type Client struct {
 	wg         sync.WaitGroup
 	installing bool       // 安装状态标志
 	installMux sync.Mutex // 安装锁
+
+	// 日志批量处理
+	logBuffer     []string
+	logBufferMux  sync.Mutex
+	logTicker     *time.Ticker
+	lastLogSend   time.Time
+	maxLogRate    int           // 每秒最大日志发送数量
+	logRateWindow time.Duration // 日志频率控制窗口
 }
 
 // Message types for WebSocket communication
@@ -83,18 +91,25 @@ func New(cfg *config.Config, steamDir string, logger *logger.Logger) *Client {
 	steamDetector := steam.NewDetector(logger)
 
 	client := &Client{
-		config:     cfg,
-		steamDir:   steamDir,
-		logger:     logger,
-		ctx:        ctx,
-		cancel:     cancel,
-		db:         database.New(steamDetector.GetSCUMDatabasePath(steamDir), logger),
-		process:    process.New(steamDetector.GetSCUMServerPath(steamDir), logger),
-		steamTools: steamtools.New(&cfg.SteamTools, logger),
+		config:        cfg,
+		steamDir:      steamDir,
+		logger:        logger,
+		ctx:           ctx,
+		cancel:        cancel,
+		db:            database.New(steamDetector.GetSCUMDatabasePath(steamDir), logger),
+		process:       process.New(steamDetector.GetSCUMServerPath(steamDir), logger),
+		steamTools:    steamtools.New(&cfg.SteamTools, logger),
+		logBuffer:     make([]string, 0, 100),                                 // 预分配100条日志的缓冲区
+		maxLogRate:    _const.LogMaxRatePerSecond,                             // 每秒最多发送日志数量
+		logRateWindow: time.Duration(_const.LogRateWindow) * time.Millisecond, // 频率控制窗口
 	}
 
 	// 设置进程输出回调函数
 	client.process.SetOutputCallback(client.handleProcessOutput)
+
+	// 启动日志批量处理定时器
+	client.logTicker = time.NewTicker(time.Duration(_const.LogBatchInterval) * time.Millisecond) // 批量发送间隔
+	go client.logBatchProcessor()
 
 	return client
 }
@@ -208,6 +223,14 @@ func (c *Client) Stop() {
 
 	c.cancel()
 
+	// 停止日志批量处理定时器
+	if c.logTicker != nil {
+		c.logTicker.Stop()
+	}
+
+	// 发送剩余的日志缓冲区
+	c.flushLogBuffer()
+
 	if c.logMonitor != nil {
 		c.logMonitor.Stop()
 	}
@@ -233,6 +256,48 @@ func (c *Client) Stop() {
 
 	c.wg.Wait()
 	c.logger.Info("SCUM Run client stopped")
+}
+
+// ForceStop forcefully stops the client and all associated processes
+func (c *Client) ForceStop() {
+	c.logger.Info("Force stopping SCUM Run client and all processes...")
+
+	c.cancel()
+
+	// 停止日志批量处理定时器
+	if c.logTicker != nil {
+		c.logTicker.Stop()
+	}
+
+	// 发送剩余的日志缓冲区
+	c.flushLogBuffer()
+
+	if c.logMonitor != nil {
+		c.logMonitor.Stop()
+	}
+
+	// Force stop the SCUM server process and all child processes
+	if c.process != nil {
+		c.process.CleanupOnExit()
+	}
+
+	if c.db != nil {
+		c.db.Close()
+	}
+
+	if c.wsClient != nil {
+		c.wsClient.Close()
+	}
+
+	// Stop Steam++ last
+	if c.steamTools != nil {
+		if err := c.steamTools.Stop(); err != nil {
+			c.logger.Warn("Failed to stop Steam++: %v", err)
+		}
+	}
+
+	c.wg.Wait()
+	c.logger.Info("SCUM Run client force stopped")
 }
 
 // handleMessages handles incoming WebSocket messages
@@ -446,10 +511,10 @@ func (c *Client) onLogUpdate(filename string, lines []string) {
 
 	c.sendResponse(MsgTypeLogUpdate, logData, "")
 
-	// 同时发送实时日志数据给Web终端
+	// 将日志行添加到批量缓冲区，而不是立即发送
 	for _, line := range lines {
 		if strings.TrimSpace(line) != "" {
-			c.sendLogData(line)
+			c.addLogToBuffer(line)
 		}
 	}
 }
@@ -1321,14 +1386,10 @@ func (c *Client) executeServerCommand(command string) (string, error) {
 	return fmt.Sprintf("Command '%s' has been sent to the server", command), nil
 }
 
-// sendLogData sends real-time log data to web terminals
+// sendLogData sends real-time log data to web terminals (deprecated - use addLogToBuffer instead)
 func (c *Client) sendLogData(content string) {
-	logData := map[string]interface{}{
-		"content":   content,
-		"timestamp": float64(time.Now().Unix()),
-	}
-
-	c.sendResponse(MsgTypeLogData, logData, "")
+	// 使用新的批量处理机制
+	c.addLogToBuffer(content)
 }
 
 // handleProcessOutput handles real-time output from SCUM server process
@@ -1658,4 +1719,91 @@ func getFileOwner(info os.FileInfo) string {
 	// 在Windows上，这个功能比较复杂，暂时返回"system"
 	// 在Linux上可以使用syscall.Getuid()等
 	return "system"
+}
+
+// addLogToBuffer adds a log line to the buffer for batch processing
+func (c *Client) addLogToBuffer(content string) {
+	c.logBufferMux.Lock()
+	defer c.logBufferMux.Unlock()
+
+	// 检查频率限制
+	now := time.Now()
+	if now.Sub(c.lastLogSend) < c.logRateWindow {
+		// 如果发送频率过高，跳过这条日志
+		return
+	}
+
+	// 添加到缓冲区
+	c.logBuffer = append(c.logBuffer, content)
+
+	// 如果缓冲区满了，立即发送
+	if len(c.logBuffer) >= _const.LogBatchSize { // 批量大小限制
+		c.flushLogBufferUnsafe()
+	}
+}
+
+// logBatchProcessor processes log batches at regular intervals
+func (c *Client) logBatchProcessor() {
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-c.logTicker.C:
+			c.flushLogBuffer()
+		}
+	}
+}
+
+// flushLogBuffer sends all buffered logs to the server
+func (c *Client) flushLogBuffer() {
+	c.logBufferMux.Lock()
+	defer c.logBufferMux.Unlock()
+	c.flushLogBufferUnsafe()
+}
+
+// flushLogBufferUnsafe sends all buffered logs without locking (caller must hold lock)
+func (c *Client) flushLogBufferUnsafe() {
+	if len(c.logBuffer) == 0 {
+		return
+	}
+
+	// 检查发送频率限制
+	now := time.Now()
+	if now.Sub(c.lastLogSend) < c.logRateWindow {
+		return
+	}
+
+	// 限制批量大小，避免单次发送过多数据
+	batchSize := len(c.logBuffer)
+	if batchSize > c.maxLogRate {
+		batchSize = c.maxLogRate
+	}
+
+	// 发送批量日志数据
+	batch := make([]string, batchSize)
+	copy(batch, c.logBuffer[:batchSize])
+
+	// 从缓冲区移除已发送的日志
+	c.logBuffer = c.logBuffer[batchSize:]
+
+	// 发送批量日志
+	c.sendBatchLogData(batch)
+
+	// 更新最后发送时间
+	c.lastLogSend = now
+}
+
+// sendBatchLogData sends a batch of log data to web terminals
+func (c *Client) sendBatchLogData(logs []string) {
+	if len(logs) == 0 {
+		return
+	}
+
+	logData := map[string]interface{}{
+		"content":   logs,
+		"timestamp": float64(time.Now().Unix()),
+		"batch":     true, // 标识这是批量数据
+	}
+
+	c.sendResponse(MsgTypeLogData, logData, "")
 }

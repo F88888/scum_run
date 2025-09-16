@@ -3,6 +3,7 @@ package websocket_client
 import (
 	"context"
 	"encoding/json"
+	_const "scum_run/internal/const"
 	"sync"
 	"time"
 
@@ -60,6 +61,8 @@ func (c *Client) Connect() error {
 	c.mutex.Lock()
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
+		ReadBufferSize:   _const.WebSocketReadBufferSize,  // 读取缓冲区
+		WriteBufferSize:  _const.WebSocketWriteBufferSize, // 写入缓冲区
 	}
 
 	conn, _, err := dialer.Dial(c.url, nil)
@@ -67,6 +70,14 @@ func (c *Client) Connect() error {
 		c.mutex.Unlock()
 		return err
 	}
+
+	// 设置连接参数
+	conn.SetReadLimit(_const.WebSocketMaxMessageSize) // 最大消息大小
+	conn.SetReadDeadline(time.Now().Add(time.Duration(_const.HeartbeatTimeout) * time.Second))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(time.Duration(_const.HeartbeatTimeout) * time.Second))
+		return nil
+	})
 
 	c.conn = conn
 	c.isRunning = true

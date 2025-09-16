@@ -152,6 +152,13 @@ func (m *Manager) Start() error {
 		return fmt.Errorf("failed to start SCUM server: %w", err)
 	}
 
+	// On Windows, create a new process group to manage child processes
+	if runtime.GOOS == "windows" {
+		if err := m.createProcessGroup(); err != nil {
+			m.logger.Warn("Failed to create process group: %v", err)
+		}
+	}
+
 	m.logger.Info("SCUM server started with PID: %d", m.cmd.Process.Pid)
 	m.logger.Info("Server configuration - Port: %d, MaxPlayers: %d, BattlEye: %v",
 		m.config.GamePort, m.config.MaxPlayers, m.config.EnableBattlEye)
@@ -213,6 +220,86 @@ func (m *Manager) Stop() error {
 
 	m.cmd = nil
 	return nil
+}
+
+// ForceStop forcefully stops the SCUM server process and all child processes
+func (m *Manager) ForceStop() error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	if m.cmd == nil || m.cmd.Process == nil {
+		return nil // Already stopped
+	}
+
+	pid := m.cmd.Process.Pid
+	m.logger.Info("Force stopping SCUM server and child processes (PID: %d)", pid)
+
+	// Close stdin pipe first
+	if m.stdin != nil {
+		m.stdin.Close()
+		m.stdin = nil
+	}
+
+	// Force kill the main process
+	if err := m.cmd.Process.Kill(); err != nil {
+		m.logger.Warn("Failed to kill main process: %v", err)
+	}
+
+	// On Windows, also try to kill child processes
+	if runtime.GOOS == "windows" {
+		m.killChildProcesses(pid)
+	}
+
+	// Wait for process to exit
+	done := make(chan error, 1)
+	go func() {
+		done <- m.cmd.Wait()
+	}()
+
+	select {
+	case <-done:
+		m.logger.Info("SCUM server force stopped")
+	case <-time.After(5 * time.Second):
+		m.logger.Warn("Force stop timeout, process may still be running")
+	}
+
+	m.cmd = nil
+	return nil
+}
+
+// createProcessGroup creates a new process group on Windows
+func (m *Manager) createProcessGroup() error {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+
+	// On Windows, we'll rely on taskkill with /T flag to kill the process tree
+	// This is simpler and more reliable than trying to create process groups
+	m.logger.Info("Process group management will be handled by taskkill /T")
+	return nil
+}
+
+// killChildProcesses kills child processes on Windows
+func (m *Manager) killChildProcesses(parentPID int) {
+	if runtime.GOOS != "windows" {
+		return
+	}
+
+	// Use taskkill to kill the process tree
+	cmd := exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprintf("%d", parentPID))
+	if err := cmd.Run(); err != nil {
+		m.logger.Warn("Failed to kill process tree: %v", err)
+	} else {
+		m.logger.Info("Successfully killed process tree for PID: %d", parentPID)
+	}
+}
+
+// CleanupOnExit ensures all processes are cleaned up when the program exits
+func (m *Manager) CleanupOnExit() {
+	if m.cmd != nil && m.cmd.Process != nil {
+		m.logger.Info("Cleaning up SCUM server process on exit (PID: %d)", m.cmd.Process.Pid)
+		m.ForceStop()
+	}
 }
 
 // Restart restarts the SCUM server process

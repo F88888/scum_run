@@ -4,6 +4,7 @@ import (
 	"flag"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 
 	"scum_run/config"
@@ -11,6 +12,15 @@ import (
 	"scum_run/internal/logger"
 	"scum_run/internal/steam"
 )
+
+var scumClient *client.Client
+
+// cleanup ensures all processes are properly cleaned up on exit
+func cleanup() {
+	if scumClient != nil {
+		scumClient.ForceStop()
+	}
+}
 
 func main() {
 	var (
@@ -65,16 +75,24 @@ func main() {
 	logger.Info("Steam directory: %s", steamDir)
 
 	// Initialize SCUM client
-	scumClient := client.New(cfg, steamDir, logger)
+	scumClient = client.New(cfg, steamDir, logger)
+
+	// Register cleanup function to run on exit
+	runtime.SetFinalizer(scumClient, func(*client.Client) {
+		cleanup()
+	})
 
 	// Setup graceful shutdown
 	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
 
 	go func() {
-		<-c
-		logger.Info("Shutting down gracefully...")
-		scumClient.Stop()
+		sig := <-c
+		logger.Info("Received signal %v, shutting down...", sig)
+
+		// Always use ForceStop to ensure all processes are cleaned up
+		logger.Info("Force stopping all processes...")
+		cleanup()
 		os.Exit(0)
 	}()
 
