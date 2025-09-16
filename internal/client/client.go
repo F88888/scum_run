@@ -1394,11 +1394,8 @@ func (c *Client) sendLogData(content string) {
 
 // handleProcessOutput handles real-time output from SCUM server process
 func (c *Client) handleProcessOutput(source string, line string) {
-	// 格式化输出内容
-	formattedLine := fmt.Sprintf("[%s] %s", source, line)
-
-	// 发送到WebSocket终端
-	c.sendLogData(formattedLine)
+	// 直接发送原始日志内容，不添加前缀
+	c.sendLogData(line)
 }
 
 // handleClientUpdate handles client update requests
