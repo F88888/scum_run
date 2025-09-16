@@ -1508,11 +1508,19 @@ func (c *Client) handleFileBrowse(data interface{}) {
 		path = "/"
 	}
 
+	// 获取请求ID用于响应匹配
+	requestID, _ := dataMap["request_id"].(string)
+
 	// 扫描指定路径的文件和目录
 	fileList, err := c.scanDirectory(path)
 	if err != nil {
 		c.logger.Error("Failed to scan directory %s: %v", path, err)
-		c.sendResponse(MsgTypeFileList, nil, fmt.Sprintf("Failed to scan directory: %v", err))
+		// 在错误响应中也包含请求ID
+		errorData := map[string]interface{}{}
+		if requestID != "" {
+			errorData["request_id"] = requestID
+		}
+		c.sendResponse(MsgTypeFileList, errorData, fmt.Sprintf("Failed to scan directory: %v", err))
 		return
 	}
 
@@ -1523,8 +1531,13 @@ func (c *Client) handleFileBrowse(data interface{}) {
 		"total":        len(fileList),
 	}
 
+	// 在响应中包含请求ID
+	if requestID != "" {
+		responseData["request_id"] = requestID
+	}
+
 	c.sendResponse(MsgTypeFileList, responseData, "")
-	c.logger.Debug("Sent file list for path: %s (%d items)", path, len(fileList))
+	c.logger.Debug("Sent file list for path: %s (%d items), request_id: %s", path, len(fileList), requestID)
 }
 
 // handleFileList 处理文件列表响应（通常不会在客户端收到）
