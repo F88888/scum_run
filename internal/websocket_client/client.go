@@ -61,9 +61,18 @@ func (c *Client) Connect() error {
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
+		CheckOrigin: func(r *http.Request) bool {
+			return true // Allow connections from any origin
+		},
 	}
 
-	conn, _, err := dialer.Dial(c.url, nil)
+	// Set proper WebSocket headers
+	headers := http.Header{}
+	headers.Set("Connection", "Upgrade")
+	headers.Set("Upgrade", "websocket")
+	headers.Set("Sec-WebSocket-Version", "13")
+
+	conn, _, err := dialer.Dial(c.url, headers)
 	if err != nil {
 		return err
 	}

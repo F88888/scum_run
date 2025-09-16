@@ -126,12 +126,14 @@ func (c *Client) Start() error {
 			// 连接成功后自动发送认证
 			authMsg := request.WebSocketMessage{
 				Type: MsgTypeAuth,
-				Data: map[string]string{
+				Data: map[string]interface{}{
 					"token": c.config.Token,
 				},
 			}
 			if err := c.wsClient.SendMessage(authMsg); err != nil {
 				c.logger.Error("Failed to send authentication: %v", err)
+			} else {
+				c.logger.Info("Authentication message sent successfully")
 			}
 		},
 		func() {
@@ -142,12 +144,14 @@ func (c *Client) Start() error {
 			// 重连成功后重新发送认证
 			authMsg := request.WebSocketMessage{
 				Type: MsgTypeAuth,
-				Data: map[string]string{
+				Data: map[string]interface{}{
 					"token": c.config.Token,
 				},
 			}
 			if err := c.wsClient.SendMessage(authMsg); err != nil {
 				c.logger.Error("Failed to send re-authentication: %v", err)
+			} else {
+				c.logger.Info("Re-authentication message sent successfully")
 			}
 		},
 	)
@@ -256,7 +260,10 @@ func (c *Client) handleMessages() {
 
 // handleMessage handles a single WebSocket message
 func (c *Client) handleMessage(msg request.WebSocketMessage) {
-	c.logger.Debug("Received message: %s", msg.Type)
+	c.logger.Info("Received message: %s, Success: %v", msg.Type, msg.Success)
+	if msg.Error != "" {
+		c.logger.Error("Message error: %s", msg.Error)
+	}
 
 	switch msg.Type {
 	case MsgTypeServerStart:
