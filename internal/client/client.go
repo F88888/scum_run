@@ -1583,8 +1583,8 @@ func (c *Client) scanDirectory(path string) ([]map[string]interface{}, error) {
 			continue
 		}
 
-		entryPath := filepath.Join(fullPath, entry.Name())
-		info, err := entry.Info()
+		var info os.FileInfo
+		info, err = entry.Info()
 		if err != nil {
 			c.logger.Warn("Failed to get file info for %s: %v", entry.Name(), err)
 			continue
