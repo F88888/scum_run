@@ -176,12 +176,27 @@ func (c *Client) ReadMessage(message interface{}) error {
 	c.mutex.RUnlock()
 
 	c.logger.Debug("Waiting for message from server...")
-	_, data, err := conn.ReadMessage()
+	messageType, data, err := conn.ReadMessage()
 	if err != nil {
 		c.logger.Error("Failed to read message: %v", err)
 		// 连接断开，触发重连
 		c.handleDisconnection()
 		return err
+	}
+
+	// 处理Pong消息
+	if messageType == websocket.PongMessage {
+		c.mutex.Lock()
+		c.lastHeartbeat = time.Now()
+		c.mutex.Unlock()
+		c.logger.Debug("Received pong message")
+		return nil
+	}
+
+	// 只处理文本消息
+	if messageType != websocket.TextMessage {
+		c.logger.Debug("Received non-text message, ignoring")
+		return nil
 	}
 
 	c.logger.Debug("Received raw message: %s", string(data))
@@ -248,8 +263,10 @@ func (c *Client) monitorConnection() {
 				heartbeatTimeout := c.heartbeatTimeout
 				c.mutex.RUnlock()
 
-				if time.Since(lastHeartbeat) > heartbeatTimeout {
-					c.logger.Warn("Heartbeat timeout, attempting to reconnect...")
+				// 如果从未收到心跳，跳过检查
+				if !lastHeartbeat.IsZero() && time.Since(lastHeartbeat) > heartbeatTimeout {
+					c.logger.Warn("Heartbeat timeout (last: %v, timeout: %v), attempting to reconnect...",
+						lastHeartbeat, heartbeatTimeout)
 					c.handleDisconnection()
 				}
 			}
@@ -293,6 +310,7 @@ func (c *Client) heartbeatLoop() {
 // handleDisconnection handles disconnection events
 func (c *Client) handleDisconnection() {
 	c.mutex.Lock()
+	wasRunning := c.isRunning
 	c.isRunning = false
 	if c.conn != nil {
 		c.conn.Close()
@@ -300,17 +318,19 @@ func (c *Client) handleDisconnection() {
 	}
 	c.mutex.Unlock()
 
-	c.logger.Warn("WebSocket disconnected, attempting to reconnect...")
+	if wasRunning {
+		c.logger.Warn("WebSocket disconnected, attempting to reconnect...")
 
-	// 调用断开连接回调
-	if c.onDisconnect != nil {
-		c.onDisconnect()
-	}
+		// 调用断开连接回调
+		if c.onDisconnect != nil {
+			c.onDisconnect()
+		}
 
-	// 触发重连
-	select {
-	case c.reconnectChan <- struct{}{}:
-	default:
+		// 触发重连
+		select {
+		case c.reconnectChan <- struct{}{}:
+		default:
+		}
 	}
 }
 

@@ -23,7 +23,7 @@ const (
 	WebSocketReadBufferSize  = 4096        // WebSocket 读取缓冲区大小
 	WebSocketWriteBufferSize = 4096        // WebSocket 写入缓冲区大小
 	WebSocketMaxMessageSize  = 1024 * 1024 // 最大消息大小 (1MB)
-	HeartbeatTimeout         = 60          // 心跳超时时间 (秒)
+	HeartbeatTimeout         = 90          // 心跳超时时间 (秒) - 增加超时时间避免误判
 
 	// 日志处理相关常量
 	LogMaxRatePerSecond = 100 // 每秒最大日志发送数量
