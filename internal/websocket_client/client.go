@@ -121,10 +121,18 @@ func (c *Client) SendMessage(message interface{}) error {
 	defer c.mutex.RUnlock()
 
 	if !c.isRunning || c.conn == nil {
+		c.logger.Error("Cannot send message: connection not running or nil")
 		return websocket.ErrCloseSent
 	}
 
-	return c.conn.WriteJSON(message)
+	c.logger.Debug("Sending message: %+v", message)
+	err := c.conn.WriteJSON(message)
+	if err != nil {
+		c.logger.Error("Failed to send message: %v", err)
+	} else {
+		c.logger.Debug("Message sent successfully")
+	}
+	return err
 }
 
 // ReadMessage reads a message from WebSocket
@@ -132,19 +140,30 @@ func (c *Client) ReadMessage(message interface{}) error {
 	c.mutex.RLock()
 	if !c.isRunning || c.conn == nil {
 		c.mutex.RUnlock()
+		c.logger.Error("Cannot read message: connection not running or nil")
 		return websocket.ErrCloseSent
 	}
 	conn := c.conn
 	c.mutex.RUnlock()
 
+	c.logger.Debug("Waiting for message from server...")
 	_, data, err := conn.ReadMessage()
 	if err != nil {
+		c.logger.Error("Failed to read message: %v", err)
 		// 连接断开，触发重连
 		c.handleDisconnection()
 		return err
 	}
 
-	return json.Unmarshal(data, message)
+	c.logger.Debug("Received raw message: %s", string(data))
+	err = json.Unmarshal(data, message)
+	if err != nil {
+		c.logger.Error("Failed to unmarshal message: %v", err)
+		return err
+	}
+
+	c.logger.Debug("Message unmarshaled successfully: %+v", message)
+	return nil
 }
 
 // IsConnected returns whether the client is connected
