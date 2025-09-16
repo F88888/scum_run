@@ -3,7 +3,6 @@ package websocket_client
 import (
 	"context"
 	"encoding/json"
-	"net/http"
 	"sync"
 	"time"
 
@@ -64,13 +63,7 @@ func (c *Client) Connect() error {
 		HandshakeTimeout: 10 * time.Second,
 	}
 
-	// Set proper WebSocket headers
-	headers := http.Header{}
-	headers.Set("Connection", "Upgrade")
-	headers.Set("Upgrade", "websocket")
-	headers.Set("Sec-WebSocket-Version", "13")
-
-	conn, _, err := dialer.Dial(c.url, headers)
+	conn, _, err := dialer.Dial(c.url, nil)
 	if err != nil {
 		return err
 	}
