@@ -1,7 +1,6 @@
 package logmonitor
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"io"
