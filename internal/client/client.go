@@ -19,6 +19,7 @@ import (
 	"scum_run/internal/database"
 	"scum_run/internal/logger"
 	"scum_run/internal/logmonitor"
+	"scum_run/internal/monitor"
 	"scum_run/internal/process"
 	"scum_run/internal/steam"
 	"scum_run/internal/steamtools"
@@ -42,6 +43,7 @@ type Client struct {
 	logMonitor *logmonitor.Monitor
 	process    *process.Manager
 	steamTools *steamtools.Manager
+	sysMonitor *monitor.SystemMonitor
 	ctx        context.Context
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
@@ -84,6 +86,9 @@ const (
 	MsgTypeFileList   = "file_list"   // 文件列表响应
 	MsgTypeFileRead   = "file_read"   // 文件内容读取
 	MsgTypeFileWrite  = "file_write"  // 文件内容写入
+
+	// System monitoring
+	MsgTypeSystemMonitor = "system_monitor" // 系统监控数据
 )
 
 // New creates a new SCUM Run client
@@ -101,6 +106,7 @@ func New(cfg *config.Config, steamDir string, logger *logger.Logger) *Client {
 		db:            database.New(steamDetector.GetSCUMDatabasePath(steamDir), logger),
 		process:       process.New(steamDetector.GetSCUMServerPath(steamDir), logger),
 		steamTools:    steamtools.New(&cfg.SteamTools, logger),
+		sysMonitor:    monitor.New(logger, 10*time.Second),                    // 每10秒监控一次
 		logBuffer:     make([]string, 0, 100),                                 // 预分配100条日志的缓冲区
 		maxLogRate:    _const.LogMaxRatePerSecond,                             // 每秒最多发送日志数量
 		logRateWindow: time.Duration(_const.LogRateWindow) * time.Millisecond, // 频率控制窗口
@@ -108,6 +114,9 @@ func New(cfg *config.Config, steamDir string, logger *logger.Logger) *Client {
 
 	// 设置进程输出回调函数
 	client.process.SetOutputCallback(client.handleProcessOutput)
+
+	// 设置系统监控回调函数
+	client.sysMonitor.SetCallback(client.handleSystemMonitorData)
 
 	// 启动日志批量处理定时器
 	client.logTicker = time.NewTicker(time.Duration(_const.LogBatchInterval) * time.Millisecond) // 批量发送间隔
@@ -191,6 +200,13 @@ func (c *Client) Start() error {
 	c.wg.Add(1)
 	go c.handleMessages()
 
+	// Start system monitoring
+	if err := c.sysMonitor.Start(); err != nil {
+		c.logger.Error("Failed to start system monitor: %v", err)
+	} else {
+		c.logger.Info("System monitor started successfully")
+	}
+
 	// WebSocket client handles heartbeat automatically
 
 	// Check if SCUM server is installed before initializing database and log monitor
@@ -235,6 +251,10 @@ func (c *Client) Stop() {
 
 	if c.logMonitor != nil {
 		c.logMonitor.Stop()
+	}
+
+	if c.sysMonitor != nil {
+		c.sysMonitor.Stop()
 	}
 
 	if c.process != nil {
@@ -2166,4 +2186,27 @@ func (c *Client) writeFileWithEncoding(filePath, content, encoding string) error
 	}
 
 	return nil
+}
+
+// handleSystemMonitorData 处理系统监控数据
+func (c *Client) handleSystemMonitorData(data *request.SystemMonitorData) {
+	// 检查WebSocket连接是否可用
+	if !c.wsClient.IsConnected() {
+		c.logger.Debug("WebSocket not connected, skipping system monitor data")
+		return
+	}
+
+	// 创建系统监控消息
+	msg := request.WebSocketMessage{
+		Type: MsgTypeSystemMonitor,
+		Data: data,
+	}
+
+	// 发送系统监控数据
+	if err := c.wsClient.SendMessage(msg); err != nil {
+		c.logger.Error("Failed to send system monitor data: %v", err)
+	} else {
+		c.logger.Debug("System monitor data sent: CPU=%.1f%%, Memory=%.1f%%, Disk=%.1f%%, NetIn=%.1fKB/s, NetOut=%.1fKB/s",
+			data.CPUUsage, data.MemUsage, data.DiskUsage, data.NetIncome, data.NetOutcome)
+	}
 }
