@@ -3,6 +3,7 @@ package websocket_client
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,8 +53,8 @@ func New(url string, logger *logger.Logger) *Client {
 		stopChan:          make(chan struct{}),
 		reconnectChan:     make(chan struct{}),
 		maxRetries:        -1,               // 无限重试
-		retryInterval:     3 * time.Second,  // 使用新的重连间隔配置
-		maxRetryInterval:  30 * time.Second, // 使用新的最大重连间隔
+		retryInterval:     5 * time.Second,  // 增加重连间隔，减少频繁重连
+		maxRetryInterval:  60 * time.Second, // 增加最大重连间隔
 		heartbeatInterval: 30 * time.Second, // 与服务端错开的心跳时间
 		heartbeatTimeout:  30 * time.Minute, // 大幅延长心跳超时到30分钟，避免误判断开
 		readBufferSize:    128 * 1024,       // 与服务端一致的缓冲区大小
@@ -120,6 +121,8 @@ func (c *Client) ConnectWithAutoReconnect() error {
 	// 启动重连监控和心跳
 	go c.monitorConnection()
 	go c.heartbeatLoop()
+	// 启动消息监听循环，确保能及时处理ping/pong消息
+	go c.messageLoop()
 
 	return nil
 }
@@ -326,7 +329,7 @@ func (c *Client) handleDisconnection() {
 	wasRunning := c.isRunning
 	c.isRunning = false
 	if c.conn != nil {
-		c.conn.Close()
+		_ = c.conn.Close()
 		c.conn = nil
 	}
 	c.mutex.Unlock()
@@ -347,16 +350,104 @@ func (c *Client) handleDisconnection() {
 	}
 }
 
+// messageLoop 持续监听WebSocket消息，确保能及时处理ping/pong消息
+func (c *Client) messageLoop() {
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		default:
+			if !c.IsConnected() {
+				// 连接断开时等待一段时间再检查
+				time.Sleep(1 * time.Second)
+				continue
+			}
+
+			c.mutex.RLock()
+			conn := c.conn
+			c.mutex.RUnlock()
+
+			if conn == nil {
+				time.Sleep(1 * time.Second)
+				continue
+			}
+
+			// 设置较短的读取超时，避免阻塞过久
+			_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+			messageType, data, err := conn.ReadMessage()
+			_ = conn.SetReadDeadline(time.Time{}) // 清除超时
+
+			if err != nil {
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+					c.logger.Error("Unexpected WebSocket close in message loop: %v", err)
+					c.handleDisconnection()
+				} else if strings.Contains(err.Error(), "unexpected EOF") {
+					// 客户端异常关闭，通常是网络问题
+					c.logger.Warn("Connection closed abnormally (unexpected EOF): %v", err)
+					c.handleDisconnection()
+				} else if strings.Contains(err.Error(), "close 1006") {
+					// WebSocket 1006错误码表示异常关闭
+					c.logger.Warn("Connection closed with abnormal closure (1006): %v", err)
+					c.handleDisconnection()
+				} else if strings.Contains(err.Error(), "i/o timeout") {
+					// 读取超时，继续循环
+					c.logger.Debug("Read timeout in message loop, continuing...")
+					continue
+				} else {
+					// 其他错误继续循环
+					c.logger.Debug("Read error in message loop: %v", err)
+					continue
+				}
+			}
+
+			// 处理不同类型的消息
+			switch messageType {
+			case websocket.PingMessage:
+				// 响应ping消息
+				c.mutex.Lock()
+				if c.conn != nil {
+					_ = c.conn.WriteMessage(websocket.PongMessage, data)
+				}
+				c.mutex.Unlock()
+				c.logger.Debug("Responded to ping message")
+
+			case websocket.PongMessage:
+				// 更新心跳时间
+				c.mutex.Lock()
+				c.lastHeartbeat = time.Now()
+				c.mutex.Unlock()
+				c.logger.Debug("Received pong message")
+
+			case websocket.TextMessage:
+				// 文本消息暂时忽略，因为业务逻辑在其他地方处理
+				c.logger.Debug("Received text message in background loop: %s", string(data))
+
+			case websocket.BinaryMessage:
+				// 二进制消息暂时忽略
+				c.logger.Debug("Received binary message in background loop")
+			}
+		}
+	}
+}
+
 // reconnect attempts to reconnect to the WebSocket server
 func (c *Client) reconnect() {
 	backoff := c.retryInterval
 	retryCount := 0
+	isFirstAttempt := true
 
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
 		case <-time.After(backoff):
+			// 首次重连前等待更长时间，避免启动时的频繁重连
+			if isFirstAttempt {
+				c.logger.Info("Waiting before first reconnection attempt...")
+				time.Sleep(2 * time.Second)
+				isFirstAttempt = false
+			}
+
 			c.logger.Info("Attempting to reconnect... (attempt %d)", retryCount+1)
 
 			if err := c.Connect(); err != nil {
@@ -382,8 +473,9 @@ func (c *Client) reconnect() {
 					c.onReconnect()
 				}
 
-				// 重新启动连接监控
+				// 重新启动连接监控和消息循环
 				go c.monitorConnection()
+				go c.messageLoop()
 				return
 			}
 		}
