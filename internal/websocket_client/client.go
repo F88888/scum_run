@@ -51,14 +51,14 @@ func New(url string, logger *logger.Logger) *Client {
 		cancel:            cancel,
 		stopChan:          make(chan struct{}),
 		reconnectChan:     make(chan struct{}),
-		maxRetries:        -1,                // 无限重试
-		retryInterval:     3 * time.Second,   // 使用新的重连间隔配置
-		maxRetryInterval:  30 * time.Second,  // 使用新的最大重连间隔
-		heartbeatInterval: 30 * time.Second,  // 与服务端错开的心跳时间
-		heartbeatTimeout:  120 * time.Second, // 使用新的心跳超时配置
-		readBufferSize:    128 * 1024,        // 与服务端一致的缓冲区大小
-		writeBufferSize:   128 * 1024,        // 与服务端一致的缓冲区大小
-		maxMessageSize:    2 * 1024 * 1024,   // 与服务端一致的最大消息大小
+		maxRetries:        -1,               // 无限重试
+		retryInterval:     3 * time.Second,  // 使用新的重连间隔配置
+		maxRetryInterval:  30 * time.Second, // 使用新的最大重连间隔
+		heartbeatInterval: 30 * time.Second, // 与服务端错开的心跳时间
+		heartbeatTimeout:  30 * time.Minute, // 大幅延长心跳超时到30分钟，避免误判断开
+		readBufferSize:    128 * 1024,       // 与服务端一致的缓冲区大小
+		writeBufferSize:   128 * 1024,       // 与服务端一致的缓冲区大小
+		maxMessageSize:    2 * 1024 * 1024,  // 与服务端一致的最大消息大小
 	}
 }
 
@@ -66,7 +66,7 @@ func New(url string, logger *logger.Logger) *Client {
 func (c *Client) Connect() error {
 	c.mutex.Lock()
 	dialer := websocket.Dialer{
-		HandshakeTimeout: 15 * time.Second,  // 使用配置的握手超时时间
+		HandshakeTimeout: 60 * time.Second,  // 延长握手超时时间到60秒
 		ReadBufferSize:   c.readBufferSize,  // 使用配置的读取缓冲区
 		WriteBufferSize:  c.writeBufferSize, // 使用配置的写入缓冲区
 		// 添加更多连接优化配置
@@ -79,16 +79,21 @@ func (c *Client) Connect() error {
 		return err
 	}
 
-	// 设置连接参数
+	// 设置连接参数 - 移除超时限制提高稳定性
 	conn.SetReadLimit(c.maxMessageSize) // 使用配置的最大消息大小
-	conn.SetReadDeadline(time.Now().Add(c.heartbeatTimeout))
+	// 移除读取超时限制，避免网络波动导致的连接断开
+	// conn.SetReadDeadline() - 不设置读取超时
+
 	conn.SetPongHandler(func(string) error {
-		conn.SetReadDeadline(time.Now().Add(c.heartbeatTimeout))
+		// 只记录pong响应，不重新设置读取超时
+		c.mutex.Lock()
+		c.lastHeartbeat = time.Now()
+		c.mutex.Unlock()
 		return nil
 	})
 
-	// 设置写超时，使用更长的超时时间避免连接断开
-	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	// 移除写超时限制，避免大量数据传输时超时
+	// conn.SetWriteDeadline() - 不设置写超时
 
 	c.conn = conn
 	c.isRunning = true
@@ -157,8 +162,8 @@ func (c *Client) SendMessage(message interface{}) error {
 	c.writeMutex.Lock()
 	defer c.writeMutex.Unlock()
 
-	// 设置写超时 - 使用更长的超时时间提高稳定性
-	conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+	// 移除写超时限制，避免网络波动时发送失败
+	// conn.SetWriteDeadline() - 不设置写超时
 
 	c.logger.Debug("Sending message: %+v", message)
 	err := conn.WriteJSON(message)
@@ -253,7 +258,7 @@ func (c *Client) SetHeartbeatConfig(interval, timeout time.Duration) {
 
 // monitorConnection monitors the connection and handles reconnection
 func (c *Client) monitorConnection() {
-	ticker := time.NewTicker(30 * time.Second) // 每30秒检查一次连接
+	ticker := time.NewTicker(5 * time.Minute) // 每5分钟检查一次连接，减少频繁检查
 	defer ticker.Stop()
 
 	for {
