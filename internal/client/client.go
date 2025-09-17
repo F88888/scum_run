@@ -5,6 +5,8 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"github.com/saintfish/chardet"
+	"golang.org/x/text/encoding/simplifiedchinese"
 	"io"
 	"net/http"
 	"net/url"
@@ -12,11 +14,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sort"
-	"strings"
-	"sync"
-	"time"
-
 	"scum_run/config"
 	_const "scum_run/internal/const"
 	"scum_run/internal/database"
@@ -29,6 +26,10 @@ import (
 	"scum_run/internal/websocket_client"
 	"scum_run/model"
 	"scum_run/model/request"
+	"sort"
+	"strings"
+	"sync"
+	"time"
 )
 
 // Client represents the SCUM Run client
@@ -81,6 +82,8 @@ const (
 	// File management
 	MsgTypeFileBrowse = "file_browse" // 文件浏览
 	MsgTypeFileList   = "file_list"   // 文件列表响应
+	MsgTypeFileRead   = "file_read"   // 文件内容读取
+	MsgTypeFileWrite  = "file_write"  // 文件内容写入
 )
 
 // New creates a new SCUM Run client
@@ -385,6 +388,10 @@ func (c *Client) handleMessage(msg request.WebSocketMessage) {
 		c.handleFileBrowse(msg.Data)
 	case MsgTypeFileList:
 		c.handleFileList(msg.Data)
+	case MsgTypeFileRead:
+		c.handleFileRead(msg.Data)
+	case MsgTypeFileWrite:
+		c.handleFileWrite(msg.Data)
 	case MsgTypeHeartbeat:
 		// Heartbeat messages from server are handled silently
 		c.logger.Debug("Received heartbeat from server")
@@ -1650,6 +1657,189 @@ func (c *Client) handleFileList(_ interface{}) {
 	c.logger.Debug("Received file list response (unexpected)")
 }
 
+// handleFileRead 处理文件内容读取请求
+func (c *Client) handleFileRead(data interface{}) {
+	c.logger.Debug("Handling file read request")
+
+	dataMap, ok := data.(map[string]interface{})
+	if !ok {
+		c.logger.Error("Invalid file read request data")
+		c.sendResponse(MsgTypeFileRead, nil, "Invalid request data")
+		return
+	}
+
+	path, _ := dataMap["path"].(string)
+	encoding, _ := dataMap["encoding"].(string)
+	requestID, _ := dataMap["request_id"].(string)
+
+	if path == "" {
+		c.logger.Error("File path is required")
+		errorData := map[string]interface{}{}
+		if requestID != "" {
+			errorData["request_id"] = requestID
+		}
+		c.sendResponse(MsgTypeFileRead, errorData, "File path is required")
+		return
+	}
+
+	if encoding == "" {
+		encoding = "utf-8"
+	}
+
+	// 构建完整文件路径
+	var fullPath string
+	if strings.HasPrefix(path, "/") {
+		// 绝对路径，直接使用
+		fullPath = path
+	} else {
+		// 相对路径，基于Steam目录
+		fullPath = filepath.Join(c.steamDir, path)
+	}
+
+	c.logger.Debug("Reading file: %s (encoding: %s)", fullPath, encoding)
+
+	// 检查文件是否存在
+	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+		c.logger.Error("File does not exist: %s", fullPath)
+		errorData := map[string]interface{}{}
+		if requestID != "" {
+			errorData["request_id"] = requestID
+		}
+		c.sendResponse(MsgTypeFileRead, errorData, fmt.Sprintf("File does not exist: %s", path))
+		return
+	}
+
+	// 读取文件内容
+	content, err := c.readFileWithEncoding(fullPath, encoding)
+	if err != nil {
+		c.logger.Error("Failed to read file %s: %v", fullPath, err)
+		errorData := map[string]interface{}{}
+		if requestID != "" {
+			errorData["request_id"] = requestID
+		}
+		c.sendResponse(MsgTypeFileRead, errorData, fmt.Sprintf("Failed to read file: %v", err))
+		return
+	}
+
+	// 发送文件内容响应
+	responseData := map[string]interface{}{
+		"content":  content,
+		"encoding": encoding,
+		"size":     len(content),
+	}
+
+	// 在响应中包含请求ID
+	if requestID != "" {
+		responseData["request_id"] = requestID
+	}
+
+	c.sendResponse(MsgTypeFileRead, responseData, "")
+	c.logger.Debug("Sent file content for: %s (%d bytes), request_id: %s", path, len(content), requestID)
+}
+
+// handleFileWrite 处理文件内容写入请求
+func (c *Client) handleFileWrite(data interface{}) {
+	c.logger.Debug("Handling file write request")
+
+	dataMap, ok := data.(map[string]interface{})
+	if !ok {
+		c.logger.Error("Invalid file write request data")
+		c.sendResponse(MsgTypeFileWrite, nil, "Invalid request data")
+		return
+	}
+
+	path, _ := dataMap["path"].(string)
+	content, _ := dataMap["content"].(string)
+	encoding, _ := dataMap["encoding"].(string)
+	requestID, _ := dataMap["request_id"].(string)
+
+	if path == "" {
+		c.logger.Error("File path is required")
+		errorData := map[string]interface{}{}
+		if requestID != "" {
+			errorData["request_id"] = requestID
+		}
+		c.sendResponse(MsgTypeFileWrite, errorData, "File path is required")
+		return
+	}
+
+	if content == "" {
+		c.logger.Error("File content is required")
+		errorData := map[string]interface{}{}
+		if requestID != "" {
+			errorData["request_id"] = requestID
+		}
+		c.sendResponse(MsgTypeFileWrite, errorData, "File content is required")
+		return
+	}
+
+	if encoding == "" {
+		encoding = "utf-8"
+	}
+
+	// 构建完整文件路径
+	var fullPath string
+	if strings.HasPrefix(path, "/") {
+		// 绝对路径，直接使用
+		fullPath = path
+	} else {
+		// 相对路径，基于Steam目录
+		fullPath = filepath.Join(c.steamDir, path)
+	}
+
+	c.logger.Debug("Writing file: %s (encoding: %s, size: %d bytes)", fullPath, encoding, len(content))
+
+	// 确保目录存在
+	dir := filepath.Dir(fullPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		c.logger.Error("Failed to create directory %s: %v", dir, err)
+		errorData := map[string]interface{}{}
+		if requestID != "" {
+			errorData["request_id"] = requestID
+		}
+		c.sendResponse(MsgTypeFileWrite, errorData, fmt.Sprintf("Failed to create directory: %v", err))
+		return
+	}
+
+	// 写入文件内容
+	err := c.writeFileWithEncoding(fullPath, content, encoding)
+	if err != nil {
+		c.logger.Error("Failed to write file %s: %v", fullPath, err)
+		errorData := map[string]interface{}{}
+		if requestID != "" {
+			errorData["request_id"] = requestID
+		}
+		c.sendResponse(MsgTypeFileWrite, errorData, fmt.Sprintf("Failed to write file: %v", err))
+		return
+	}
+
+	// 获取文件信息
+	fileInfo, err := os.Stat(fullPath)
+	if err != nil {
+		c.logger.Warn("Failed to get file info after write: %v", err)
+	}
+
+	// 发送写入成功响应
+	responseData := map[string]interface{}{
+		"path":     path,
+		"encoding": encoding,
+		"size":     len(content),
+	}
+
+	if fileInfo != nil {
+		responseData["file_size"] = fileInfo.Size()
+		responseData["modified_at"] = fileInfo.ModTime().Format("2006-01-02 15:04:05")
+	}
+
+	// 在响应中包含请求ID
+	if requestID != "" {
+		responseData["request_id"] = requestID
+	}
+
+	c.sendResponse(MsgTypeFileWrite, responseData, "")
+	c.logger.Debug("File written successfully: %s (%d bytes), request_id: %s", path, len(content), requestID)
+}
+
 // scanDirectory 扫描指定目录并返回文件列表
 func (c *Client) scanDirectory(path string) ([]map[string]interface{}, error) {
 	// 构建完整路径
@@ -1868,4 +2058,112 @@ func (c *Client) sendBatchLogData(logs []string) {
 
 	c.logger.Debug("Sending batch log data: %d logs", len(logContents))
 	c.sendResponse(MsgTypeLogData, logData, "")
+}
+
+// readFileWithEncoding 根据指定编码读取文件内容
+func (c *Client) readFileWithEncoding(filePath, encoding string) (string, error) {
+	// 读取文件原始字节
+	fileData, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read file: %w", err)
+	}
+
+	// 根据编码转换内容
+	switch strings.ToLower(encoding) {
+	case "utf-8", "utf8":
+		return string(fileData), nil
+	case "gbk":
+		// 对于GBK编码，尝试转换
+		decoder := simplifiedchinese.GBK.NewDecoder()
+		utf8Data, err := decoder.Bytes(fileData)
+		if err != nil {
+			// 如果转换失败，返回原始内容
+			c.logger.Warn("Failed to convert GBK to UTF-8, returning raw content: %v", err)
+			return string(fileData), nil
+		}
+		return string(utf8Data), nil
+	case "gb2312":
+		// 对于GB2312编码，尝试转换
+		decoder := simplifiedchinese.GB18030.NewDecoder()
+		utf8Data, err := decoder.Bytes(fileData)
+		if err != nil {
+			// 如果转换失败，返回原始内容
+			c.logger.Warn("Failed to convert GB2312 to UTF-8, returning raw content: %v", err)
+			return string(fileData), nil
+		}
+		return string(utf8Data), nil
+	default:
+		// 对于其他编码，尝试自动检测
+		detector := chardet.NewTextDetector()
+		result, err := detector.DetectBest(fileData)
+		if err != nil {
+			c.logger.Warn("Failed to detect encoding, using UTF-8: %v", err)
+			return string(fileData), nil
+		}
+
+		c.logger.Debug("Detected encoding: %s (confidence: %.2f)", result.Charset, result.Confidence)
+
+		// 如果检测到的编码不是UTF-8，尝试转换
+		if result.Charset != "UTF-8" {
+			// 这里可以添加更多编码转换逻辑
+			// 目前只处理常见的编码
+			switch strings.ToLower(result.Charset) {
+			case "gbk", "gb2312":
+				decoder := simplifiedchinese.GBK.NewDecoder()
+				utf8Data, err := decoder.Bytes(fileData)
+				if err != nil {
+					c.logger.Warn("Failed to convert detected encoding to UTF-8: %v", err)
+					return string(fileData), nil
+				}
+				return string(utf8Data), nil
+			default:
+				c.logger.Warn("Unsupported encoding detected: %s", result.Charset)
+				return string(fileData), nil
+			}
+		}
+
+		return string(fileData), nil
+	}
+}
+
+// writeFileWithEncoding 根据指定编码写入文件内容
+func (c *Client) writeFileWithEncoding(filePath, content, encoding string) error {
+	var fileData []byte
+	var err error
+
+	// 根据编码转换内容
+	switch strings.ToLower(encoding) {
+	case "utf-8", "utf8":
+		fileData = []byte(content)
+	case "gbk":
+		// 对于GBK编码，尝试转换
+		encoder := simplifiedchinese.GBK.NewEncoder()
+		fileData, err = encoder.Bytes([]byte(content))
+		if err != nil {
+			// 如果转换失败，使用原始内容
+			c.logger.Warn("Failed to convert UTF-8 to GBK, using raw content: %v", err)
+			fileData = []byte(content)
+		}
+	case "gb2312":
+		// 对于GB2312编码，尝试转换
+		encoder := simplifiedchinese.GB18030.NewEncoder()
+		fileData, err = encoder.Bytes([]byte(content))
+		if err != nil {
+			// 如果转换失败，使用原始内容
+			c.logger.Warn("Failed to convert UTF-8 to GB2312, using raw content: %v", err)
+			fileData = []byte(content)
+		}
+	default:
+		// 对于其他编码，使用原始内容
+		c.logger.Warn("Unsupported encoding for writing: %s, using UTF-8", encoding)
+		fileData = []byte(content)
+	}
+
+	// 写入文件
+	err = os.WriteFile(filePath, fileData, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to write file: %w", err)
+	}
+
+	return nil
 }
