@@ -89,6 +89,14 @@ const (
 
 	// System monitoring
 	MsgTypeSystemMonitor = "system_monitor" // 系统监控数据
+
+	// Backup related
+	MsgTypeBackupStart    = "backup_start"    // 开始备份
+	MsgTypeBackupStop     = "backup_stop"     // 停止备份
+	MsgTypeBackupStatus   = "backup_status"   // 备份状态
+	MsgTypeBackupList     = "backup_list"     // 备份列表
+	MsgTypeBackupDelete   = "backup_delete"   // 删除备份
+	MsgTypeBackupProgress = "backup_progress" // 备份进度
 )
 
 // New creates a new SCUM Run client
@@ -418,6 +426,16 @@ func (c *Client) handleMessage(msg request.WebSocketMessage) {
 	case MsgTypeAuth:
 		// Handle authentication response from server
 		c.handleAuthResponse(msg)
+	case MsgTypeBackupStart:
+		c.handleBackupStart(msg.Data)
+	case MsgTypeBackupStop:
+		c.handleBackupStop(msg.Data)
+	case MsgTypeBackupStatus:
+		c.handleBackupStatus(msg.Data)
+	case MsgTypeBackupList:
+		c.handleBackupList(msg.Data)
+	case MsgTypeBackupDelete:
+		c.handleBackupDelete(msg.Data)
 	default:
 		c.logger.Warn("Unknown message type: %s", msg.Type)
 	}
@@ -2208,5 +2226,280 @@ func (c *Client) handleSystemMonitorData(data *request.SystemMonitorData) {
 	} else {
 		c.logger.Debug("System monitor data sent: CPU=%.1f%%, Memory=%.1f%%, Disk=%.1f%%, NetIn=%.1fKB/s, NetOut=%.1fKB/s",
 			data.CPUUsage, data.MemUsage, data.DiskUsage, data.NetIncome, data.NetOutcome)
+	}
+}
+
+// handleBackupStart 处理开始备份请求
+func (c *Client) handleBackupStart(data interface{}) {
+	c.logger.Info("Received backup start request")
+
+	backupData, ok := data.(map[string]interface{})
+	if !ok {
+		c.logger.Error("Invalid backup data format")
+		c.sendBackupResponse(MsgTypeBackupStatus, map[string]interface{}{
+			"success": false,
+			"message": "Invalid backup data format",
+		})
+		return
+	}
+
+	serverID, ok := backupData["server_id"].(float64)
+	if !ok {
+		c.logger.Error("Server ID is missing or invalid")
+		c.sendBackupResponse(MsgTypeBackupStatus, map[string]interface{}{
+			"success": false,
+			"message": "Server ID is missing or invalid",
+		})
+		return
+	}
+
+	backupPath, ok := backupData["backup_path"].(string)
+	if !ok || backupPath == "" {
+		c.logger.Error("Backup path is missing or invalid")
+		c.sendBackupResponse(MsgTypeBackupStatus, map[string]interface{}{
+			"success": false,
+			"message": "Backup path is missing or invalid",
+		})
+		return
+	}
+
+	description, _ := backupData["description"].(string)
+	if description == "" {
+		description = "手动备份"
+	}
+
+	// 异步执行备份
+	go c.executeBackup(uint(serverID), backupPath, description)
+}
+
+// handleBackupStop 处理停止备份请求
+func (c *Client) handleBackupStop(data interface{}) {
+	c.logger.Info("Received backup stop request")
+	// 这里可以实现停止备份的逻辑
+	c.sendBackupResponse(MsgTypeBackupStatus, map[string]interface{}{
+		"success": true,
+		"message": "Backup stop request received",
+	})
+}
+
+// handleBackupStatus 处理备份状态请求
+func (c *Client) handleBackupStatus(data interface{}) {
+	c.logger.Info("Received backup status request")
+	// 返回当前备份状态
+	c.sendBackupResponse(MsgTypeBackupStatus, map[string]interface{}{
+		"success": true,
+		"status":  "idle",
+		"message": "No backup in progress",
+	})
+}
+
+// handleBackupList 处理备份列表请求
+func (c *Client) handleBackupList(data interface{}) {
+	c.logger.Info("Received backup list request")
+	// 这里可以实现获取备份列表的逻辑
+	c.sendBackupResponse(MsgTypeBackupList, map[string]interface{}{
+		"success": true,
+		"list":    []interface{}{},
+		"message": "Backup list retrieved",
+	})
+}
+
+// handleBackupDelete 处理删除备份请求
+func (c *Client) handleBackupDelete(data interface{}) {
+	c.logger.Info("Received backup delete request")
+	// 这里可以实现删除备份的逻辑
+	c.sendBackupResponse(MsgTypeBackupStatus, map[string]interface{}{
+		"success": true,
+		"message": "Backup delete request received",
+	})
+}
+
+// executeBackup 执行备份操作
+func (c *Client) executeBackup(serverID uint, backupPath, description string) {
+	c.logger.Info("Starting backup for server %d, path: %s", serverID, backupPath)
+
+	// 发送备份开始状态
+	c.sendBackupResponse(MsgTypeBackupProgress, map[string]interface{}{
+		"server_id": serverID,
+		"status":    1, // 备份中
+		"progress":  0,
+		"message":   "开始备份...",
+	})
+
+	// 检查备份路径是否存在
+	if _, err := os.Stat(backupPath); os.IsNotExist(err) {
+		c.logger.Error("Backup path does not exist: %s", backupPath)
+		c.sendBackupResponse(MsgTypeBackupStatus, map[string]interface{}{
+			"server_id": serverID,
+			"success":   false,
+			"message":   "备份路径不存在",
+		})
+		return
+	}
+
+	// 创建备份目录
+	backupDir := filepath.Join(filepath.Dir(os.Args[0]), "backup")
+	if err := os.MkdirAll(backupDir, 0755); err != nil {
+		c.logger.Error("Failed to create backup directory: %v", err)
+		c.sendBackupResponse(MsgTypeBackupStatus, map[string]interface{}{
+			"server_id": serverID,
+			"success":   false,
+			"message":   "创建备份目录失败",
+		})
+		return
+	}
+
+	// 生成备份文件名
+	timestamp := time.Now().Format("20060102_150405")
+	fileName := fmt.Sprintf("backup_%d_%s.zip", serverID, timestamp)
+	filePath := filepath.Join(backupDir, fileName)
+
+	// 执行备份
+	if err := c.createBackupArchive(backupPath, filePath, serverID); err != nil {
+		c.logger.Error("Backup failed: %v", err)
+		c.sendBackupResponse(MsgTypeBackupStatus, map[string]interface{}{
+			"server_id": serverID,
+			"success":   false,
+			"message":   fmt.Sprintf("备份失败: %v", err),
+		})
+		return
+	}
+
+	// 获取备份文件信息
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		c.logger.Error("Failed to get backup file info: %v", err)
+		c.sendBackupResponse(MsgTypeBackupStatus, map[string]interface{}{
+			"server_id": serverID,
+			"success":   false,
+			"message":   "获取备份文件信息失败",
+		})
+		return
+	}
+
+	// 清理旧备份（保留最新的20个）
+	c.cleanOldBackups(backupDir, serverID, 20)
+
+	// 发送备份完成状态
+	c.sendBackupResponse(MsgTypeBackupStatus, map[string]interface{}{
+		"server_id": serverID,
+		"success":   true,
+		"message":   "备份完成",
+		"file_name": fileName,
+		"file_size": fileInfo.Size(),
+		"file_path": filePath,
+	})
+
+	c.logger.Info("Backup completed successfully for server %d: %s", serverID, fileName)
+}
+
+// createBackupArchive 创建备份压缩包
+func (c *Client) createBackupArchive(sourcePath, targetPath string, serverID uint) error {
+	// 创建ZIP文件
+	zipFile, err := os.Create(targetPath)
+	if err != nil {
+		return fmt.Errorf("failed to create backup file: %w", err)
+	}
+	defer zipFile.Close()
+
+	zipWriter := zip.NewWriter(zipFile)
+	defer zipWriter.Close()
+
+	// 遍历源目录并添加到ZIP
+	err = filepath.Walk(sourcePath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			// 跳过无法访问的文件
+			c.logger.Warn("Skipping file %s: %v", path, err)
+			return nil
+		}
+
+		// 跳过目录
+		if info.IsDir() {
+			return nil
+		}
+
+		// 计算相对路径
+		relPath, err := filepath.Rel(sourcePath, path)
+		if err != nil {
+			return err
+		}
+
+		// 创建ZIP文件条目
+		zipEntry, err := zipWriter.Create(relPath)
+		if err != nil {
+			return err
+		}
+
+		// 打开源文件
+		sourceFile, err := os.Open(path)
+		if err != nil {
+			// 跳过锁定的文件
+			c.logger.Warn("Skipping locked file %s: %v", path, err)
+			return nil
+		}
+		defer sourceFile.Close()
+
+		// 复制文件内容
+		_, err = io.Copy(zipEntry, sourceFile)
+		if err != nil {
+			c.logger.Warn("Failed to copy file %s: %v", path, err)
+			return nil
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		os.Remove(targetPath) // 清理失败的文件
+		return fmt.Errorf("failed to create backup archive: %w", err)
+	}
+
+	return nil
+}
+
+// cleanOldBackups 清理旧备份文件
+func (c *Client) cleanOldBackups(backupDir string, serverID uint, keepCount int) {
+	// 查找该服务器的所有备份文件
+	pattern := fmt.Sprintf("backup_%d_*.zip", serverID)
+	matches, err := filepath.Glob(filepath.Join(backupDir, pattern))
+	if err != nil {
+		c.logger.Error("Failed to find backup files: %v", err)
+		return
+	}
+
+	// 按修改时间排序
+	sort.Slice(matches, func(i, j int) bool {
+		info1, _ := os.Stat(matches[i])
+		info2, _ := os.Stat(matches[j])
+		return info1.ModTime().After(info2.ModTime())
+	})
+
+	// 删除多余的备份文件
+	if len(matches) > keepCount {
+		toDelete := matches[keepCount:]
+		for _, file := range toDelete {
+			if err := os.Remove(file); err != nil {
+				c.logger.Warn("Failed to delete old backup file %s: %v", file, err)
+			} else {
+				c.logger.Info("Deleted old backup file: %s", file)
+			}
+		}
+	}
+}
+
+// sendBackupResponse 发送备份响应
+func (c *Client) sendBackupResponse(msgType string, data interface{}) {
+	if !c.wsClient.IsConnected() {
+		c.logger.Debug("WebSocket not connected, skipping backup response")
+		return
+	}
+
+	msg := request.WebSocketMessage{
+		Type: msgType,
+		Data: data,
+	}
+
+	if err := c.wsClient.SendMessage(msg); err != nil {
+		c.logger.Error("Failed to send backup response: %v", err)
 	}
 }
