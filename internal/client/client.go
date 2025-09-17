@@ -393,35 +393,45 @@ func (c *Client) handleServerStart() {
 		}
 	}
 
-	// Start the server process first
-	if err := c.process.Start(); err != nil {
-		c.sendResponse(MsgTypeServerStart, nil, fmt.Sprintf("Failed to start server: %v", err))
-		return
-	}
-
-	// After server starts, try to initialize database connection
-	// This is done after server start because the database file is created by SCUM server
-	go func() {
-		// Wait a bit for the server to create the database file
-		time.Sleep(5 * time.Second)
-		c.logger.Info("Attempting to initialize database connection after server start...")
-
-		// Check if database is available before trying to initialize
-		if c.db.IsAvailable() {
-			if err := c.db.Initialize(); err != nil {
-				c.logger.Warn("Failed to initialize database after server start: %v", err)
-			} else {
-				c.logger.Info("Database connection initialized successfully after server start")
-			}
-		} else {
-			c.logger.Info("Database file not yet available, will retry later")
-		}
-	}()
-
+	// 先发送启动开始的响应，避免长时间无响应导致连接超时
 	c.sendResponse(MsgTypeServerStart, map[string]interface{}{
-		"status": "started",
-		"pid":    c.process.GetPID(),
+		"status":  "starting",
+		"message": "Server startup initiated...",
 	}, "")
+
+	// Start the server process in a goroutine to avoid blocking WebSocket
+	go func() {
+		if err := c.process.Start(); err != nil {
+			c.logger.Error("Failed to start server: %v", err)
+			c.sendResponse(MsgTypeServerStart, nil, fmt.Sprintf("Failed to start server: %v", err))
+			return
+		}
+
+		// Send success response after process starts
+		c.sendResponse(MsgTypeServerStart, map[string]interface{}{
+			"status": "started",
+			"pid":    c.process.GetPID(),
+		}, "")
+
+		// After server starts, try to initialize database connection
+		// This is done after server start because the database file is created by SCUM server
+		go func() {
+			// Wait a bit for the server to create the database file
+			time.Sleep(5 * time.Second)
+			c.logger.Info("Attempting to initialize database connection after server start...")
+
+			// Check if database is available before trying to initialize
+			if c.db.IsAvailable() {
+				if err := c.db.Initialize(); err != nil {
+					c.logger.Warn("Failed to initialize database after server start: %v", err)
+				} else {
+					c.logger.Info("Database connection initialized successfully after server start")
+				}
+			} else {
+				c.logger.Info("Database file not yet available, will retry later")
+			}
+		}()
+	}()
 }
 
 // handleServerStop handles server stop request
@@ -622,20 +632,7 @@ func (c *Client) updateServerConfig(configData map[string]interface{}) {
 		c.logger.Info("Created new process manager with server configuration")
 	}
 
-	// 检查是否需要自动启动服务器（仅在配置同步时，而非配置更新时）
-	if c.config.AutoInstall.AutoStartAfterConfig {
-		steamDetector := steam.NewDetector(c.logger)
-		if steamDetector.IsSCUMServerInstalled(c.steamDir) && !c.process.IsRunning() {
-			c.logger.Info("Auto-start after config sync is enabled and server is installed, starting SCUM server...")
-			go func() {
-				// 等待一段时间让配置完全更新
-				time.Sleep(2 * time.Second)
-				c.handleServerStart()
-			}()
-		}
-	}
-
-	// 发送配置更新确认
+	// 发送配置更新确认 - 先发送确认再执行耗时操作
 	response := request.WebSocketMessage{
 		Type:    MsgTypeConfigUpdate,
 		Success: true,
@@ -651,7 +648,24 @@ func (c *Client) updateServerConfig(configData map[string]interface{}) {
 			},
 		},
 	}
-	c.wsClient.SendMessage(response)
+	if err := c.wsClient.SendMessage(response); err != nil {
+		c.logger.Error("Failed to send config update confirmation: %v", err)
+	}
+
+	// 检查是否需要自动启动服务器（仅在配置同步时，而非配置更新时）
+	if c.config.AutoInstall.AutoStartAfterConfig {
+		steamDetector := steam.NewDetector(c.logger)
+		if steamDetector.IsSCUMServerInstalled(c.steamDir) && !c.process.IsRunning() {
+			c.logger.Info("Auto-start after config sync is enabled and server is installed, scheduling server start...")
+			// 使用更长的延迟，确保WebSocket连接稳定
+			go func() {
+				// 等待更长时间确保配置完全更新且连接稳定
+				time.Sleep(5 * time.Second)
+				c.logger.Info("Starting SCUM server after config sync...")
+				c.handleServerStart()
+			}()
+		}
+	}
 }
 
 // handleInstallServer 已移除 - 客户端自动处理安装，不再响应服务器端安装请求

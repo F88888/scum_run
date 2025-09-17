@@ -55,8 +55,8 @@ func New(url string, logger *logger.Logger) *Client {
 		maxRetries:        -1,               // 无限重试
 		retryInterval:     5 * time.Second,  // 增加重连间隔，减少频繁重连
 		maxRetryInterval:  60 * time.Second, // 增加最大重连间隔
-		heartbeatInterval: 30 * time.Second, // 与服务端错开的心跳时间
-		heartbeatTimeout:  30 * time.Minute, // 大幅延长心跳超时到30分钟，避免误判断开
+		heartbeatInterval: 40 * time.Second, // 与服务端错开的心跳时间，避免冲突
+		heartbeatTimeout:  5 * time.Minute,  // 合理的心跳超时时间，给网络波动缓冲
 		readBufferSize:    128 * 1024,       // 与服务端一致的缓冲区大小
 		writeBufferSize:   128 * 1024,       // 与服务端一致的缓冲区大小
 		maxMessageSize:    2 * 1024 * 1024,  // 与服务端一致的最大消息大小
@@ -382,17 +382,25 @@ func (c *Client) messageLoop() {
 					c.logger.Error("Unexpected WebSocket close in message loop: %v", err)
 					c.handleDisconnection()
 				} else if strings.Contains(err.Error(), "unexpected EOF") {
-					// 客户端异常关闭，通常是网络问题
-					c.logger.Warn("Connection closed abnormally (unexpected EOF): %v", err)
+					// 客户端异常关闭，通常是网络问题 - 使用更温和的重连策略
+					c.logger.Info("Connection interrupted (unexpected EOF), will reconnect: %v", err)
 					c.handleDisconnection()
 				} else if strings.Contains(err.Error(), "close 1006") {
-					// WebSocket 1006错误码表示异常关闭
-					c.logger.Warn("Connection closed with abnormal closure (1006): %v", err)
+					// WebSocket 1006错误码表示异常关闭 - 通常是网络问题
+					c.logger.Info("Connection closed abnormally (1006), will reconnect: %v", err)
+					c.handleDisconnection()
+				} else if strings.Contains(err.Error(), "connection reset by peer") {
+					// 连接被对端重置 - 通常是网络问题或服务器重启
+					c.logger.Info("Connection reset by peer, will reconnect: %v", err)
 					c.handleDisconnection()
 				} else if strings.Contains(err.Error(), "i/o timeout") {
 					// 读取超时，继续循环
 					c.logger.Debug("Read timeout in message loop, continuing...")
 					continue
+				} else if strings.Contains(err.Error(), "use of closed network connection") {
+					// 连接已关闭，退出循环
+					c.logger.Debug("Network connection closed, exiting message loop")
+					return
 				} else {
 					// 其他错误继续循环
 					c.logger.Debug("Read error in message loop: %v", err)
@@ -443,15 +451,15 @@ func (c *Client) reconnect() {
 		case <-time.After(backoff):
 			// 首次重连前等待更长时间，避免启动时的频繁重连
 			if isFirstAttempt {
-				c.logger.Info("Waiting before first reconnection attempt...")
-				time.Sleep(2 * time.Second)
+				c.logger.Info("Starting reconnection process...")
+				time.Sleep(1 * time.Second) // 减少初始等待时间
 				isFirstAttempt = false
 			}
 
 			c.logger.Info("Attempting to reconnect... (attempt %d)", retryCount+1)
 
 			if err := c.Connect(); err != nil {
-				c.logger.Error("Reconnection failed: %v", err)
+				c.logger.Warn("Reconnection attempt %d failed: %v", retryCount+1, err)
 				retryCount++
 
 				// 检查是否达到最大重试次数
@@ -460,13 +468,27 @@ func (c *Client) reconnect() {
 					return
 				}
 
-				// 指数退避
-				backoff *= 2
-				if backoff > c.maxRetryInterval {
-					backoff = c.maxRetryInterval
+				// 智能退避策略：网络错误使用较短间隔，其他错误使用指数退避
+				if strings.Contains(err.Error(), "connection refused") ||
+					strings.Contains(err.Error(), "network is unreachable") ||
+					strings.Contains(err.Error(), "timeout") {
+					// 网络问题，使用固定的较短间隔
+					backoff = c.retryInterval
+				} else {
+					// 其他错误，使用指数退避
+					backoff *= 2
+					if backoff > c.maxRetryInterval {
+						backoff = c.maxRetryInterval
+					}
+				}
+
+				// 对于频繁的连接失败，增加额外延迟
+				if retryCount > 5 {
+					c.logger.Info("Multiple reconnection failures, adding extra delay...")
+					time.Sleep(5 * time.Second)
 				}
 			} else {
-				c.logger.Info("Reconnected successfully")
+				c.logger.Info("Reconnected successfully after %d attempts", retryCount+1)
 
 				// 调用重连回调
 				if c.onReconnect != nil {
