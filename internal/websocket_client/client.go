@@ -121,8 +121,6 @@ func (c *Client) ConnectWithAutoReconnect() error {
 	// 启动重连监控和心跳
 	go c.monitorConnection()
 	go c.heartbeatLoop()
-	// 启动消息监听循环，确保能及时处理ping/pong消息
-	go c.messageLoop()
 
 	return nil
 }
@@ -182,48 +180,69 @@ func (c *Client) SendMessage(message interface{}) error {
 
 // ReadMessage reads a message from WebSocket
 func (c *Client) ReadMessage(message interface{}) error {
-	c.mutex.RLock()
-	if !c.isRunning || c.conn == nil {
+	for {
+		c.mutex.RLock()
+		if !c.isRunning || c.conn == nil {
+			c.mutex.RUnlock()
+			c.logger.Error("Cannot read message: connection not running or nil")
+			return websocket.ErrCloseSent
+		}
+		conn := c.conn
 		c.mutex.RUnlock()
-		c.logger.Error("Cannot read message: connection not running or nil")
-		return websocket.ErrCloseSent
-	}
-	conn := c.conn
-	c.mutex.RUnlock()
 
-	c.logger.Debug("Waiting for message from server...")
-	messageType, data, err := conn.ReadMessage()
-	if err != nil {
-		c.logger.Error("Failed to read message: %v", err)
-		// 连接断开，触发重连
-		c.handleDisconnection()
-		return err
-	}
+		c.logger.Debug("Waiting for message from server...")
+		messageType, data, err := conn.ReadMessage()
+		if err != nil {
+			c.logger.Error("Failed to read message: %v", err)
+			// 连接断开，触发重连
+			c.handleDisconnection()
+			return err
+		}
 
-	// 处理Pong消息
-	if messageType == websocket.PongMessage {
-		c.mutex.Lock()
-		c.lastHeartbeat = time.Now()
-		c.mutex.Unlock()
-		c.logger.Debug("Received pong message")
-		return nil
-	}
+		// 处理不同类型的消息
+		switch messageType {
+		case websocket.PingMessage:
+			// 响应ping消息
+			c.mutex.Lock()
+			if c.conn != nil {
+				_ = c.conn.WriteMessage(websocket.PongMessage, data)
+			}
+			c.mutex.Unlock()
+			c.logger.Debug("Responded to ping message")
+			// 继续读取下一条消息
+			continue
 
-	// 只处理文本消息
-	if messageType != websocket.TextMessage {
-		c.logger.Debug("Received non-text message, ignoring")
-		return nil
-	}
+		case websocket.PongMessage:
+			// 更新心跳时间
+			c.mutex.Lock()
+			c.lastHeartbeat = time.Now()
+			c.mutex.Unlock()
+			c.logger.Debug("Received pong message")
+			// 继续读取下一条消息
+			continue
 
-	c.logger.Debug("Received raw message: %s", string(data))
-	err = json.Unmarshal(data, message)
-	if err != nil {
-		c.logger.Error("Failed to unmarshal message: %v", err)
-		return err
-	}
+		case websocket.TextMessage:
+			// 处理文本消息
+			c.logger.Debug("Received raw message: %s", string(data))
+			err = json.Unmarshal(data, message)
+			if err != nil {
+				c.logger.Error("Failed to unmarshal message: %v", err)
+				return err
+			}
+			c.logger.Debug("Message unmarshaled successfully: %+v", message)
+			return nil
 
-	c.logger.Debug("Message unmarshaled successfully: %+v", message)
-	return nil
+		case websocket.BinaryMessage:
+			// 二进制消息暂时忽略，继续读取下一条消息
+			c.logger.Debug("Received binary message, ignoring")
+			continue
+
+		default:
+			// 其他类型消息忽略，继续读取下一条消息
+			c.logger.Debug("Received non-text message type %d, ignoring", messageType)
+			continue
+		}
+	}
 }
 
 // IsConnected returns whether the client is connected
@@ -342,101 +361,18 @@ func (c *Client) handleDisconnection() {
 			c.onDisconnect()
 		}
 
-		// 触发重连
+		// 触发重连 - 使用非阻塞发送避免死锁
 		select {
 		case c.reconnectChan <- struct{}{}:
 		default:
+			// 如果重连通道已满，说明重连已在进行中
+			c.logger.Debug("Reconnection already in progress")
 		}
 	}
 }
 
-// messageLoop 持续监听WebSocket消息，确保能及时处理ping/pong消息
-func (c *Client) messageLoop() {
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		default:
-			if !c.IsConnected() {
-				// 连接断开时等待一段时间再检查
-				time.Sleep(1 * time.Second)
-				continue
-			}
-
-			c.mutex.RLock()
-			conn := c.conn
-			c.mutex.RUnlock()
-
-			if conn == nil {
-				time.Sleep(1 * time.Second)
-				continue
-			}
-
-			// 设置较短的读取超时，避免阻塞过久
-			_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-			messageType, data, err := conn.ReadMessage()
-			_ = conn.SetReadDeadline(time.Time{}) // 清除超时
-
-			if err != nil {
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-					c.logger.Error("Unexpected WebSocket close in message loop: %v", err)
-					c.handleDisconnection()
-				} else if strings.Contains(err.Error(), "unexpected EOF") {
-					// 客户端异常关闭，通常是网络问题 - 使用更温和的重连策略
-					c.logger.Info("Connection interrupted (unexpected EOF), will reconnect: %v", err)
-					c.handleDisconnection()
-				} else if strings.Contains(err.Error(), "close 1006") {
-					// WebSocket 1006错误码表示异常关闭 - 通常是网络问题
-					c.logger.Info("Connection closed abnormally (1006), will reconnect: %v", err)
-					c.handleDisconnection()
-				} else if strings.Contains(err.Error(), "connection reset by peer") {
-					// 连接被对端重置 - 通常是网络问题或服务器重启
-					c.logger.Info("Connection reset by peer, will reconnect: %v", err)
-					c.handleDisconnection()
-				} else if strings.Contains(err.Error(), "i/o timeout") {
-					// 读取超时，继续循环
-					c.logger.Debug("Read timeout in message loop, continuing...")
-					continue
-				} else if strings.Contains(err.Error(), "use of closed network connection") {
-					// 连接已关闭，退出循环
-					c.logger.Debug("Network connection closed, exiting message loop")
-					return
-				} else {
-					// 其他错误继续循环
-					c.logger.Debug("Read error in message loop: %v", err)
-					continue
-				}
-			}
-
-			// 处理不同类型的消息
-			switch messageType {
-			case websocket.PingMessage:
-				// 响应ping消息
-				c.mutex.Lock()
-				if c.conn != nil {
-					_ = c.conn.WriteMessage(websocket.PongMessage, data)
-				}
-				c.mutex.Unlock()
-				c.logger.Debug("Responded to ping message")
-
-			case websocket.PongMessage:
-				// 更新心跳时间
-				c.mutex.Lock()
-				c.lastHeartbeat = time.Now()
-				c.mutex.Unlock()
-				c.logger.Debug("Received pong message")
-
-			case websocket.TextMessage:
-				// 文本消息暂时忽略，因为业务逻辑在其他地方处理
-				c.logger.Debug("Received text message in background loop: %s", string(data))
-
-			case websocket.BinaryMessage:
-				// 二进制消息暂时忽略
-				c.logger.Debug("Received binary message in background loop")
-			}
-		}
-	}
-}
+// messageLoop function removed to prevent race conditions with concurrent reads
+// Ping/Pong handling is now integrated into the main ReadMessage method
 
 // reconnect attempts to reconnect to the WebSocket server
 func (c *Client) reconnect() {
@@ -495,9 +431,8 @@ func (c *Client) reconnect() {
 					c.onReconnect()
 				}
 
-				// 重新启动连接监控和消息循环
+				// 重新启动连接监控
 				go c.monitorConnection()
-				go c.messageLoop()
 				return
 			}
 		}

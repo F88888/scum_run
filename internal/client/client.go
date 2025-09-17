@@ -79,9 +79,8 @@ const (
 	MsgTypeClientUpdate     = "client_update"     // 客户端更新
 
 	// File management
-	MsgTypeFileBrowse    = "file_browse"    // 文件浏览
-	MsgTypeFileList      = "file_list"      // 文件列表响应
-	MsgTypeFileOperation = "file_operation" // 文件操作
+	MsgTypeFileBrowse = "file_browse" // 文件浏览
+	MsgTypeFileList   = "file_list"   // 文件列表响应
 )
 
 // New creates a new SCUM Run client
@@ -236,15 +235,21 @@ func (c *Client) Stop() {
 	}
 
 	if c.process != nil {
-		c.process.Stop()
+		if err := c.process.Stop(); err != nil {
+			c.logger.Warn("Failed to stop process: %v", err)
+		}
 	}
 
 	if c.db != nil {
-		c.db.Close()
+		if err := c.db.Close(); err != nil {
+			c.logger.Warn("Failed to close database: %v", err)
+		}
 	}
 
 	if c.wsClient != nil {
-		c.wsClient.Close()
+		if err := c.wsClient.Close(); err != nil {
+			c.logger.Warn("Failed to close WebSocket client: %v", err)
+		}
 	}
 
 	// Stop Steam++ last
@@ -282,11 +287,15 @@ func (c *Client) ForceStop() {
 	}
 
 	if c.db != nil {
-		c.db.Close()
+		if err := c.db.Close(); err != nil {
+			c.logger.Warn("Failed to close database: %v", err)
+		}
 	}
 
 	if c.wsClient != nil {
-		c.wsClient.Close()
+		if err := c.wsClient.Close(); err != nil {
+			c.logger.Warn("Failed to close WebSocket client: %v", err)
+		}
 	}
 
 	// Stop Steam++ last
@@ -309,10 +318,24 @@ func (c *Client) handleMessages() {
 		case <-c.ctx.Done():
 			return
 		default:
+			// 检查WebSocket客户端是否仍然连接
+			if !c.wsClient.IsConnected() {
+				c.logger.Debug("WebSocket not connected, waiting for reconnection...")
+				time.Sleep(2 * time.Second)
+				continue
+			}
+
 			var msg request.WebSocketMessage
 			if err := c.wsClient.ReadMessage(&msg); err != nil {
-				c.logger.Error("Failed to read WebSocket message: %v", err)
-				time.Sleep(time.Second)
+				// 使用更详细的错误处理
+				if strings.Contains(err.Error(), "connection not running") ||
+					strings.Contains(err.Error(), "websocket: close") {
+					c.logger.Debug("WebSocket connection closed, waiting for reconnection...")
+					time.Sleep(2 * time.Second)
+				} else {
+					c.logger.Error("Failed to read WebSocket message: %v", err)
+					time.Sleep(1 * time.Second)
+				}
 				continue
 			}
 
@@ -587,48 +610,48 @@ func (c *Client) handleConfigUpdate(data interface{}) {
 
 // updateServerConfig updates the local server configuration
 func (c *Client) updateServerConfig(configData map[string]interface{}) {
-	config := &model.ServerConfig{}
+	serverConfig := &model.ServerConfig{}
 
 	if installPath, ok := configData["install_path"].(string); ok && installPath != "" {
-		config.ExecPath = installPath + "\\SCUM\\Binaries\\Win64\\SCUMServer.exe"
+		serverConfig.ExecPath = installPath + "\\SCUM\\Binaries\\Win64\\SCUMServer.exe"
 	} else {
 		// 如果没有配置路径，使用Steam检测的路径
 		steamDetector := steam.NewDetector(c.logger)
-		config.ExecPath = steamDetector.GetSCUMServerPath(c.steamDir)
+		serverConfig.ExecPath = steamDetector.GetSCUMServerPath(c.steamDir)
 	}
 
 	if gamePort, ok := configData["game_port"].(float64); ok {
-		config.GamePort = int(gamePort)
+		serverConfig.GamePort = int(gamePort)
 	} else {
-		config.GamePort = _const.DefaultGamePort
+		serverConfig.GamePort = _const.DefaultGamePort
 	}
 
 	if maxPlayers, ok := configData["max_players"].(float64); ok {
-		config.MaxPlayers = int(maxPlayers)
+		serverConfig.MaxPlayers = int(maxPlayers)
 	} else {
-		config.MaxPlayers = _const.DefaultMaxPlayers
+		serverConfig.MaxPlayers = _const.DefaultMaxPlayers
 	}
 
 	if enableBattlEye, ok := configData["enable_battleye"].(bool); ok {
-		config.EnableBattlEye = enableBattlEye
+		serverConfig.EnableBattlEye = enableBattlEye
 	}
 
 	if serverIP, ok := configData["server_ip"].(string); ok {
-		config.ServerIP = serverIP
+		serverConfig.ServerIP = serverIP
 	}
 
 	if additionalArgs, ok := configData["additional_args"].(string); ok {
-		config.AdditionalArgs = additionalArgs
+		serverConfig.AdditionalArgs = additionalArgs
 	}
 
 	// 更新进程管理器配置
 	if c.process != nil {
-		c.process.UpdateConfig(config)
+		c.process.UpdateConfig(serverConfig)
 		c.logger.Info("Updated server configuration - Path: %s, Port: %d, MaxPlayers: %d, BattlEye: %v",
-			config.ExecPath, config.GamePort, config.MaxPlayers, config.EnableBattlEye)
+			serverConfig.ExecPath, serverConfig.GamePort, serverConfig.MaxPlayers, serverConfig.EnableBattlEye)
 	} else {
 		// 如果进程管理器还未创建，则创建一个新的
-		c.process = process.NewWithConfig(config, c.logger)
+		c.process = process.NewWithConfig(serverConfig, c.logger)
 		c.logger.Info("Created new process manager with server configuration")
 	}
 
@@ -639,12 +662,12 @@ func (c *Client) updateServerConfig(configData map[string]interface{}) {
 		Data: map[string]interface{}{
 			"config_updated": true,
 			"current_config": map[string]interface{}{
-				"exec_path":       config.ExecPath,
-				"game_port":       config.GamePort,
-				"max_players":     config.MaxPlayers,
-				"enable_battleye": config.EnableBattlEye,
-				"server_ip":       config.ServerIP,
-				"additional_args": config.AdditionalArgs,
+				"exec_path":       serverConfig.ExecPath,
+				"game_port":       serverConfig.GamePort,
+				"max_players":     serverConfig.MaxPlayers,
+				"enable_battleye": serverConfig.EnableBattlEye,
+				"server_ip":       serverConfig.ServerIP,
+				"additional_args": serverConfig.AdditionalArgs,
 			},
 		},
 	}
@@ -685,7 +708,7 @@ func (c *Client) handleAuthResponse(msg request.WebSocketMessage) {
 }
 
 // handleDownloadSteamCmd handles SteamCmd download requests
-func (c *Client) handleDownloadSteamCmd(data interface{}) {
+func (c *Client) handleDownloadSteamCmd(_ interface{}) {
 	c.logger.Info("Received SteamCmd download request")
 
 	// 在后台执行SteamCmd下载
@@ -1058,7 +1081,7 @@ func (c *Client) handleServerUpdateCheck() {
 }
 
 // handleServerUpdateInstall performs server update installation
-func (c *Client) handleServerUpdateInstall(updateData map[string]interface{}) {
+func (c *Client) handleServerUpdateInstall(_ map[string]interface{}) {
 	c.logger.Info("Starting SCUM server update installation...")
 
 	// 检查是否已经在安装中
@@ -1224,7 +1247,11 @@ func (c *Client) downloadSteamCmd() error {
 	if err != nil {
 		return fmt.Errorf("failed to download steamcmd: %w", err)
 	}
-	defer response.Body.Close()
+	defer func() {
+		if err := response.Body.Close(); err != nil {
+			c.logger.Warn("Failed to close response body: %v", err)
+		}
+	}()
 
 	// 创建临时文件
 	tempFile := filepath.Join(steamCmdDir, "steamcmd.zip")
@@ -1232,7 +1259,11 @@ func (c *Client) downloadSteamCmd() error {
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %w", err)
 	}
-	defer out.Close()
+	defer func() {
+		if err := out.Close(); err != nil {
+			c.logger.Warn("Failed to close temp file: %v", err)
+		}
+	}()
 
 	// 写入文件
 	_, err = io.Copy(out, response.Body)
@@ -1248,7 +1279,9 @@ func (c *Client) downloadSteamCmd() error {
 
 	// 删除临时文件
 	c.logger.Info("Cleaning up temporary file: %s", tempFile)
-	os.Remove(tempFile)
+	if err := os.Remove(tempFile); err != nil {
+		c.logger.Warn("Failed to remove temp file %s: %v", tempFile, err)
+	}
 
 	// 验证SteamCmd是否成功解压
 	expectedPath := _const.DefaultSteamCmdPath
@@ -1307,13 +1340,13 @@ func (c *Client) extractZip(src, dest string) error {
 
 		outFile, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.FileInfo().Mode())
 		if err != nil {
-			rc.Close()
+			_ = rc.Close()
 			return err
 		}
 
 		_, err = io.Copy(outFile, rc)
-		outFile.Close()
-		rc.Close()
+		_ = outFile.Close()
+		_ = rc.Close()
 
 		if err != nil {
 			return err
@@ -1407,7 +1440,7 @@ func (c *Client) sendLogData(content string) {
 }
 
 // handleProcessOutput handles real-time output from SCUM server process
-func (c *Client) handleProcessOutput(source string, line string) {
+func (c *Client) handleProcessOutput(_ string, line string) {
 	// 直接发送原始日志内容，不添加前缀
 	c.sendLogData(line)
 }
@@ -1613,7 +1646,7 @@ func (c *Client) handleFileBrowse(data interface{}) {
 }
 
 // handleFileList 处理文件列表响应（通常不会在客户端收到）
-func (c *Client) handleFileList(data interface{}) {
+func (c *Client) handleFileList(_ interface{}) {
 	c.logger.Debug("Received file list response (unexpected)")
 }
 
@@ -1726,7 +1759,7 @@ func getFilePermissions(mode os.FileMode) string {
 }
 
 // getFileOwner 获取文件所有者（简化版本）
-func getFileOwner(info os.FileInfo) string {
+func getFileOwner(_ os.FileInfo) string {
 	// 在Windows上，这个功能比较复杂，暂时返回"system"
 	// 在Linux上可以使用syscall.Getuid()等
 	return "system"
