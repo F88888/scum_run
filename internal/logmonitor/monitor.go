@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/fsnotify/fsnotify"
 
@@ -34,15 +36,15 @@ type Monitor struct {
 
 // fileState tracks the state of a monitored file
 type fileState struct {
-	filename   string
-	lastSize   int64
+	filename    string
+	lastSize    int64
 	lastModTime time.Time
 }
 
 // New creates a new log monitor
 func New(logsPath string, logger *logger.Logger, callback LogUpdateCallback) *Monitor {
 	ctx, cancel := context.WithCancel(context.Background())
-	
+
 	return &Monitor{
 		logsPath:   logsPath,
 		logger:     logger,
@@ -91,11 +93,11 @@ func (m *Monitor) Stop() {
 	if m.cancel != nil {
 		m.cancel()
 	}
-	
+
 	if m.watcher != nil {
 		m.watcher.Close()
 	}
-	
+
 	m.wg.Wait()
 	m.logger.Info("Log monitor stopped")
 }
@@ -163,7 +165,7 @@ func (m *Monitor) monitorLoop() {
 // handleFileEvent handles file system events
 func (m *Monitor) handleFileEvent(event fsnotify.Event) {
 	filename := filepath.Base(event.Name)
-	
+
 	if !m.isLogFile(filename) {
 		return
 	}
@@ -211,7 +213,7 @@ func (m *Monitor) handleFileRemoved(filename string) {
 	m.mutex.Lock()
 	delete(m.fileStates, filename)
 	m.mutex.Unlock()
-	
+
 	m.logger.Info("Stopped monitoring removed log file: %s", filename)
 }
 
@@ -232,7 +234,7 @@ func (m *Monitor) checkFileChanges() {
 // checkFileForNewLines checks a specific file for new lines
 func (m *Monitor) checkFileForNewLines(filename string) {
 	filepath := filepath.Join(m.logsPath, filename)
-	
+
 	fileInfo, err := os.Stat(filepath)
 	if err != nil {
 		// File might have been deleted
@@ -269,13 +271,13 @@ func (m *Monitor) checkFileForNewLines(filename string) {
 
 	if len(newLines) > 0 {
 		m.logger.Debug("Found %d new lines in %s", len(newLines), filename)
-		
+
 		// Update state
 		m.mutex.Lock()
 		state.lastSize = fileInfo.Size()
 		state.lastModTime = fileInfo.ModTime()
 		m.mutex.Unlock()
-		
+
 		// Call callback with new lines
 		if m.callback != nil {
 			m.callback(filename, newLines)
@@ -284,6 +286,7 @@ func (m *Monitor) checkFileForNewLines(filename string) {
 }
 
 // readNewLines reads new lines from a file starting from the given offset
+// Supports both UTF-8 and UTF-16LE encoding
 func (m *Monitor) readNewLines(filepath string, startOffset, endOffset int64) ([]string, error) {
 	file, err := os.Open(filepath)
 	if err != nil {
@@ -296,27 +299,99 @@ func (m *Monitor) readNewLines(filepath string, startOffset, endOffset int64) ([
 		return nil, err
 	}
 
-	// Create a limited reader to only read the new content
-	limitedReader := io.LimitReader(file, endOffset-startOffset)
-	scanner := bufio.NewScanner(limitedReader)
+	// Read the new content
+	contentSize := endOffset - startOffset
+	content := make([]byte, contentSize)
+	n, err := io.ReadFull(file, content)
+	if err != nil && err != io.ErrUnexpectedEOF {
+		return nil, err
+	}
+	content = content[:n]
 
-	var lines []string
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	// Detect encoding and decode content
+	text, err := m.decodeContent(content)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode content: %w", err)
+	}
+
+	// Split into lines
+	lines := strings.Split(text, "\n")
+	var result []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
 		if line != "" {
-			lines = append(lines, line)
+			result = append(result, line)
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		return nil, err
+	return result, nil
+}
+
+// decodeContent detects encoding and decodes the content
+func (m *Monitor) decodeContent(content []byte) (string, error) {
+	if len(content) == 0 {
+		return "", nil
 	}
 
-	return lines, nil
+	// Check for UTF-16LE BOM (Byte Order Mark)
+	if len(content) >= 2 && content[0] == 0xFF && content[1] == 0xFE {
+		// UTF-16LE with BOM
+		return m.decodeUTF16LE(content[2:])
+	}
+
+	// Check if content is valid UTF-8
+	if utf8.Valid(content) {
+		return string(content), nil
+	}
+
+	// Try to decode as UTF-16LE without BOM
+	// Check if content length is even (UTF-16LE requires even number of bytes)
+	if len(content)%2 == 0 {
+		// Try UTF-16LE decoding
+		if text, err := m.decodeUTF16LE(content); err == nil {
+			return text, nil
+		}
+	}
+
+	// Fallback to UTF-8 with replacement characters
+	return string(content), nil
+}
+
+// decodeUTF16LE decodes UTF-16LE encoded content
+func (m *Monitor) decodeUTF16LE(content []byte) (string, error) {
+	if len(content)%2 != 0 {
+		return "", fmt.Errorf("UTF-16LE content must have even number of bytes")
+	}
+
+	// Convert bytes to UTF-16 code units
+	codeUnits := make([]uint16, len(content)/2)
+	for i := 0; i < len(content); i += 2 {
+		codeUnits[i/2] = uint16(content[i]) | (uint16(content[i+1]) << 8)
+	}
+
+	// Convert UTF-16 to UTF-8
+	return string(utf16.Decode(codeUnits)), nil
 }
 
 // isLogFile determines if a file is a log file we should monitor
+// Only monitor specific SCUM log files: chat, login, kill, economy, gameplay, vehicle_destruction
 func (m *Monitor) isLogFile(filename string) bool {
+	// Convert filename to lowercase for case-insensitive matching
+	lowerFilename := strings.ToLower(filename)
+
+	// Check if file has .log extension
 	ext := strings.ToLower(filepath.Ext(filename))
-	return ext == ".log" || ext == ".txt" || strings.Contains(strings.ToLower(filename), "log")
-} 
+	if ext != ".log" {
+		return false
+	}
+
+	// Check if filename starts with one of the specific SCUM log prefixes
+	scumLogPrefixes := []string{"chat", "login", "kill", "economy", "gameplay", "vehicle_destruction"}
+	for _, prefix := range scumLogPrefixes {
+		if strings.HasPrefix(lowerFilename, prefix) {
+			return true
+		}
+	}
+
+	return false
+}
