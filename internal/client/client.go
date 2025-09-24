@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"github.com/saintfish/chardet"
 	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/encoding/unicode"
+	"golang.org/x/text/transform"
 	"io"
 	"net/http"
 	"net/url"
@@ -97,6 +99,13 @@ const (
 	MsgTypeBackupList     = "backup_list"     // 备份列表
 	MsgTypeBackupDelete   = "backup_delete"   // 删除备份
 	MsgTypeBackupProgress = "backup_progress" // 备份进度
+
+	// File transfer related
+	MsgTypeFileTransfer  = "file_transfer"  // 文件传输
+	MsgTypeFileUpload    = "file_upload"    // 文件上传
+	MsgTypeFileDownload  = "file_download"  // 文件下载
+	MsgTypeCloudUpload   = "cloud_upload"   // 云存储上传
+	MsgTypeCloudDownload = "cloud_download" // 云存储下载
 )
 
 // New creates a new SCUM Run client
@@ -436,6 +445,16 @@ func (c *Client) handleMessage(msg request.WebSocketMessage) {
 		c.handleBackupList(msg.Data)
 	case MsgTypeBackupDelete:
 		c.handleBackupDelete(msg.Data)
+	case MsgTypeFileTransfer:
+		c.handleFileTransfer(msg.Data)
+	case MsgTypeFileUpload:
+		c.handleFileUpload(msg.Data)
+	case MsgTypeFileDownload:
+		c.handleFileDownload(msg.Data)
+	case MsgTypeCloudUpload:
+		c.handleCloudUpload(msg.Data)
+	case MsgTypeCloudDownload:
+		c.handleCloudDownload(msg.Data)
 	default:
 		c.logger.Warn("Unknown message type: %s", msg.Type)
 	}
@@ -2108,8 +2127,33 @@ func (c *Client) readFileWithEncoding(filePath, encoding string) (string, error)
 
 	// 根据编码转换内容
 	switch strings.ToLower(encoding) {
+	case "binary":
+		// 对于二进制文件，直接返回原始字节数据（base64编码）
+		return string(fileData), nil
 	case "utf-8", "utf8":
 		return string(fileData), nil
+	case "utf-16le":
+		// 对于UTF-16LE编码，尝试转换
+		decoder := unicode.UTF16(unicode.LittleEndian, unicode.UseBOM).NewDecoder()
+		reader := transform.NewReader(strings.NewReader(string(fileData)), decoder)
+		decoded, err := io.ReadAll(reader)
+		if err != nil {
+			// 如果转换失败，返回原始内容
+			c.logger.Warn("Failed to convert UTF-16LE to UTF-8, returning raw content: %v", err)
+			return string(fileData), nil
+		}
+		return string(decoded), nil
+	case "utf-16be":
+		// 对于UTF-16BE编码，尝试转换
+		decoder := unicode.UTF16(unicode.BigEndian, unicode.UseBOM).NewDecoder()
+		reader := transform.NewReader(strings.NewReader(string(fileData)), decoder)
+		decoded, err := io.ReadAll(reader)
+		if err != nil {
+			// 如果转换失败，返回原始内容
+			c.logger.Warn("Failed to convert UTF-16BE to UTF-8, returning raw content: %v", err)
+			return string(fileData), nil
+		}
+		return string(decoded), nil
 	case "gbk":
 		// 对于GBK编码，尝试转换
 		decoder := simplifiedchinese.GBK.NewDecoder()
@@ -2173,6 +2217,26 @@ func (c *Client) writeFileWithEncoding(filePath, content, encoding string) error
 	switch strings.ToLower(encoding) {
 	case "utf-8", "utf8":
 		fileData = []byte(content)
+	case "utf-16le":
+		// 对于UTF-16LE编码，尝试转换
+		encoder := unicode.UTF16(unicode.LittleEndian, unicode.IgnoreBOM).NewEncoder()
+		reader := transform.NewReader(strings.NewReader(content), encoder)
+		fileData, err = io.ReadAll(reader)
+		if err != nil {
+			// 如果转换失败，使用原始内容
+			c.logger.Warn("Failed to convert UTF-8 to UTF-16LE, using raw content: %v", err)
+			fileData = []byte(content)
+		}
+	case "utf-16be":
+		// 对于UTF-16BE编码，尝试转换
+		encoder := unicode.UTF16(unicode.BigEndian, unicode.IgnoreBOM).NewEncoder()
+		reader := transform.NewReader(strings.NewReader(content), encoder)
+		fileData, err = io.ReadAll(reader)
+		if err != nil {
+			// 如果转换失败，使用原始内容
+			c.logger.Warn("Failed to convert UTF-8 to UTF-16BE, using raw content: %v", err)
+			fileData = []byte(content)
+		}
 	case "gbk":
 		// 对于GBK编码，尝试转换
 		encoder := simplifiedchinese.GBK.NewEncoder()
@@ -2502,4 +2566,283 @@ func (c *Client) sendBackupResponse(msgType string, data interface{}) {
 	if err := c.wsClient.SendMessage(msg); err != nil {
 		c.logger.Error("Failed to send backup response: %v", err)
 	}
+}
+
+// handleFileTransfer 处理文件传输请求
+func (c *Client) handleFileTransfer(data interface{}) {
+	c.logger.Debug("Handling file transfer request")
+
+	dataMap, ok := data.(map[string]interface{})
+	if !ok {
+		c.logger.Error("Invalid file transfer request data")
+		c.sendResponse(MsgTypeFileTransfer, nil, "Invalid request data")
+		return
+	}
+
+	operation, _ := dataMap["operation"].(string)
+	transferID, _ := dataMap["transfer_id"].(string)
+
+	switch operation {
+	case "upload":
+		c.handleFileUpload(data)
+	case "download":
+		c.handleFileDownload(data)
+	default:
+		c.logger.Error("Unknown file transfer operation: %s", operation)
+		c.sendResponse(MsgTypeFileTransfer, map[string]interface{}{
+			"transfer_id": transferID,
+		}, "Unknown operation")
+	}
+}
+
+// handleFileUpload 处理文件上传请求
+func (c *Client) handleFileUpload(data interface{}) {
+	c.logger.Debug("Handling file upload request")
+
+	dataMap, ok := data.(map[string]interface{})
+	if !ok {
+		c.logger.Error("Invalid file upload request data")
+		c.sendResponse(MsgTypeFileUpload, nil, "Invalid request data")
+		return
+	}
+
+	filePath, _ := dataMap["file_path"].(string)
+	content, _ := dataMap["content"].(string)
+	encoding, _ := dataMap["encoding"].(string)
+	transferID, _ := dataMap["transfer_id"].(string)
+
+	if filePath == "" {
+		c.logger.Error("File path is required")
+		c.sendResponse(MsgTypeFileUpload, map[string]interface{}{
+			"transfer_id": transferID,
+		}, "File path is required")
+		return
+	}
+
+	if content == "" {
+		c.logger.Error("File content is required")
+		c.sendResponse(MsgTypeFileUpload, map[string]interface{}{
+			"transfer_id": transferID,
+		}, "File content is required")
+		return
+	}
+
+	if encoding == "" {
+		encoding = "utf-8"
+	}
+
+	// 构建完整文件路径
+	var fullPath string
+	if strings.HasPrefix(filePath, "/") {
+		// 绝对路径，直接使用
+		fullPath = filePath
+	} else {
+		// 相对路径，基于Steam目录
+		fullPath = filepath.Join(c.steamDir, filePath)
+	}
+
+	c.logger.Debug("Writing file: %s (encoding: %s, size: %d bytes)", fullPath, encoding, len(content))
+
+	// 确保目录存在
+	dir := filepath.Dir(fullPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		c.logger.Error("Failed to create directory %s: %v", dir, err)
+		c.sendResponse(MsgTypeFileUpload, map[string]interface{}{
+			"transfer_id": transferID,
+		}, fmt.Sprintf("Failed to create directory: %v", err))
+		return
+	}
+
+	// 写入文件内容
+	err := c.writeFileWithEncoding(fullPath, content, encoding)
+	if err != nil {
+		c.logger.Error("Failed to write file %s: %v", fullPath, err)
+		c.sendResponse(MsgTypeFileUpload, map[string]interface{}{
+			"transfer_id": transferID,
+		}, fmt.Sprintf("Failed to write file: %v", err))
+		return
+	}
+
+	// 发送成功响应
+	c.sendResponse(MsgTypeFileUpload, map[string]interface{}{
+		"transfer_id": transferID,
+		"file_path":   filePath,
+		"file_size":   len(content),
+	}, "")
+	c.logger.Debug("File uploaded successfully: %s, transfer_id: %s", filePath, transferID)
+}
+
+// handleFileDownload 处理文件下载请求
+func (c *Client) handleFileDownload(data interface{}) {
+	c.logger.Debug("Handling file download request")
+
+	dataMap, ok := data.(map[string]interface{})
+	if !ok {
+		c.logger.Error("Invalid file download request data")
+		c.sendResponse(MsgTypeFileDownload, nil, "Invalid request data")
+		return
+	}
+
+	filePath, _ := dataMap["file_path"].(string)
+	encoding, _ := dataMap["encoding"].(string)
+	transferID, _ := dataMap["transfer_id"].(string)
+
+	if filePath == "" {
+		c.logger.Error("File path is required")
+		c.sendResponse(MsgTypeFileDownload, map[string]interface{}{
+			"transfer_id": transferID,
+		}, "File path is required")
+		return
+	}
+
+	if encoding == "" {
+		encoding = "binary"
+	}
+
+	// 构建完整文件路径
+	var fullPath string
+	if strings.HasPrefix(filePath, "/") {
+		// 绝对路径，直接使用
+		fullPath = filePath
+	} else {
+		// 相对路径，基于Steam目录
+		fullPath = filepath.Join(c.steamDir, filePath)
+	}
+
+	c.logger.Debug("Reading file: %s (encoding: %s)", fullPath, encoding)
+
+	// 检查文件是否存在
+	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+		c.logger.Error("File does not exist: %s", fullPath)
+		c.sendResponse(MsgTypeFileDownload, map[string]interface{}{
+			"transfer_id": transferID,
+		}, fmt.Sprintf("File does not exist: %s", filePath))
+		return
+	}
+
+	// 读取文件内容
+	content, err := c.readFileWithEncoding(fullPath, encoding)
+	if err != nil {
+		c.logger.Error("Failed to read file %s: %v", fullPath, err)
+		c.sendResponse(MsgTypeFileDownload, map[string]interface{}{
+			"transfer_id": transferID,
+		}, fmt.Sprintf("Failed to read file: %v", err))
+		return
+	}
+
+	// 发送文件内容响应
+	responseData := map[string]interface{}{
+		"transfer_id": transferID,
+		"content":     content,
+		"encoding":    encoding,
+		"size":        len(content),
+	}
+
+	c.sendResponse(MsgTypeFileDownload, responseData, "")
+	c.logger.Debug("File downloaded successfully: %s (%d bytes), transfer_id: %s", filePath, len(content), transferID)
+}
+
+// handleCloudUpload 处理云存储上传请求
+func (c *Client) handleCloudUpload(data interface{}) {
+	c.logger.Debug("Handling cloud upload request")
+
+	dataMap, ok := data.(map[string]interface{})
+	if !ok {
+		c.logger.Error("Invalid cloud upload request data")
+		c.sendResponse(MsgTypeCloudUpload, nil, "Invalid request data")
+		return
+	}
+
+	filePath, _ := dataMap["file_path"].(string)
+	cloudPath, _ := dataMap["cloud_path"].(string)
+	transferID, _ := dataMap["transfer_id"].(string)
+
+	if filePath == "" {
+		c.logger.Error("File path is required")
+		c.sendResponse(MsgTypeCloudUpload, map[string]interface{}{
+			"transfer_id": transferID,
+		}, "File path is required")
+		return
+	}
+
+	// 构建完整文件路径
+	var fullPath string
+	if strings.HasPrefix(filePath, "/") {
+		// 绝对路径，直接使用
+		fullPath = filePath
+	} else {
+		// 相对路径，基于Steam目录
+		fullPath = filepath.Join(c.steamDir, filePath)
+	}
+
+	c.logger.Debug("Uploading file to cloud: %s -> %s", fullPath, cloudPath)
+
+	// 检查文件是否存在
+	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+		c.logger.Error("File does not exist: %s", fullPath)
+		c.sendResponse(MsgTypeCloudUpload, map[string]interface{}{
+			"transfer_id": transferID,
+		}, fmt.Sprintf("File does not exist: %s", filePath))
+		return
+	}
+
+	// TODO: 实现云存储上传逻辑
+	// 这里需要根据具体的云存储提供商实现上传逻辑
+	// 1. 读取文件内容
+	// 2. 使用上传URL和参数上传到云存储
+	// 3. 返回上传结果
+
+	c.logger.Warn("Cloud upload not implemented yet")
+	c.sendResponse(MsgTypeCloudUpload, map[string]interface{}{
+		"transfer_id": transferID,
+		"cloud_path":  cloudPath,
+	}, "Cloud upload not implemented yet")
+}
+
+// handleCloudDownload 处理云存储下载请求
+func (c *Client) handleCloudDownload(data interface{}) {
+	c.logger.Debug("Handling cloud download request")
+
+	dataMap, ok := data.(map[string]interface{})
+	if !ok {
+		c.logger.Error("Invalid cloud download request data")
+		c.sendResponse(MsgTypeCloudDownload, nil, "Invalid request data")
+		return
+	}
+
+	filePath, _ := dataMap["file_path"].(string)
+	cloudPath, _ := dataMap["cloud_path"].(string)
+	transferID, _ := dataMap["transfer_id"].(string)
+
+	if filePath == "" {
+		c.logger.Error("File path is required")
+		c.sendResponse(MsgTypeCloudDownload, map[string]interface{}{
+			"transfer_id": transferID,
+		}, "File path is required")
+		return
+	}
+
+	// 构建完整文件路径
+	var fullPath string
+	if strings.HasPrefix(filePath, "/") {
+		// 绝对路径，直接使用
+		fullPath = filePath
+	} else {
+		// 相对路径，基于Steam目录
+		fullPath = filepath.Join(c.steamDir, filePath)
+	}
+
+	c.logger.Debug("Downloading file from cloud: %s -> %s", cloudPath, fullPath)
+
+	// TODO: 实现云存储下载逻辑
+	// 这里需要根据具体的云存储提供商实现下载逻辑
+	// 1. 从云存储下载文件内容
+	// 2. 保存到本地文件路径
+	// 3. 返回下载结果
+
+	c.logger.Warn("Cloud download not implemented yet")
+	c.sendResponse(MsgTypeCloudDownload, map[string]interface{}{
+		"transfer_id": transferID,
+		"file_path":   filePath,
+	}, "Cloud download not implemented yet")
 }
