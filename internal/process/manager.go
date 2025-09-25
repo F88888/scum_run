@@ -14,6 +14,7 @@ import (
 
 	_const "scum_run/internal/const"
 	"scum_run/internal/logger"
+	"scum_run/internal/network"
 	"scum_run/model"
 )
 
@@ -114,6 +115,27 @@ func (m *Manager) Start() error {
 	// Check if executable exists
 	if _, err := os.Stat(m.config.ExecPath); os.IsNotExist(err) {
 		return fmt.Errorf("SCUM server executable not found: %s", m.config.ExecPath)
+	}
+
+	// Check if the configured port is already in use
+	if m.config.GamePort > 0 {
+		portChecker := network.NewPortChecker(3 * time.Second)
+		host := m.config.ServerIP
+		if host == "" {
+			host = _const.DefaultServerIP
+		}
+
+		m.logger.Info("Checking if port %d is available on %s...", m.config.GamePort, host)
+
+		portStatus, err := portChecker.CheckPort(host, m.config.GamePort)
+		if err != nil {
+			m.logger.Warn("Failed to check port status: %v", err)
+		} else if portStatus.InUse {
+			m.logger.Warn("Port %d is already in use on %s, skipping SCUM server startup", m.config.GamePort, host)
+			return fmt.Errorf("port %d is already in use on %s", m.config.GamePort, host)
+		} else {
+			m.logger.Info("Port %d is available on %s", m.config.GamePort, host)
+		}
 	}
 
 	// Build command arguments
