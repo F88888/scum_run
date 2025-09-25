@@ -1746,8 +1746,19 @@ func (c *Client) handleFileRead(data interface{}) {
 	// 构建完整文件路径
 	var fullPath string
 	if strings.HasPrefix(path, "/") {
-		// 绝对路径，直接使用
-		fullPath = path
+		// 绝对路径，需要验证是否在允许的目录内
+		// 只允许访问Steam目录及其子目录
+		cleanPath := filepath.Clean(path)
+		if !strings.HasPrefix(cleanPath, c.steamDir) {
+			c.logger.Error("Access denied: path outside Steam directory: %s", path)
+			errorData := map[string]interface{}{}
+			if requestID != "" {
+				errorData["request_id"] = requestID
+			}
+			c.sendResponse(MsgTypeFileRead, errorData, "Access denied: path outside allowed directory")
+			return
+		}
+		fullPath = cleanPath
 	} else {
 		// 相对路径，基于Steam目录
 		fullPath = filepath.Join(c.steamDir, path)
@@ -1837,8 +1848,19 @@ func (c *Client) handleFileWrite(data interface{}) {
 	// 构建完整文件路径
 	var fullPath string
 	if strings.HasPrefix(path, "/") {
-		// 绝对路径，直接使用
-		fullPath = path
+		// 绝对路径，需要验证是否在允许的目录内
+		// 只允许访问Steam目录及其子目录
+		cleanPath := filepath.Clean(path)
+		if !strings.HasPrefix(cleanPath, c.steamDir) {
+			c.logger.Error("Access denied: path outside Steam directory: %s", path)
+			errorData := map[string]interface{}{}
+			if requestID != "" {
+				errorData["request_id"] = requestID
+			}
+			c.sendResponse(MsgTypeFileWrite, errorData, "Access denied: path outside allowed directory")
+			return
+		}
+		fullPath = cleanPath
 	} else {
 		// 相对路径，基于Steam目录
 		fullPath = filepath.Join(c.steamDir, path)
@@ -2634,8 +2656,17 @@ func (c *Client) handleFileUpload(data interface{}) {
 	// 构建完整文件路径
 	var fullPath string
 	if strings.HasPrefix(filePath, "/") {
-		// 绝对路径，直接使用
-		fullPath = filePath
+		// 绝对路径，需要验证是否在允许的目录内
+		// 只允许访问Steam目录及其子目录
+		cleanPath := filepath.Clean(filePath)
+		if !strings.HasPrefix(cleanPath, c.steamDir) {
+			c.logger.Error("Access denied: path outside Steam directory: %s", filePath)
+			c.sendResponse(MsgTypeFileUpload, map[string]interface{}{
+				"transfer_id": transferID,
+			}, "Access denied: path outside allowed directory")
+			return
+		}
+		fullPath = cleanPath
 	} else {
 		// 相对路径，基于Steam目录
 		fullPath = filepath.Join(c.steamDir, filePath)
@@ -2702,8 +2733,17 @@ func (c *Client) handleFileDownload(data interface{}) {
 	// 构建完整文件路径
 	var fullPath string
 	if strings.HasPrefix(filePath, "/") {
-		// 绝对路径，直接使用
-		fullPath = filePath
+		// 绝对路径，需要验证是否在允许的目录内
+		// 只允许访问Steam目录及其子目录
+		cleanPath := filepath.Clean(filePath)
+		if !strings.HasPrefix(cleanPath, c.steamDir) {
+			c.logger.Error("Access denied: path outside Steam directory: %s", filePath)
+			c.sendResponse(MsgTypeFileDownload, map[string]interface{}{
+				"transfer_id": transferID,
+			}, "Access denied: path outside allowed directory")
+			return
+		}
+		fullPath = cleanPath
 	} else {
 		// 相对路径，基于Steam目录
 		fullPath = filepath.Join(c.steamDir, filePath)
