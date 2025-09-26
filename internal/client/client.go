@@ -1747,31 +1747,10 @@ func (c *Client) handleFileRead(data interface{}) {
 	var fullPath string
 	if strings.HasPrefix(path, "/") {
 		// 绝对路径，需要验证是否在允许的目录内
-		// 允许访问Steam目录及其子目录，以及常见的游戏目录
+		// 只允许访问Steam目录及其子目录
 		cleanPath := filepath.Clean(path)
-
-		// 检查是否在Steam目录内
-		isInSteamDir := strings.HasPrefix(cleanPath, c.steamDir)
-
-		// 检查是否在常见的游戏目录内（如根目录下的游戏文件）
-		isInGameDir := false
-		if runtime.GOOS == "windows" {
-			// Windows下允许访问C盘根目录下的游戏文件
-			if strings.HasPrefix(cleanPath, "C:/") || strings.HasPrefix(cleanPath, "C:\\") {
-				// 检查是否是游戏相关的文件
-				fileName := filepath.Base(cleanPath)
-				gameExtensions := []string{".dll", ".exe", ".cfg", ".ini", ".log", ".txt", ".json", ".xml"}
-				for _, ext := range gameExtensions {
-					if strings.HasSuffix(strings.ToLower(fileName), ext) {
-						isInGameDir = true
-						break
-					}
-				}
-			}
-		}
-
-		if !isInSteamDir && !isInGameDir {
-			c.logger.Error("Access denied: path outside allowed directories: %s", path)
+		if !strings.HasPrefix(cleanPath, c.steamDir) {
+			c.logger.Error("Access denied: path outside Steam directory: %s", path)
 			errorData := map[string]interface{}{}
 			if requestID != "" {
 				errorData["request_id"] = requestID
@@ -1870,31 +1849,10 @@ func (c *Client) handleFileWrite(data interface{}) {
 	var fullPath string
 	if strings.HasPrefix(path, "/") {
 		// 绝对路径，需要验证是否在允许的目录内
-		// 允许访问Steam目录及其子目录，以及常见的游戏目录
+		// 只允许访问Steam目录及其子目录
 		cleanPath := filepath.Clean(path)
-
-		// 检查是否在Steam目录内
-		isInSteamDir := strings.HasPrefix(cleanPath, c.steamDir)
-
-		// 检查是否在常见的游戏目录内（如根目录下的游戏文件）
-		isInGameDir := false
-		if runtime.GOOS == "windows" {
-			// Windows下允许访问C盘根目录下的游戏文件
-			if strings.HasPrefix(cleanPath, "C:/") || strings.HasPrefix(cleanPath, "C:\\") {
-				// 检查是否是游戏相关的文件
-				fileName := filepath.Base(cleanPath)
-				gameExtensions := []string{".dll", ".exe", ".cfg", ".ini", ".log", ".txt", ".json", ".xml"}
-				for _, ext := range gameExtensions {
-					if strings.HasSuffix(strings.ToLower(fileName), ext) {
-						isInGameDir = true
-						break
-					}
-				}
-			}
-		}
-
-		if !isInSteamDir && !isInGameDir {
-			c.logger.Error("Access denied: path outside allowed directories: %s", path)
+		if !strings.HasPrefix(cleanPath, c.steamDir) {
+			c.logger.Error("Access denied: path outside Steam directory: %s", path)
 			errorData := map[string]interface{}{}
 			if requestID != "" {
 				errorData["request_id"] = requestID
@@ -2699,31 +2657,10 @@ func (c *Client) handleFileUpload(data interface{}) {
 	var fullPath string
 	if strings.HasPrefix(filePath, "/") {
 		// 绝对路径，需要验证是否在允许的目录内
-		// 允许访问Steam目录及其子目录，以及常见的游戏目录
+		// 只允许访问Steam目录及其子目录
 		cleanPath := filepath.Clean(filePath)
-
-		// 检查是否在Steam目录内
-		isInSteamDir := strings.HasPrefix(cleanPath, c.steamDir)
-
-		// 检查是否在常见的游戏目录内（如根目录下的游戏文件）
-		isInGameDir := false
-		if runtime.GOOS == "windows" {
-			// Windows下允许访问C盘根目录下的游戏文件
-			if strings.HasPrefix(cleanPath, "C:/") || strings.HasPrefix(cleanPath, "C:\\") {
-				// 检查是否是游戏相关的文件
-				fileName := filepath.Base(cleanPath)
-				gameExtensions := []string{".dll", ".exe", ".cfg", ".ini", ".log", ".txt", ".json", ".xml"}
-				for _, ext := range gameExtensions {
-					if strings.HasSuffix(strings.ToLower(fileName), ext) {
-						isInGameDir = true
-						break
-					}
-				}
-			}
-		}
-
-		if !isInSteamDir && !isInGameDir {
-			c.logger.Error("Access denied: path outside allowed directories: %s", filePath)
+		if !strings.HasPrefix(cleanPath, c.steamDir) {
+			c.logger.Error("Access denied: path outside Steam directory: %s", filePath)
 			c.sendResponse(MsgTypeFileUpload, map[string]interface{}{
 				"transfer_id": transferID,
 			}, "Access denied: path outside allowed directory")
@@ -2797,31 +2734,10 @@ func (c *Client) handleFileDownload(data interface{}) {
 	var fullPath string
 	if strings.HasPrefix(filePath, "/") {
 		// 绝对路径，需要验证是否在允许的目录内
-		// 允许访问Steam目录及其子目录，以及常见的游戏目录
+		// 只允许访问Steam目录及其子目录
 		cleanPath := filepath.Clean(filePath)
-
-		// 检查是否在Steam目录内
-		isInSteamDir := strings.HasPrefix(cleanPath, c.steamDir)
-
-		// 检查是否在常见的游戏目录内（如根目录下的游戏文件）
-		isInGameDir := false
-		if runtime.GOOS == "windows" {
-			// Windows下允许访问C盘根目录下的游戏文件
-			if strings.HasPrefix(cleanPath, "C:/") || strings.HasPrefix(cleanPath, "C:\\") {
-				// 检查是否是游戏相关的文件
-				fileName := filepath.Base(cleanPath)
-				gameExtensions := []string{".dll", ".exe", ".cfg", ".ini", ".log", ".txt", ".json", ".xml"}
-				for _, ext := range gameExtensions {
-					if strings.HasSuffix(strings.ToLower(fileName), ext) {
-						isInGameDir = true
-						break
-					}
-				}
-			}
-		}
-
-		if !isInSteamDir && !isInGameDir {
-			c.logger.Error("Access denied: path outside allowed directories: %s", filePath)
+		if !strings.HasPrefix(cleanPath, c.steamDir) {
+			c.logger.Error("Access denied: path outside Steam directory: %s", filePath)
 			c.sendResponse(MsgTypeFileDownload, map[string]interface{}{
 				"transfer_id": transferID,
 			}, "Access denied: path outside allowed directory")
