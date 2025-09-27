@@ -455,6 +455,8 @@ func (c *Client) handleMessage(msg request.WebSocketMessage) {
 		c.handleCloudUpload(msg.Data)
 	case MsgTypeCloudDownload:
 		c.handleCloudDownload(msg.Data)
+	case MsgTypeSystemMonitor:
+		c.handleSystemMonitor(msg.Data)
 	default:
 		c.logger.Warn("Unknown message type: %s", msg.Type)
 	}
@@ -2302,6 +2304,17 @@ func (c *Client) writeFileWithEncoding(filePath, content, encoding string) error
 	return nil
 }
 
+// handleSystemMonitor 处理系统监控消息
+func (c *Client) handleSystemMonitor(data interface{}) {
+	c.logger.Debug("Received system monitor message")
+
+	// 系统监控消息通常是从服务器发送的配置或控制指令
+	// 这里可以根据需要处理服务器发送的系统监控相关指令
+	if data != nil {
+		c.logger.Debug("System monitor data: %+v", data)
+	}
+}
+
 // handleSystemMonitorData 处理系统监控数据
 func (c *Client) handleSystemMonitorData(data *request.SystemMonitorData) {
 	// 检查WebSocket连接是否可用
@@ -2319,9 +2332,6 @@ func (c *Client) handleSystemMonitorData(data *request.SystemMonitorData) {
 	// 发送系统监控数据
 	if err := c.wsClient.SendMessage(msg); err != nil {
 		c.logger.Error("Failed to send system monitor data: %v", err)
-	} else {
-		c.logger.Debug("System monitor data sent: CPU=%.1f%%, Memory=%.1f%%, Disk=%.1f%%, NetIn=%.1fKB/s, NetOut=%.1fKB/s",
-			data.CPUUsage, data.MemUsage, data.DiskUsage, data.NetIncome, data.NetOutcome)
 	}
 }
 

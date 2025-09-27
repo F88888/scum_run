@@ -98,7 +98,6 @@ func (c *Client) Connect() error {
 
 	c.conn = conn
 	c.isRunning = true
-	c.logger.Info("Connected to WebSocket server: %s", c.url)
 
 	// 获取回调函数的引用，然后释放锁
 	onConnect := c.onConnect
@@ -165,15 +164,11 @@ func (c *Client) SendMessage(message interface{}) error {
 
 	// 移除写超时限制，避免网络波动时发送失败
 	// conn.SetWriteDeadline() - 不设置写超时
-
-	c.logger.Debug("Sending message: %+v", message)
 	err := conn.WriteJSON(message)
 	if err != nil {
 		c.logger.Error("Failed to send message: %v", err)
 		// 发送失败时触发重连
 		c.handleDisconnection()
-	} else {
-		c.logger.Debug("Message sent successfully")
 	}
 	return err
 }
@@ -190,7 +185,6 @@ func (c *Client) ReadMessage(message interface{}) error {
 		conn := c.conn
 		c.mutex.RUnlock()
 
-		c.logger.Debug("Waiting for message from server...")
 		messageType, data, err := conn.ReadMessage()
 		if err != nil {
 			c.logger.Error("Failed to read message: %v", err)
@@ -208,7 +202,6 @@ func (c *Client) ReadMessage(message interface{}) error {
 				_ = c.conn.WriteMessage(websocket.PongMessage, data)
 			}
 			c.mutex.Unlock()
-			c.logger.Debug("Responded to ping message")
 			// 继续读取下一条消息
 			continue
 
@@ -217,19 +210,16 @@ func (c *Client) ReadMessage(message interface{}) error {
 			c.mutex.Lock()
 			c.lastHeartbeat = time.Now()
 			c.mutex.Unlock()
-			c.logger.Debug("Received pong message")
 			// 继续读取下一条消息
 			continue
 
 		case websocket.TextMessage:
 			// 处理文本消息
-			c.logger.Debug("Received raw message: %s", string(data))
 			err = json.Unmarshal(data, message)
 			if err != nil {
 				c.logger.Error("Failed to unmarshal message: %v", err)
 				return err
 			}
-			c.logger.Debug("Message unmarshaled successfully: %+v", message)
 			return nil
 
 		case websocket.BinaryMessage:
@@ -354,7 +344,6 @@ func (c *Client) handleDisconnection() {
 	c.mutex.Unlock()
 
 	if wasRunning {
-		c.logger.Warn("WebSocket disconnected, attempting to reconnect...")
 
 		// 调用断开连接回调
 		if c.onDisconnect != nil {
@@ -387,15 +376,11 @@ func (c *Client) reconnect() {
 		case <-time.After(backoff):
 			// 首次重连前等待更长时间，避免启动时的频繁重连
 			if isFirstAttempt {
-				c.logger.Info("Starting reconnection process...")
 				time.Sleep(1 * time.Second) // 减少初始等待时间
 				isFirstAttempt = false
 			}
 
-			c.logger.Info("Attempting to reconnect... (attempt %d)", retryCount+1)
-
 			if err := c.Connect(); err != nil {
-				c.logger.Warn("Reconnection attempt %d failed: %v", retryCount+1, err)
 				retryCount++
 
 				// 检查是否达到最大重试次数
@@ -420,12 +405,9 @@ func (c *Client) reconnect() {
 
 				// 对于频繁的连接失败，增加额外延迟
 				if retryCount > 5 {
-					c.logger.Info("Multiple reconnection failures, adding extra delay...")
 					time.Sleep(5 * time.Second)
 				}
 			} else {
-				c.logger.Info("Reconnected successfully after %d attempts", retryCount+1)
-
 				// 调用重连回调
 				if c.onReconnect != nil {
 					c.onReconnect()
