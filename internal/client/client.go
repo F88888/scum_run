@@ -1358,34 +1358,6 @@ func (c *Client) downloadSteamCmd() error {
 	return nil
 }
 
-// getSCUMServerRootDir returns the SCUM server root directory
-// This is the directory where SCUM server is installed, not the Steam directory
-func (c *Client) getSCUMServerRootDir() string {
-	// 如果steamDir已经是SCUM服务器目录（通过自动安装设置的），直接返回
-	if c.steamDir != "" {
-		// 检查是否是SCUM服务器根目录
-		steamDetector := steam.NewDetector(c.logger)
-		if steamDetector.IsSCUMServerInstalled(c.steamDir) {
-			return c.steamDir
-		}
-	}
-
-	// 否则尝试从配置中获取安装路径
-	installPath := c.config.AutoInstall.InstallPath
-	if installPath == "" {
-		installPath = _const.DefaultInstallPath
-	}
-
-	// 转换为绝对路径
-	absInstallPath, err := filepath.Abs(installPath)
-	if err != nil {
-		c.logger.Warn("Failed to get absolute path for install directory: %v", err)
-		absInstallPath = installPath
-	}
-
-	return absInstallPath
-}
-
 // extractZip extracts a zip file to the specified directory
 func (c *Client) extractZip(src, dest string) error {
 	c.logger.Info("Extracting %s to %s", src, dest)
@@ -1774,25 +1746,27 @@ func (c *Client) handleFileRead(data interface{}) {
 	// 构建完整文件路径
 	var fullPath string
 	if strings.HasPrefix(path, "/") {
-		// 绝对路径，需要验证是否在允许的目录内
-		// 只允许访问SCUM服务器目录及其子目录
-		cleanPath := filepath.Clean(path)
-		// 获取SCUM服务器根目录
-		scumServerDir := c.getSCUMServerRootDir()
-		if !strings.HasPrefix(cleanPath, scumServerDir) {
-			c.logger.Error("Access denied: path outside SCUM server directory: %s (allowed: %s)", path, scumServerDir)
-			errorData := map[string]interface{}{}
-			if requestID != "" {
-				errorData["request_id"] = requestID
-			}
-			c.sendResponse(MsgTypeFileRead, errorData, "Access denied: path outside allowed directory")
-			return
-		}
-		fullPath = cleanPath
+		// 绝对路径，将其视为相对于steamDir的路径
+		// 移除开头的斜杠，然后基于steamDir构建完整路径
+		relativePath := strings.TrimPrefix(path, "/")
+		fullPath = filepath.Join(c.steamDir, relativePath)
+		c.logger.Debug("Converting absolute path %s to %s", path, fullPath)
 	} else {
-		// 相对路径，基于SCUM服务器目录
-		scumServerDir := c.getSCUMServerRootDir()
-		fullPath = filepath.Join(scumServerDir, path)
+		// 相对路径，基于Steam目录
+		fullPath = filepath.Join(c.steamDir, path)
+	}
+
+	// 验证最终路径是否在允许的目录内
+	cleanFullPath := filepath.Clean(fullPath)
+	cleanSteamDir := filepath.Clean(c.steamDir)
+	if !strings.HasPrefix(cleanFullPath, cleanSteamDir) {
+		c.logger.Error("Access denied: path outside Steam directory: %s (resolved to %s, steamDir: %s)", path, cleanFullPath, cleanSteamDir)
+		errorData := map[string]interface{}{}
+		if requestID != "" {
+			errorData["request_id"] = requestID
+		}
+		c.sendResponse(MsgTypeFileRead, errorData, "Access denied: path outside allowed directory")
+		return
 	}
 
 	c.logger.Debug("Reading file: %s (encoding: %s)", fullPath, encoding)
@@ -1879,25 +1853,27 @@ func (c *Client) handleFileWrite(data interface{}) {
 	// 构建完整文件路径
 	var fullPath string
 	if strings.HasPrefix(path, "/") {
-		// 绝对路径，需要验证是否在允许的目录内
-		// 只允许访问SCUM服务器目录及其子目录
-		cleanPath := filepath.Clean(path)
-		// 获取SCUM服务器根目录
-		scumServerDir := c.getSCUMServerRootDir()
-		if !strings.HasPrefix(cleanPath, scumServerDir) {
-			c.logger.Error("Access denied: path outside SCUM server directory: %s (allowed: %s)", path, scumServerDir)
-			errorData := map[string]interface{}{}
-			if requestID != "" {
-				errorData["request_id"] = requestID
-			}
-			c.sendResponse(MsgTypeFileWrite, errorData, "Access denied: path outside allowed directory")
-			return
-		}
-		fullPath = cleanPath
+		// 绝对路径，将其视为相对于steamDir的路径
+		// 移除开头的斜杠，然后基于steamDir构建完整路径
+		relativePath := strings.TrimPrefix(path, "/")
+		fullPath = filepath.Join(c.steamDir, relativePath)
+		c.logger.Debug("Converting absolute path %s to %s", path, fullPath)
 	} else {
-		// 相对路径，基于SCUM服务器目录
-		scumServerDir := c.getSCUMServerRootDir()
-		fullPath = filepath.Join(scumServerDir, path)
+		// 相对路径，基于Steam目录
+		fullPath = filepath.Join(c.steamDir, path)
+	}
+
+	// 验证最终路径是否在允许的目录内
+	cleanFullPath := filepath.Clean(fullPath)
+	cleanSteamDir := filepath.Clean(c.steamDir)
+	if !strings.HasPrefix(cleanFullPath, cleanSteamDir) {
+		c.logger.Error("Access denied: path outside Steam directory: %s (resolved to %s, steamDir: %s)", path, cleanFullPath, cleanSteamDir)
+		errorData := map[string]interface{}{}
+		if requestID != "" {
+			errorData["request_id"] = requestID
+		}
+		c.sendResponse(MsgTypeFileWrite, errorData, "Access denied: path outside allowed directory")
+		return
 	}
 
 	c.logger.Debug("Writing file: %s (encoding: %s, size: %d bytes)", fullPath, encoding, len(content))
@@ -2690,23 +2666,25 @@ func (c *Client) handleFileUpload(data interface{}) {
 	// 构建完整文件路径
 	var fullPath string
 	if strings.HasPrefix(filePath, "/") {
-		// 绝对路径，需要验证是否在允许的目录内
-		// 只允许访问SCUM服务器目录及其子目录
-		cleanPath := filepath.Clean(filePath)
-		// 获取SCUM服务器根目录
-		scumServerDir := c.getSCUMServerRootDir()
-		if !strings.HasPrefix(cleanPath, scumServerDir) {
-			c.logger.Error("Access denied: path outside SCUM server directory: %s (allowed: %s)", filePath, scumServerDir)
-			c.sendResponse(MsgTypeFileUpload, map[string]interface{}{
-				"transfer_id": transferID,
-			}, "Access denied: path outside allowed directory")
-			return
-		}
-		fullPath = cleanPath
+		// 绝对路径，将其视为相对于steamDir的路径
+		// 移除开头的斜杠，然后基于steamDir构建完整路径
+		relativePath := strings.TrimPrefix(filePath, "/")
+		fullPath = filepath.Join(c.steamDir, relativePath)
+		c.logger.Debug("Converting absolute path %s to %s", filePath, fullPath)
 	} else {
-		// 相对路径，基于SCUM服务器目录
-		scumServerDir := c.getSCUMServerRootDir()
-		fullPath = filepath.Join(scumServerDir, filePath)
+		// 相对路径，基于Steam目录
+		fullPath = filepath.Join(c.steamDir, filePath)
+	}
+
+	// 验证最终路径是否在允许的目录内
+	cleanFullPath := filepath.Clean(fullPath)
+	cleanSteamDir := filepath.Clean(c.steamDir)
+	if !strings.HasPrefix(cleanFullPath, cleanSteamDir) {
+		c.logger.Error("Access denied: path outside Steam directory: %s (resolved to %s, steamDir: %s)", filePath, cleanFullPath, cleanSteamDir)
+		c.sendResponse(MsgTypeFileUpload, map[string]interface{}{
+			"transfer_id": transferID,
+		}, "Access denied: path outside allowed directory")
+		return
 	}
 
 	c.logger.Debug("Writing file: %s (encoding: %s, size: %d bytes)", fullPath, encoding, len(content))
@@ -2770,23 +2748,25 @@ func (c *Client) handleFileDownload(data interface{}) {
 	// 构建完整文件路径
 	var fullPath string
 	if strings.HasPrefix(filePath, "/") {
-		// 绝对路径，需要验证是否在允许的目录内
-		// 只允许访问SCUM服务器目录及其子目录
-		cleanPath := filepath.Clean(filePath)
-		// 获取SCUM服务器根目录
-		scumServerDir := c.getSCUMServerRootDir()
-		if !strings.HasPrefix(cleanPath, scumServerDir) {
-			c.logger.Error("Access denied: path outside SCUM server directory: %s (allowed: %s)", filePath, scumServerDir)
-			c.sendResponse(MsgTypeFileDownload, map[string]interface{}{
-				"transfer_id": transferID,
-			}, "Access denied: path outside allowed directory")
-			return
-		}
-		fullPath = cleanPath
+		// 绝对路径，将其视为相对于steamDir的路径
+		// 移除开头的斜杠，然后基于steamDir构建完整路径
+		relativePath := strings.TrimPrefix(filePath, "/")
+		fullPath = filepath.Join(c.steamDir, relativePath)
+		c.logger.Debug("Converting absolute path %s to %s", filePath, fullPath)
 	} else {
-		// 相对路径，基于SCUM服务器目录
-		scumServerDir := c.getSCUMServerRootDir()
-		fullPath = filepath.Join(scumServerDir, filePath)
+		// 相对路径，基于Steam目录
+		fullPath = filepath.Join(c.steamDir, filePath)
+	}
+
+	// 验证最终路径是否在允许的目录内
+	cleanFullPath := filepath.Clean(fullPath)
+	cleanSteamDir := filepath.Clean(c.steamDir)
+	if !strings.HasPrefix(cleanFullPath, cleanSteamDir) {
+		c.logger.Error("Access denied: path outside Steam directory: %s (resolved to %s, steamDir: %s)", filePath, cleanFullPath, cleanSteamDir)
+		c.sendResponse(MsgTypeFileDownload, map[string]interface{}{
+			"transfer_id": transferID,
+		}, "Access denied: path outside allowed directory")
+		return
 	}
 
 	c.logger.Debug("Reading file: %s (encoding: %s)", fullPath, encoding)
