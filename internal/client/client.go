@@ -2972,13 +2972,11 @@ func (c *Client) uploadToQiniu(fileData []byte, cloudPath string, uploadSignatur
 
 	domain, _ := uploadSignature["domain"].(string)
 
-	// 构建上传URL
+	// 构建上传URL - 七牛云使用固定的上传域名
 	uploadURL := "https://upload.qiniup.com"
-	if domain != "" {
-		uploadURL = fmt.Sprintf("https://%s", domain)
-	}
 
 	c.logger.Debug("Uploading to Qiniu: %s -> %s (%d bytes)", cloudPath, uploadURL, len(fileData))
+	c.logger.Debug("Qiniu upload parameters: token=%s, key=%s, domain=%s", token, key, domain)
 
 	// 创建multipart form data
 	var buf bytes.Buffer
@@ -3041,6 +3039,9 @@ func (c *Client) uploadToQiniu(fileData []byte, cloudPath string, uploadSignatur
 	if err != nil {
 		return fmt.Errorf("failed to read response body: %w", err)
 	}
+
+	// 记录响应信息
+	c.logger.Debug("Qiniu upload response: status=%d, body=%s", resp.StatusCode, string(responseBody))
 
 	// 检查响应状态
 	if resp.StatusCode != http.StatusOK {
