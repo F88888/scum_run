@@ -469,7 +469,7 @@ func (c *Client) handleMessage(msg request.WebSocketMessage) {
 	case MsgTypeSystemMonitor:
 		c.handleSystemMonitor(msg.Data)
 	case MsgTypeGetSystemInfo:
-		c.handleGetSystemInfo(msg.Data)
+		c.handleGetSystemInfo()
 	default:
 		c.logger.Warn("Unknown message type: %s", msg.Type)
 	}
@@ -2267,18 +2267,7 @@ func (c *Client) handleSystemMonitor(data interface{}) {
 }
 
 // handleGetSystemInfo 处理获取系统信息请求
-func (c *Client) handleGetSystemInfo(data interface{}) {
-	c.logger.Info("Received get system info request")
-
-	// 收集系统信息
-	systemInfo := c.collectSystemInfo()
-
-	// 发送响应
-	c.sendResponse(MsgTypeGetSystemInfo, systemInfo, "")
-}
-
-// collectSystemInfo 收集系统信息
-func (c *Client) collectSystemInfo() map[string]interface{} {
+func (c *Client) handleGetSystemInfo() {
 
 	// 收集实时系统监控数据
 	var cpuUsage, memoryUsage, diskUsage float64
@@ -2313,7 +2302,8 @@ func (c *Client) collectSystemInfo() map[string]interface{} {
 		"last_updated":   time.Now().Format(time.RFC3339),
 	}
 
-	return systemInfo
+	// 发送响应
+	c.sendResponse(MsgTypeGetSystemInfo, systemInfo, "")
 }
 
 // collectSystemDataDirectly 直接收集系统数据
