@@ -8,6 +8,10 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"github.com/saintfish/chardet"
+	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/disk"
+	"github.com/shirou/gopsutil/v3/host"
+	"github.com/shirou/gopsutil/v3/mem"
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/encoding/unicode"
 	"golang.org/x/text/transform"
@@ -93,7 +97,8 @@ const (
 	MsgTypeFileWrite  = "file_write"  // 文件内容写入
 
 	// System monitoring
-	MsgTypeSystemMonitor = "system_monitor" // 系统监控数据
+	MsgTypeSystemMonitor = "system_monitor"  // 系统监控数据
+	MsgTypeGetSystemInfo = "get_system_info" // 获取系统信息
 
 	// Backup related
 	MsgTypeBackupStart    = "backup_start"    // 开始备份
@@ -463,6 +468,8 @@ func (c *Client) handleMessage(msg request.WebSocketMessage) {
 		c.handleCloudDownload(msg.Data)
 	case MsgTypeSystemMonitor:
 		c.handleSystemMonitor(msg.Data)
+	case MsgTypeGetSystemInfo:
+		c.handleGetSystemInfo(msg.Data)
 	default:
 		c.logger.Warn("Unknown message type: %s", msg.Type)
 	}
@@ -2259,6 +2266,160 @@ func (c *Client) handleSystemMonitor(data interface{}) {
 	}
 }
 
+// handleGetSystemInfo 处理获取系统信息请求
+func (c *Client) handleGetSystemInfo(data interface{}) {
+	c.logger.Info("Received get system info request")
+
+	// 收集系统信息
+	systemInfo := c.collectSystemInfo()
+
+	// 发送响应
+	c.sendResponse(MsgTypeGetSystemInfo, systemInfo, "")
+}
+
+// collectSystemInfo 收集系统信息
+func (c *Client) collectSystemInfo() map[string]interface{} {
+
+	// 收集实时系统监控数据
+	var cpuUsage, memoryUsage, diskUsage float64
+	var networkStatus string
+
+	// 直接收集系统数据
+	if data, err := c.collectSystemDataDirectly(); err == nil {
+		cpuUsage = data.CPUUsage
+		memoryUsage = data.MemUsage
+		diskUsage = data.DiskUsage
+		if data.NetIncome > 0 || data.NetOutcome > 0 {
+			networkStatus = "active"
+		} else {
+			networkStatus = "idle"
+		}
+	}
+
+	// 获取系统运行时间
+	uptime := c.getSystemUptime()
+
+	// 获取操作系统信息
+	osInfo := c.getOSInfo()
+
+	// 构建系统信息响应
+	systemInfo := map[string]interface{}{
+		"os":             osInfo,
+		"cpu_usage":      cpuUsage,
+		"memory_usage":   memoryUsage,
+		"disk_usage":     diskUsage,
+		"network_status": networkStatus,
+		"uptime_seconds": uptime,
+		"last_updated":   time.Now().Format(time.RFC3339),
+	}
+
+	return systemInfo
+}
+
+// collectSystemDataDirectly 直接收集系统数据
+func (c *Client) collectSystemDataDirectly() (*request.SystemMonitorData, error) {
+	data := &request.SystemMonitorData{
+		Timestamp: time.Now().Unix(),
+	}
+
+	// 收集CPU使用率
+	if err := c.collectCPUUsage(data); err != nil {
+		c.logger.Warn("Failed to collect CPU usage: %v", err)
+	}
+
+	// 收集内存使用率
+	if err := c.collectMemoryUsage(data); err != nil {
+		c.logger.Warn("Failed to collect memory usage: %v", err)
+	}
+
+	// 收集磁盘使用率
+	if err := c.collectDiskUsage(data); err != nil {
+		c.logger.Warn("Failed to collect disk usage: %v", err)
+	}
+
+	// 收集网络流量
+	if err := c.collectNetworkUsage(data); err != nil {
+		c.logger.Warn("Failed to collect network usage: %v", err)
+	}
+
+	return data, nil
+}
+
+// collectCPUUsage 收集CPU使用率
+func (c *Client) collectCPUUsage(data *request.SystemMonitorData) error {
+	percentages, err := cpu.Percent(time.Second, false)
+	if err != nil {
+		return fmt.Errorf("failed to get CPU percentage: %w", err)
+	}
+
+	if len(percentages) > 0 {
+		data.CPUUsage = percentages[0]
+	}
+
+	return nil
+}
+
+// collectMemoryUsage 收集内存使用率
+func (c *Client) collectMemoryUsage(data *request.SystemMonitorData) error {
+	memInfo, err := mem.VirtualMemory()
+	if err != nil {
+		return fmt.Errorf("failed to get memory info: %w", err)
+	}
+
+	data.MemUsage = memInfo.UsedPercent
+	return nil
+}
+
+// collectDiskUsage 收集磁盘使用率
+func (c *Client) collectDiskUsage(data *request.SystemMonitorData) error {
+	// 获取SCUM服务器安装目录的磁盘使用情况
+	steamDir := c.steamDir
+	if steamDir == "" {
+		steamDir = "C:/scumserver" // 默认路径
+	}
+
+	diskInfo, err := disk.Usage(steamDir)
+	if err != nil {
+		return fmt.Errorf("failed to get disk usage: %w", err)
+	}
+
+	data.DiskUsage = diskInfo.UsedPercent
+	return nil
+}
+
+// collectNetworkUsage 收集网络流量
+func (c *Client) collectNetworkUsage(data *request.SystemMonitorData) error {
+	// 这里可以实现网络流量收集逻辑
+	// 暂时返回0，表示没有网络活动
+	data.NetIncome = 0
+	data.NetOutcome = 0
+	return nil
+}
+
+// getSystemUptime 获取系统运行时间
+func (c *Client) getSystemUptime() int64 {
+	// 获取系统启动时间
+	bootTime, err := host.BootTime()
+	if err != nil {
+		c.logger.Warn("Failed to get boot time: %v", err)
+		return 0
+	}
+
+	// 计算运行时间（秒）
+	return time.Now().Unix() - int64(bootTime)
+}
+
+// getOSInfo 获取操作系统信息
+func (c *Client) getOSInfo() string {
+	hostInfo, err := host.Info()
+	if err != nil {
+		c.logger.Warn("Failed to get host info: %v", err)
+		return "Unknown"
+	}
+
+	return fmt.Sprintf("%s %s", hostInfo.Platform, hostInfo.PlatformVersion)
+}
+
 // handleSystemMonitorData 处理系统监控数据
 func (c *Client) handleSystemMonitorData(data *request.SystemMonitorData) {
 	// 检查WebSocket连接是否可用
@@ -2310,7 +2471,7 @@ func (c *Client) handleBackupStart(data interface{}) {
 		backupPath = c.getDefaultBackupPath(uint(serverID))
 	} else {
 		// 验证用户提供的备份路径
-		cfg, err := c.getServerConfig(uint(serverID))
+		cfg, err := c.getServerConfig()
 		if err != nil {
 			c.logger.Error("Failed to get server config for path validation: %v", err)
 			c.sendBackupResponse(MsgTypeBackupStatus, map[string]interface{}{
@@ -2707,7 +2868,7 @@ func generateTaskID() string {
 // getDefaultBackupPath 根据服务器类型获取默认备份路径
 func (c *Client) getDefaultBackupPath(serverID uint) string {
 	// 获取服务器配置信息
-	cfg, err := c.getServerConfig(serverID)
+	cfg, err := c.getServerConfig()
 	if err != nil {
 		c.logger.Error("Failed to get server config: %v", err)
 		// 使用默认路径
@@ -2742,7 +2903,7 @@ func (c *Client) getDefaultBackupPath(serverID uint) string {
 }
 
 // getServerConfig 获取服务器配置信息
-func (c *Client) getServerConfig(serverID uint) (*config.Config, error) {
+func (c *Client) getServerConfig() (*config.Config, error) {
 	// 返回当前客户端的配置
 	return c.config, nil
 }
