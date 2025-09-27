@@ -3,6 +3,7 @@ package client
 import (
 	"archive/zip"
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"github.com/saintfish/chardet"
@@ -10,6 +11,7 @@ import (
 	"golang.org/x/text/encoding/unicode"
 	"golang.org/x/text/transform"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -2891,27 +2893,281 @@ func (c *Client) handleCloudUpload(data interface{}) {
 
 // uploadFileToCloud 上传文件到云存储
 func (c *Client) uploadFileToCloud(filePath, cloudPath, transferID string, uploadSignature map[string]interface{}) error {
+	// 验证输入参数
+	if filePath == "" {
+		return fmt.Errorf("file path cannot be empty")
+	}
+	if cloudPath == "" {
+		return fmt.Errorf("cloud path cannot be empty")
+	}
+	if uploadSignature == nil {
+		return fmt.Errorf("upload signature cannot be nil")
+	}
+
 	// 读取文件内容
 	fileData, err := os.ReadFile(filePath)
 	if err != nil {
-		return fmt.Errorf("failed to read file: %w", err)
+		return fmt.Errorf("failed to read file %s: %w", filePath, err)
+	}
+
+	if len(fileData) == 0 {
+		return fmt.Errorf("file %s is empty", filePath)
 	}
 
 	c.logger.Debug("Read file %s (%d bytes), uploading to cloud path: %s", filePath, len(fileData), cloudPath)
 
-	// 这里需要实现具体的云存储上传逻辑
-	// 使用从服务端获取的上传凭证直接上传到云存储
-
-	// 暂时模拟上传成功
-	// 实际实现中，这里应该：
-	// 1. 解析上传凭证（签名、URL、参数等）
-	// 2. 使用HTTP POST/PUT请求上传文件到云存储
-	// 3. 处理上传响应
-
 	// 记录上传凭证信息（用于调试）
 	c.logger.Debug("Upload signature received: %+v", uploadSignature)
 
-	c.logger.Info("File uploaded to cloud successfully: %s (%d bytes)", cloudPath, len(fileData))
+	// 检测云存储提供商
+	provider := c.detectCloudProvider(uploadSignature)
+	if provider == "" {
+		return fmt.Errorf("unable to detect cloud storage provider from upload signature")
+	}
+
+	c.logger.Debug("Detected cloud storage provider: %s", provider)
+
+	// 根据提供商选择上传方法
+	switch provider {
+	case "qiniu":
+		return c.uploadToQiniu(fileData, cloudPath, uploadSignature)
+	case "aliyun":
+		return c.uploadToAliyun(fileData, cloudPath, uploadSignature)
+	default:
+		return fmt.Errorf("unsupported cloud storage provider: %s", provider)
+	}
+}
+
+// detectCloudProvider 检测云存储提供商
+func (c *Client) detectCloudProvider(uploadSignature map[string]interface{}) string {
+	// 首先检查明确的provider字段
+	if provider, ok := uploadSignature["provider"].(string); ok && provider != "" {
+		return provider
+	}
+
+	// 根据特征字段推断提供商
+	if _, hasToken := uploadSignature["token"]; hasToken {
+		return "qiniu"
+	}
+
+	if _, hasPolicy := uploadSignature["policy"]; hasPolicy {
+		return "aliyun"
+	}
+
+	return ""
+}
+
+// uploadToQiniu 上传文件到七牛云
+func (c *Client) uploadToQiniu(fileData []byte, cloudPath string, uploadSignature map[string]interface{}) error {
+	// 验证必需参数
+	token, ok := uploadSignature["token"].(string)
+	if !ok || token == "" {
+		return fmt.Errorf("missing or invalid qiniu upload token")
+	}
+
+	key, ok := uploadSignature["key"].(string)
+	if !ok || key == "" {
+		return fmt.Errorf("missing or invalid qiniu upload key")
+	}
+
+	domain, _ := uploadSignature["domain"].(string)
+
+	// 构建上传URL
+	uploadURL := "https://upload.qiniup.com"
+	if domain != "" {
+		uploadURL = fmt.Sprintf("https://%s", domain)
+	}
+
+	c.logger.Debug("Uploading to Qiniu: %s -> %s (%d bytes)", cloudPath, uploadURL, len(fileData))
+
+	// 创建multipart form data
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+
+	// 添加必需字段
+	fields := map[string]string{
+		"token": token,
+		"key":   key,
+	}
+
+	for fieldName, fieldValue := range fields {
+		if err := writer.WriteField(fieldName, fieldValue); err != nil {
+			return fmt.Errorf("failed to write field %s: %w", fieldName, err)
+		}
+	}
+
+	// 添加文件字段
+	fileName := filepath.Base(cloudPath)
+	fileWriter, err := writer.CreateFormFile("file", fileName)
+	if err != nil {
+		return fmt.Errorf("failed to create form file: %w", err)
+	}
+
+	if _, err := fileWriter.Write(fileData); err != nil {
+		return fmt.Errorf("failed to write file data: %w", err)
+	}
+
+	// 关闭writer
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("failed to close multipart writer: %w", err)
+	}
+
+	// 创建HTTP请求
+	req, err := http.NewRequest("POST", uploadURL, &buf)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("User-Agent", "SCUM-Run-Client/1.0")
+
+	// 发送请求
+	httpClient := &http.Client{
+		Timeout: 5 * time.Minute,
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to upload file to Qiniu: %w", err)
+	}
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			c.logger.Warn("Failed to close response body: %v", closeErr)
+		}
+	}()
+
+	// 读取响应
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	// 检查响应状态
+	if resp.StatusCode != http.StatusOK {
+		c.logger.Error("Qiniu upload failed",
+			"status_code", resp.StatusCode,
+			"response", string(responseBody),
+			"cloud_path", cloudPath)
+		return fmt.Errorf("qiniu upload failed with status %d: %s", resp.StatusCode, string(responseBody))
+	}
+
+	c.logger.Info("Successfully uploaded file to Qiniu: %s (%d bytes)", cloudPath, len(fileData))
+	return nil
+}
+
+// uploadToAliyun 上传文件到阿里云OSS
+func (c *Client) uploadToAliyun(fileData []byte, cloudPath string, uploadSignature map[string]interface{}) error {
+	// 验证必需参数
+	policy, ok := uploadSignature["policy"].(string)
+	if !ok || policy == "" {
+		return fmt.Errorf("missing or invalid aliyun upload policy")
+	}
+
+	signature, ok := uploadSignature["signature"].(string)
+	if !ok || signature == "" {
+		return fmt.Errorf("missing or invalid aliyun upload signature")
+	}
+
+	key, ok := uploadSignature["key"].(string)
+	if !ok || key == "" {
+		return fmt.Errorf("missing or invalid aliyun upload key")
+	}
+
+	bucket, ok := uploadSignature["bucket"].(string)
+	if !ok || bucket == "" {
+		return fmt.Errorf("missing or invalid aliyun upload bucket")
+	}
+
+	endpoint, ok := uploadSignature["endpoint"].(string)
+	if !ok || endpoint == "" {
+		return fmt.Errorf("missing or invalid aliyun upload endpoint")
+	}
+
+	accessKeyID, ok := uploadSignature["OSSAccessKeyId"].(string)
+	if !ok || accessKeyID == "" {
+		return fmt.Errorf("missing or invalid aliyun upload access key ID")
+	}
+
+	// 构建上传URL
+	uploadURL := fmt.Sprintf("https://%s", endpoint)
+
+	c.logger.Debug("Uploading to Aliyun OSS: %s -> %s (%d bytes)", cloudPath, uploadURL, len(fileData))
+
+	// 创建multipart form data
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+
+	// 添加必需字段
+	fields := map[string]string{
+		"key":                   key,
+		"policy":                policy,
+		"OSSAccessKeyId":        accessKeyID,
+		"signature":             signature,
+		"success_action_status": "200",
+	}
+
+	for fieldName, fieldValue := range fields {
+		if err := writer.WriteField(fieldName, fieldValue); err != nil {
+			return fmt.Errorf("failed to write field %s: %w", fieldName, err)
+		}
+	}
+
+	// 添加文件字段
+	fileName := filepath.Base(cloudPath)
+	fileWriter, err := writer.CreateFormFile("file", fileName)
+	if err != nil {
+		return fmt.Errorf("failed to create form file: %w", err)
+	}
+
+	if _, err := fileWriter.Write(fileData); err != nil {
+		return fmt.Errorf("failed to write file data: %w", err)
+	}
+
+	// 关闭writer
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("failed to close multipart writer: %w", err)
+	}
+
+	// 创建HTTP请求
+	req, err := http.NewRequest("POST", uploadURL, &buf)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("User-Agent", "SCUM-Run-Client/1.0")
+
+	// 发送请求
+	httpClient := &http.Client{
+		Timeout: 5 * time.Minute,
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to upload file to Aliyun OSS: %w", err)
+	}
+	defer func() {
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			c.logger.Warn("Failed to close response body: %v", closeErr)
+		}
+	}()
+
+	// 读取响应
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	// 检查响应状态
+	if resp.StatusCode != http.StatusOK {
+		c.logger.Error("Aliyun OSS upload failed",
+			"status_code", resp.StatusCode,
+			"response", string(responseBody),
+			"cloud_path", cloudPath)
+		return fmt.Errorf("aliyun OSS upload failed with status %d: %s", resp.StatusCode, string(responseBody))
+	}
+
+	c.logger.Info("Successfully uploaded file to Aliyun OSS: %s (%d bytes)", cloudPath, len(fileData))
 	return nil
 }
 
