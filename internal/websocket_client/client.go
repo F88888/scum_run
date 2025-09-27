@@ -2,6 +2,7 @@ package websocket_client
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"strings"
 	"sync"
@@ -40,6 +41,8 @@ type Client struct {
 	onConnect    func()
 	onDisconnect func()
 	onReconnect  func()
+	// TLS 配置
+	skipTLSVerify bool
 }
 
 // New creates a new WebSocket client
@@ -60,6 +63,7 @@ func New(url string, logger *logger.Logger) *Client {
 		readBufferSize:    128 * 1024,       // 与服务端一致的缓冲区大小
 		writeBufferSize:   128 * 1024,       // 与服务端一致的缓冲区大小
 		maxMessageSize:    2 * 1024 * 1024,  // 与服务端一致的最大消息大小
+		skipTLSVerify:     true,             // 默认不跳过 TLS 验证
 	}
 }
 
@@ -72,6 +76,14 @@ func (c *Client) Connect() error {
 		WriteBufferSize:  c.writeBufferSize, // 使用配置的写入缓冲区
 		// 添加更多连接优化配置
 		EnableCompression: false, // 禁用压缩减少CPU开销
+	}
+
+	// 配置 TLS 设置
+	if c.skipTLSVerify {
+		dialer.TLSClientConfig = &tls.Config{
+			InsecureSkipVerify: true, // 跳过 TLS 证书验证
+		}
+		c.logger.Warn("TLS certificate verification is disabled - this is not recommended for production use")
 	}
 
 	conn, _, err := dialer.Dial(c.url, nil)
@@ -276,6 +288,18 @@ func (c *Client) SetHeartbeatConfig(interval, timeout time.Duration) {
 	defer c.mutex.Unlock()
 	c.heartbeatInterval = interval
 	c.heartbeatTimeout = timeout
+}
+
+// SetTLSConfig sets TLS configuration
+func (c *Client) SetTLSConfig(skipVerify bool) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	c.skipTLSVerify = skipVerify
+	if skipVerify {
+		c.logger.Warn("TLS certificate verification will be skipped for future connections")
+	} else {
+		c.logger.Info("TLS certificate verification will be enabled for future connections")
+	}
 }
 
 // monitorConnection monitors the connection and handles reconnection
