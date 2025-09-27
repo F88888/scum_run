@@ -376,8 +376,8 @@ func (pm *PerformanceMonitor) collectNetworkUsage(data *PerformanceData) error {
 			bytesInDiff := currentNetIO.BytesRecv - pm.lastNetIO.BytesRecv
 			bytesOutDiff := currentNetIO.BytesSent - pm.lastNetIO.BytesSent
 
-			data.NetworkIn = bytesInDiff
-			data.NetworkOut = bytesOutDiff
+			data.NetworkIn = int64(bytesInDiff)
+			data.NetworkOut = int64(bytesOutDiff)
 		}
 	}
 

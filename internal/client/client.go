@@ -2660,6 +2660,11 @@ func (c *Client) sendBackupResponse(msgType string, data interface{}) {
 	}
 }
 
+// generateTaskID 生成任务ID
+func generateTaskID() string {
+	return fmt.Sprintf("task_%d", time.Now().UnixNano())
+}
+
 // handleFileTransfer 处理文件传输请求
 func (c *Client) handleFileTransfer(data interface{}) {
 	c.logger.Debug("Handling file transfer request")
