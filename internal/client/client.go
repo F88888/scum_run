@@ -511,20 +511,26 @@ func (c *Client) handleServerStart() {
 		// After server starts, try to initialize database connection
 		// This is done after server start because the database file is created by SCUM server
 		go func() {
-			// Wait a bit for the server to create the database file
-			time.Sleep(5 * time.Second)
+			// 减少等待时间，提高响应速度
+			time.Sleep(2 * time.Second)
 			c.logger.Info("Attempting to initialize database connection after server start...")
 
-			// Check if database is available before trying to initialize
-			if c.db.IsAvailable() {
-				if err := c.db.Initialize(); err != nil {
-					c.logger.Warn("Failed to initialize database after server start: %v", err)
+			// 使用重试机制而不是单次检查
+			maxRetries := 5
+			for i := 0; i < maxRetries; i++ {
+				if c.db.IsAvailable() {
+					if err := c.db.Initialize(); err != nil {
+						c.logger.Warn("Failed to initialize database after server start (attempt %d): %v", i+1, err)
+					} else {
+						c.logger.Info("Database connection initialized successfully after server start")
+						return
+					}
 				} else {
-					c.logger.Info("Database connection initialized successfully after server start")
+					c.logger.Info("Database file not yet available, retrying in 1 second (attempt %d/%d)", i+1, maxRetries)
 				}
-			} else {
-				c.logger.Info("Database file not yet available, will retry later")
+				time.Sleep(1 * time.Second)
 			}
+			c.logger.Warn("Failed to initialize database after %d attempts", maxRetries)
 		}()
 	}()
 }
@@ -552,8 +558,8 @@ func (c *Client) handleServerRestart() {
 		c.logger.Warn("Failed to stop server gracefully: %v", err)
 	}
 
-	// Wait a moment for cleanup
-	time.Sleep(2 * time.Second)
+	// 减少等待时间，提高重启速度
+	time.Sleep(1 * time.Second)
 
 	// Start again
 	if err := c.process.Start(); err != nil {
