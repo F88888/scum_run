@@ -1008,8 +1008,6 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
 			line := scanner.Text()
-			c.logger.Info("SteamCmd stdout: %s", line)
-
 			// 检查安装进度 - 仅记录日志，不发送状态消息
 			if strings.Contains(line, "Update state") && strings.Contains(line, "downloading") {
 				c.logger.Info("SteamCmd: Downloading SCUM server files...")
@@ -1052,8 +1050,6 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 		c.logger.Error("Installation completed but SCUM server executable not found")
 		return
 	}
-
-	c.logger.Info("SCUM server installation completed successfully")
 }
 
 // checkServerInstallation checks if SCUM server is installed in multiple possible locations
@@ -1072,13 +1068,11 @@ func (c *Client) checkServerInstallation(steamDetector *steam.Detector) bool {
 
 	absInstallPath, err := filepath.Abs(installPath)
 	if err == nil && steamDetector.IsSCUMServerInstalled(absInstallPath) {
-		c.logger.Debug("SCUM server found in auto-install directory: %s", absInstallPath)
 		// 更新steamDir为实际安装路径
 		c.steamDir = absInstallPath
 		return true
 	}
 
-	c.logger.Debug("SCUM server not found in any configured locations")
 	return false
 }
 
@@ -1091,8 +1085,6 @@ func (c *Client) initializeServerComponents(steamDetector *steam.Detector) {
 			c.logger.Warn("Failed to initialize database on startup: %v", err)
 			c.logger.Info("Database will be initialized when server starts")
 		}
-	} else {
-		c.logger.Info("SCUM database not found, will be created when server starts")
 	}
 
 	// Initialize log monitor
@@ -1102,15 +1094,11 @@ func (c *Client) initializeServerComponents(steamDetector *steam.Detector) {
 		if err := c.logMonitor.Start(); err != nil {
 			c.logger.Warn("Failed to start log monitor: %v", err)
 		}
-	} else {
-		c.logger.Info("SCUM logs directory not found, will be created when server starts")
 	}
 }
 
 // handleServerUpdate handles server update requests from the web interface
 func (c *Client) handleServerUpdate(data interface{}) {
-	c.logger.Info("Received server update request")
-
 	updateData, ok := data.(map[string]interface{})
 	if !ok {
 		c.sendResponse(MsgTypeServerUpdate, nil, "Invalid update request data format")
@@ -1150,8 +1138,6 @@ func (c *Client) handleServerUpdateCheck() {
 
 // handleServerUpdateInstall performs server update installation
 func (c *Client) handleServerUpdateInstall(_ map[string]interface{}) {
-	c.logger.Info("Starting SCUM server update installation...")
-
 	// 检查是否已经在安装中
 	c.installMux.Lock()
 	if c.installing {
@@ -1191,7 +1177,6 @@ func (c *Client) handleServerUpdateInstall(_ map[string]interface{}) {
 	}
 
 	// 执行更新安装
-	c.logger.Info("Performing server update installation (force reinstall)...")
 	go func() {
 		c.performServerInstallation(installPath, steamCmdPath, forceReinstall)
 
@@ -1214,8 +1199,6 @@ func (c *Client) handleServerUpdateInstall(_ map[string]interface{}) {
 
 // handleScheduledRestart handles scheduled restart requests
 func (c *Client) handleScheduledRestart(data interface{}) {
-	c.logger.Info("Received scheduled restart request")
-
 	restartData, ok := data.(map[string]interface{})
 	if !ok {
 		c.sendResponse(MsgTypeScheduledRestart, nil, "Invalid restart request data format")
@@ -1227,8 +1210,6 @@ func (c *Client) handleScheduledRestart(data interface{}) {
 	if reasonStr, exists := restartData["reason"].(string); exists && reasonStr != "" {
 		reason = reasonStr
 	}
-
-	c.logger.Info("Performing scheduled restart: %s", reason)
 
 	// 检查服务器是否在运行
 	if c.process == nil || !c.process.IsRunning() {
@@ -1280,8 +1261,6 @@ func (c *Client) validateSteamCmdExecutable(steamCmdPath string) error {
 	if runtime.GOOS == "windows" && !strings.HasSuffix(strings.ToLower(steamCmdPath), ".exe") {
 		return fmt.Errorf("SteamCmd file should have .exe extension on Windows: %s", steamCmdPath)
 	}
-
-	c.logger.Info("SteamCmd validation passed: %s (size: %d bytes)", steamCmdPath, fileInfo.Size())
 	return nil
 }
 
@@ -1301,11 +1280,7 @@ func (c *Client) performSteamCmdDownload() {
 func (c *Client) downloadSteamCmd() error {
 	steamCmdURL := _const.DefaultSteamCmdURL
 	steamCmdDir := _const.DefaultSteamCmdDir
-
-	c.logger.Info("Downloading SteamCmd from %s to directory %s", steamCmdURL, steamCmdDir)
-
 	// 创建目录
-	c.logger.Info("Creating directory: %s", steamCmdDir)
 	if err := os.MkdirAll(steamCmdDir, 0755); err != nil {
 		return fmt.Errorf("failed to create steamcmd directory: %w", err)
 	}
@@ -1340,32 +1315,25 @@ func (c *Client) downloadSteamCmd() error {
 	}
 
 	// 解压文件
-	c.logger.Info("Extracting SteamCmd from %s to %s", tempFile, steamCmdDir)
 	if err := c.extractZip(tempFile, steamCmdDir); err != nil {
 		return fmt.Errorf("failed to extract steamcmd.zip: %w", err)
 	}
 
 	// 删除临时文件
-	c.logger.Info("Cleaning up temporary file: %s", tempFile)
 	if err := os.Remove(tempFile); err != nil {
 		c.logger.Warn("Failed to remove temp file %s: %v", tempFile, err)
 	}
 
 	// 验证SteamCmd是否成功解压
 	expectedPath := _const.DefaultSteamCmdPath
-	c.logger.Info("Verifying SteamCmd at expected path: %s", expectedPath)
 	if _, err := os.Stat(expectedPath); err != nil {
 		return fmt.Errorf("steamcmd.exe not found after extraction at %s: %w", expectedPath, err)
 	}
-
-	c.logger.Info("SteamCmd downloaded and extracted successfully to %s", expectedPath)
 	return nil
 }
 
 // extractZip extracts a zip file to the specified directory
 func (c *Client) extractZip(src, dest string) error {
-	c.logger.Info("Extracting %s to %s", src, dest)
-
 	r, err := zip.OpenReader(src)
 	if err != nil {
 		return err
@@ -1421,14 +1389,11 @@ func (c *Client) extractZip(src, dest string) error {
 		}
 	}
 
-	c.logger.Info("Zip extraction completed successfully")
 	return nil
 }
 
 // handleServerCommand handles server command requests from web terminal
 func (c *Client) handleServerCommand(data interface{}) {
-	c.logger.Info("DEBUG: Received server command request")
-
 	commandData, ok := data.(map[string]interface{})
 	if !ok {
 		c.logger.Error("DEBUG: Invalid command data format")
@@ -1449,8 +1414,6 @@ func (c *Client) handleServerCommand(data interface{}) {
 		return
 	}
 
-	c.logger.Info("DEBUG: Executing server command: %s", command)
-
 	// 执行服务器命令
 	output, err := c.executeServerCommand(command)
 	if err != nil {
@@ -1461,7 +1424,6 @@ func (c *Client) handleServerCommand(data interface{}) {
 			"output":  fmt.Sprintf("Command execution failed: %v", err),
 		}, "")
 	} else {
-		c.logger.Info("DEBUG: Command executed successfully: %s", command)
 		c.sendResponse(MsgTypeCommandResult, map[string]interface{}{
 			"command": command,
 			"success": true,
@@ -1472,8 +1434,6 @@ func (c *Client) handleServerCommand(data interface{}) {
 
 // executeServerCommand executes a SCUM server command
 func (c *Client) executeServerCommand(command string) (string, error) {
-	c.logger.Info("DEBUG: executeServerCommand called with command: %s", command)
-
 	// 检查服务器是否在运行
 	if c.process == nil {
 		c.logger.Error("DEBUG: Process manager is nil")
@@ -1485,18 +1445,12 @@ func (c *Client) executeServerCommand(command string) (string, error) {
 		return "", fmt.Errorf("server is not running")
 	}
 
-	c.logger.Info("DEBUG: Server is running, sending command to process manager")
-
 	// 发送命令到SCUM服务器
 	if err := c.process.SendCommand(command); err != nil {
 		c.logger.Error("DEBUG: Failed to send command to server: %v", err)
 		return "", fmt.Errorf("failed to send command to server: %w", err)
 	}
-
-	c.logger.Info("DEBUG: Successfully sent command to server: %s", command)
-
 	// 发送日志数据显示命令已执行
-	c.sendLogData(fmt.Sprintf("Command executed: %s", command))
 
 	return fmt.Sprintf("Command '%s' has been sent to the server", command), nil
 }
@@ -1515,8 +1469,6 @@ func (c *Client) handleProcessOutput(_ string, line string) {
 
 // handleClientUpdate handles client update requests
 func (c *Client) handleClientUpdate(data interface{}) {
-	c.logger.Info("Received client update request")
-
 	updateData, ok := data.(map[string]interface{})
 	if !ok {
 		c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
@@ -1567,8 +1519,6 @@ func (c *Client) handleClientUpdate(data interface{}) {
 
 // performSelfUpdate performs the self-update process using external updater
 func (c *Client) performSelfUpdate() {
-	c.logger.Info("Starting self-update process...")
-
 	// 发送更新开始状态
 	c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
 		"type":   "self_update",
@@ -1667,8 +1617,6 @@ func (c *Client) checkForUpdates() (version string, downloadURL string, err erro
 
 // handleFileBrowse 处理文件浏览请求
 func (c *Client) handleFileBrowse(data interface{}) {
-	c.logger.Debug("Handling file browse request")
-
 	dataMap, ok := data.(map[string]interface{})
 	if !ok {
 		c.logger.Error("Invalid file browse request data")
@@ -1710,7 +1658,6 @@ func (c *Client) handleFileBrowse(data interface{}) {
 	}
 
 	c.sendResponse(MsgTypeFileList, responseData, "")
-	c.logger.Debug("Sent file list for path: %s (%d items), request_id: %s", path, len(fileList), requestID)
 }
 
 // handleFileList 处理文件列表响应（通常不会在客户端收到）
@@ -1720,8 +1667,6 @@ func (c *Client) handleFileList(_ interface{}) {
 
 // handleFileRead 处理文件内容读取请求
 func (c *Client) handleFileRead(data interface{}) {
-	c.logger.Debug("Handling file read request")
-
 	dataMap, ok := data.(map[string]interface{})
 	if !ok {
 		c.logger.Error("Invalid file read request data")
@@ -1754,7 +1699,6 @@ func (c *Client) handleFileRead(data interface{}) {
 		// 移除开头的斜杠，然后基于steamDir构建完整路径
 		relativePath := strings.TrimPrefix(path, "/")
 		fullPath = filepath.Join(c.steamDir, relativePath)
-		c.logger.Debug("Converting absolute path %s to %s", path, fullPath)
 	} else {
 		// 相对路径，基于Steam目录
 		fullPath = filepath.Join(c.steamDir, path)
@@ -1764,7 +1708,6 @@ func (c *Client) handleFileRead(data interface{}) {
 	cleanFullPath := filepath.Clean(fullPath)
 	cleanSteamDir := filepath.Clean(c.steamDir)
 	if !strings.HasPrefix(cleanFullPath, cleanSteamDir) {
-		c.logger.Error("Access denied: path outside Steam directory: %s (resolved to %s, steamDir: %s)", path, cleanFullPath, cleanSteamDir)
 		errorData := map[string]interface{}{}
 		if requestID != "" {
 			errorData["request_id"] = requestID
@@ -1772,8 +1715,6 @@ func (c *Client) handleFileRead(data interface{}) {
 		c.sendResponse(MsgTypeFileRead, errorData, "Access denied: path outside allowed directory")
 		return
 	}
-
-	c.logger.Debug("Reading file: %s (encoding: %s)", fullPath, encoding)
 
 	// 检查文件是否存在
 	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
@@ -1811,7 +1752,6 @@ func (c *Client) handleFileRead(data interface{}) {
 	}
 
 	c.sendResponse(MsgTypeFileRead, responseData, "")
-	c.logger.Debug("Sent file content for: %s (%d bytes), request_id: %s", path, len(content), requestID)
 }
 
 // handleFileWrite 处理文件内容写入请求
@@ -1861,7 +1801,6 @@ func (c *Client) handleFileWrite(data interface{}) {
 		// 移除开头的斜杠，然后基于steamDir构建完整路径
 		relativePath := strings.TrimPrefix(path, "/")
 		fullPath = filepath.Join(c.steamDir, relativePath)
-		c.logger.Debug("Converting absolute path %s to %s", path, fullPath)
 	} else {
 		// 相对路径，基于Steam目录
 		fullPath = filepath.Join(c.steamDir, path)
@@ -1871,7 +1810,6 @@ func (c *Client) handleFileWrite(data interface{}) {
 	cleanFullPath := filepath.Clean(fullPath)
 	cleanSteamDir := filepath.Clean(c.steamDir)
 	if !strings.HasPrefix(cleanFullPath, cleanSteamDir) {
-		c.logger.Error("Access denied: path outside Steam directory: %s (resolved to %s, steamDir: %s)", path, cleanFullPath, cleanSteamDir)
 		errorData := map[string]interface{}{}
 		if requestID != "" {
 			errorData["request_id"] = requestID
@@ -1879,8 +1817,6 @@ func (c *Client) handleFileWrite(data interface{}) {
 		c.sendResponse(MsgTypeFileWrite, errorData, "Access denied: path outside allowed directory")
 		return
 	}
-
-	c.logger.Debug("Writing file: %s (encoding: %s, size: %d bytes)", fullPath, encoding, len(content))
 
 	// 确保目录存在
 	dir := filepath.Dir(fullPath)
@@ -1897,7 +1833,6 @@ func (c *Client) handleFileWrite(data interface{}) {
 	// 写入文件内容
 	err := c.writeFileWithEncoding(fullPath, content, encoding)
 	if err != nil {
-		c.logger.Error("Failed to write file %s: %v", fullPath, err)
 		errorData := map[string]interface{}{}
 		if requestID != "" {
 			errorData["request_id"] = requestID
@@ -1930,7 +1865,6 @@ func (c *Client) handleFileWrite(data interface{}) {
 	}
 
 	c.sendResponse(MsgTypeFileWrite, responseData, "")
-	c.logger.Debug("File written successfully: %s (%d bytes), request_id: %s", path, len(content), requestID)
 }
 
 // scanDirectory 扫描指定目录并返回文件列表
@@ -2055,7 +1989,6 @@ func (c *Client) addLogToBuffer(content string) {
 
 	// 检查消息大小限制（单条日志最大1KB）
 	if len(content) > 1024 {
-		c.logger.Warn("Log message too large, truncating: %d bytes", len(content))
 		content = content[:1024] + "... [truncated]"
 	}
 
@@ -2149,7 +2082,6 @@ func (c *Client) sendBatchLogData(logs []string) {
 		"batch":   true, // 标识这是批量数据
 	}
 
-	c.logger.Debug("Sending batch log data: %d logs", len(logContents))
 	c.sendResponse(MsgTypeLogData, logData, "")
 }
 
@@ -2308,12 +2240,12 @@ func (c *Client) writeFileWithEncoding(filePath, content, encoding string) error
 
 // handleSystemMonitor 处理系统监控消息
 func (c *Client) handleSystemMonitor(data interface{}) {
-	c.logger.Debug("Received system monitor message")
+	//c.logger.Debug("Received system monitor message")
 
 	// 系统监控消息通常是从服务器发送的配置或控制指令
 	// 这里可以根据需要处理服务器发送的系统监控相关指令
 	if data != nil {
-		c.logger.Debug("System monitor data: %+v", data)
+		//c.logger.Debug("System monitor data: %+v", data)
 	}
 }
 

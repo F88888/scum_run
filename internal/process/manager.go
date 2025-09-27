@@ -379,7 +379,6 @@ func (m *Manager) readOutput(pipe io.ReadCloser, source string) {
 	scanner := bufio.NewScanner(pipe)
 	for scanner.Scan() {
 		line := scanner.Text()
-		m.logger.Info("[%s] %s", source, line)
 
 		// 调用回调函数发送实时输出
 		if m.outputCallback != nil {
@@ -393,8 +392,6 @@ func (m *Manager) readOutput(pipe io.ReadCloser, source string) {
 
 // SendCommand sends a command to the running SCUM server
 func (m *Manager) SendCommand(command string) error {
-	m.logger.Info("DEBUG: SendCommand called with command: %s", command)
-
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
@@ -412,8 +409,6 @@ func (m *Manager) SendCommand(command string) error {
 		m.logger.Error("DEBUG: stdin pipe is nil")
 		return fmt.Errorf("stdin pipe is not available")
 	}
-
-	m.logger.Info("DEBUG: Sending command to server: %s", command)
 
 	// Write command to stdin with newline
 	_, err := fmt.Fprintf(m.stdin, "%s\n", command)
