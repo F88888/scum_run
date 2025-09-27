@@ -162,9 +162,6 @@ func (c *Client) Start() error {
 
 	c.wsClient = websocket_client.New(u.String(), c.logger)
 
-	// 设置 TLS 配置
-	c.wsClient.SetTLSConfig(c.config.SkipTLSVerify)
-
 	// 设置重连回调
 	c.wsClient.SetCallbacks(
 		func() {
