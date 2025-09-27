@@ -2902,14 +2902,95 @@ func (c *Client) uploadToQiniu(fileData []byte, cloudPath string, uploadSignatur
 		return fmt.Errorf("missing or invalid qiniu upload key")
 	}
 
-	domain, _ := uploadSignature["domain"].(string)
+	region, _ := uploadSignature["region"].(string)
 
-	// 构建上传URL - 七牛云使用固定的上传域名
-	uploadURL := "https://upload.qiniup.com"
+	// 尝试上传到七牛云，支持区域域名自动切换
+	return c.uploadToQiniuWithRetry(fileData, cloudPath, token, key, region)
+}
 
-	c.logger.Debug("Uploading to Qiniu: %s -> %s (%d bytes)", cloudPath, uploadURL, len(fileData))
-	c.logger.Debug("Qiniu upload parameters: token=%s, key=%s, domain=%s", token, key, domain)
+// uploadToQiniuWithRetry 带重试的七牛云上传
+func (c *Client) uploadToQiniuWithRetry(fileData []byte, cloudPath, token, key, region string) error {
+	// 如果没有提供区域信息，使用默认值
+	if region == "" {
+		region = "z0" // 默认华东-浙江区域
+	}
 
+	// 根据区域构建上传URL
+	uploadURL := c.buildQiniuUploadURL(region)
+
+	// 尝试上传
+	err := c.uploadToQiniuURL(fileData, cloudPath, token, key, uploadURL)
+	if err == nil {
+		// 上传成功
+		c.logger.Info("Successfully uploaded file to Qiniu: %s (%d bytes)", cloudPath, len(fileData))
+		return nil
+	}
+
+	// 如果上传失败且是区域错误，尝试解析错误信息获取正确的区域
+	if strings.Contains(err.Error(), "incorrect region") && strings.Contains(err.Error(), "please use") {
+		correctRegion := c.parseRegionFromError(err.Error())
+		if correctRegion != "" && correctRegion != region {
+			correctURL := c.buildQiniuUploadURL(correctRegion)
+			err = c.uploadToQiniuURL(fileData, cloudPath, token, key, correctURL)
+			if err == nil {
+				c.logger.Info("Successfully uploaded file to Qiniu with corrected region: %s (%d bytes)", cloudPath, len(fileData))
+				return nil
+			}
+		}
+	}
+
+	return fmt.Errorf("七牛云上传失败: %w", err)
+}
+
+// buildQiniuUploadURL 根据区域构建七牛云上传URL
+func (c *Client) buildQiniuUploadURL(region string) string {
+	// 七牛云区域域名映射
+	regionMap := map[string]string{
+		"z0":             "https://up-z0.qiniup.com",             // 华东-浙江
+		"cn-east-2":      "https://up-cn-east-2.qiniup.com",      // 华东-浙江2
+		"z1":             "https://up-z1.qiniup.com",             // 华北-河北
+		"z2":             "https://up-z2.qiniup.com",             // 华南-广东
+		"cn-northwest-1": "https://up-cn-northwest-1.qiniup.com", // 西北-陕西1
+		"na0":            "https://up-na0.qiniup.com",            // 北美-洛杉矶
+		"as0":            "https://up-as0.qiniup.com",            // 亚太-新加坡
+		"ap-southeast-2": "https://up-ap-southeast-2.qiniup.com", // 亚太-河内
+		"ap-southeast-3": "https://up-ap-southeast-3.qiniup.com", // 亚太-胡志明
+	}
+
+	if url, exists := regionMap[region]; exists {
+		return url
+	}
+
+	// 如果区域不存在，使用通用域名
+	return "https://upload.qiniup.com"
+}
+
+// parseRegionFromError 从错误信息中解析正确的区域
+func (c *Client) parseRegionFromError(errorMsg string) string {
+	// 解析错误信息中的区域域名
+	regionMap := map[string]string{
+		"up-z0.qiniup.com":             "z0",
+		"up-cn-east-2.qiniup.com":      "cn-east-2",
+		"up-z1.qiniup.com":             "z1",
+		"up-z2.qiniup.com":             "z2",
+		"up-cn-northwest-1.qiniup.com": "cn-northwest-1",
+		"up-na0.qiniup.com":            "na0",
+		"up-as0.qiniup.com":            "as0",
+		"up-ap-southeast-2.qiniup.com": "ap-southeast-2",
+		"up-ap-southeast-3.qiniup.com": "ap-southeast-3",
+	}
+
+	for domain, region := range regionMap {
+		if strings.Contains(errorMsg, domain) {
+			return region
+		}
+	}
+
+	return ""
+}
+
+// uploadToQiniuURL 使用指定URL上传到七牛云
+func (c *Client) uploadToQiniuURL(fileData []byte, cloudPath, token, key, uploadURL string) error {
 	// 创建multipart form data
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
@@ -2977,14 +3058,9 @@ func (c *Client) uploadToQiniu(fileData []byte, cloudPath string, uploadSignatur
 
 	// 检查响应状态
 	if resp.StatusCode != http.StatusOK {
-		c.logger.Error("Qiniu upload failed",
-			"status_code", resp.StatusCode,
-			"response", string(responseBody),
-			"cloud_path", cloudPath)
 		return fmt.Errorf("qiniu upload failed with status %d: %s", resp.StatusCode, string(responseBody))
 	}
 
-	c.logger.Info("Successfully uploaded file to Qiniu: %s (%d bytes)", cloudPath, len(fileData))
 	return nil
 }
 
