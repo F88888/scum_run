@@ -2297,14 +2297,36 @@ func (c *Client) handleBackupStart(data interface{}) {
 		return
 	}
 
+	// 获取备份路径，如果没有提供则根据服务器类型使用默认路径
 	backupPath, ok := backupData["backup_path"].(string)
 	if !ok || backupPath == "" {
-		c.logger.Error("Backup path is missing or invalid")
-		c.sendBackupResponse(MsgTypeBackupStatus, map[string]interface{}{
-			"success": false,
-			"message": "Backup path is missing or invalid",
-		})
-		return
+		// 根据服务器类型设置默认备份路径
+		backupPath = c.getDefaultBackupPath(uint(serverID))
+	} else {
+		// 验证用户提供的备份路径
+		cfg, err := c.getServerConfig(uint(serverID))
+		if err != nil {
+			c.logger.Error("Failed to get server config for path validation: %v", err)
+			c.sendBackupResponse(MsgTypeBackupStatus, map[string]interface{}{
+				"success": false,
+				"message": "无法获取服务器配置",
+			})
+			return
+		}
+
+		installPath := cfg.AutoInstall.InstallPath
+		if installPath == "" {
+			installPath = "C:/scumserver"
+		}
+
+		if err := c.validateBackupPath(backupPath, installPath); err != nil {
+			c.logger.Error("Invalid backup path: %v", err)
+			c.sendBackupResponse(MsgTypeBackupStatus, map[string]interface{}{
+				"success": false,
+				"message": err.Error(),
+			})
+			return
+		}
 	}
 
 	description, _ := backupData["description"].(string)
@@ -2526,6 +2548,11 @@ func (c *Client) createBackupArchive(sourcePath, targetPath string, serverID uin
 
 		// 跳过目录
 		if info.IsDir() {
+			// 排除 Logs 目录
+			if filepath.Base(path) == "Logs" {
+				c.logger.Info("Skipping Logs directory: %s", path)
+				return filepath.SkipDir
+			}
 			return nil
 		}
 
@@ -2589,6 +2616,12 @@ func (c *Client) getSourceSize(sourcePath string) int64 {
 		if err != nil {
 			return nil
 		}
+
+		// 排除 Logs 目录
+		if info.IsDir() && filepath.Base(path) == "Logs" {
+			return filepath.SkipDir
+		}
+
 		if !info.IsDir() {
 			totalSize += info.Size()
 		}
@@ -2663,6 +2696,75 @@ func (c *Client) sendBackupResponse(msgType string, data interface{}) {
 // generateTaskID 生成任务ID
 func generateTaskID() string {
 	return fmt.Sprintf("task_%d", time.Now().UnixNano())
+}
+
+// getDefaultBackupPath 根据服务器类型获取默认备份路径
+func (c *Client) getDefaultBackupPath(serverID uint) string {
+	// 获取服务器配置信息
+	cfg, err := c.getServerConfig(serverID)
+	if err != nil {
+		c.logger.Error("Failed to get server config: %v", err)
+		// 使用默认路径
+		return "C:/scumserver/backups"
+	}
+
+	// 获取安装路径
+	installPath := cfg.AutoInstall.InstallPath
+	if installPath == "" {
+		installPath = "C:/scumserver"
+	}
+
+	// 根据服务器类型设置不同的备份路径
+	// 这里需要根据实际的服务器类型判断逻辑
+	// 暂时通过检查路径结构来判断服务器类型
+	var backupPath string
+
+	// 检查是否存在 SCUM 目录结构来判断是否为 SCUM 自建服
+	scumSavePath := filepath.Join(installPath, "SCUM", "Saved", "SaveFiles")
+	if _, err := os.Stat(scumSavePath); err == nil {
+		// SCUM 自建服：备份路径是 \SCUM\Saved\SaveFiles
+		backupPath = scumSavePath
+		c.logger.Info("Detected SCUM self-hosted server, using SaveFiles path")
+	} else {
+		// CMD 服务器：备份路径是根目录
+		backupPath = installPath
+		c.logger.Info("Detected CMD server, using root directory")
+	}
+
+	c.logger.Info("Server %d backup path: %s (install path: %s)", serverID, backupPath, installPath)
+	return backupPath
+}
+
+// getServerConfig 获取服务器配置信息
+func (c *Client) getServerConfig(serverID uint) (*config.Config, error) {
+	// 返回当前客户端的配置
+	return c.config, nil
+}
+
+// validateBackupPath 验证备份路径是否安全
+func (c *Client) validateBackupPath(path string, installPath string) error {
+	// 检查路径是否包含危险字符
+	if strings.Contains(path, "..") || strings.Contains(path, "../") || strings.Contains(path, "..\\") {
+		return fmt.Errorf("备份路径包含危险字符，不允许使用相对路径")
+	}
+
+	// 检查路径是否在安装目录内
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("无法解析备份路径: %v", err)
+	}
+
+	absInstallPath, err := filepath.Abs(installPath)
+	if err != nil {
+		return fmt.Errorf("无法解析安装路径: %v", err)
+	}
+
+	// 检查备份路径是否在安装目录内
+	if !strings.HasPrefix(absPath, absInstallPath) {
+		return fmt.Errorf("备份路径必须在安装目录内")
+	}
+
+	return nil
 }
 
 // handleFileTransfer 处理文件传输请求
