@@ -1586,8 +1586,11 @@ func (c *Client) handleClientUpdate(data interface{}) {
 			}
 		}
 
-		// 启动自我更新流程
-		go c.performSelfUpdate()
+		// 获取下载链接
+		downloadURL, _ := updateData["download_url"].(string)
+
+		// 启动自我更新流程，传递下载链接
+		go c.performSelfUpdateWithURL(downloadURL)
 	default:
 		c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
 			"type":   "self_update",
@@ -1596,7 +1599,75 @@ func (c *Client) handleClientUpdate(data interface{}) {
 	}
 }
 
-// performSelfUpdate performs the self-update process using external updater
+// performSelfUpdateWithURL performs the self-update process using provided download URL
+func (c *Client) performSelfUpdateWithURL(downloadURL string) {
+	// 发送更新开始状态
+	c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
+		"type":   "self_update",
+		"status": _const.UpdateStatusChecking,
+	}, "Starting update with provided download URL...")
+
+	if downloadURL == "" {
+		c.logger.Error("No download URL provided")
+		c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
+			"type":   "self_update",
+			"status": _const.UpdateStatusFailed,
+		}, "No download URL provided")
+		return
+	}
+
+	c.logger.Info("Update download URL: %s", downloadURL)
+
+	// 准备更新配置
+	currentExe, err := os.Executable()
+	if err != nil {
+		c.logger.Error("Failed to get executable path: %v", err)
+		c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
+			"type":   "self_update",
+			"status": _const.UpdateStatusFailed,
+		}, fmt.Sprintf("Failed to get executable path: %v", err))
+		return
+	}
+
+	updateConfig := updater.UpdaterConfig{
+		CurrentExePath: currentExe,
+		UpdateURL:      downloadURL,
+		Args:           os.Args[1:], // 排除程序名本身
+	}
+
+	// 发送更新状态并启动外部更新器
+	c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
+		"type":   "self_update",
+		"status": _const.UpdateStatusDownloading,
+	}, "Starting updater with provided download URL...")
+
+	// 启动外部更新器
+	if err := updater.ExecuteUpdate(updateConfig); err != nil {
+		c.logger.Error("Failed to start updater: %v", err)
+		c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
+			"type":   "self_update",
+			"status": _const.UpdateStatusFailed,
+		}, fmt.Sprintf("Failed to start updater: %v", err))
+		return
+	}
+
+	c.logger.Info("External updater started, shutting down current process...")
+
+	// 发送最终状态
+	c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
+		"type":   "self_update",
+		"status": _const.UpdateStatusInstalling,
+	}, "Updater started, shutting down for update...")
+
+	// 延迟一段时间让消息发送完成，然后退出让更新器接管
+	go func() {
+		time.Sleep(2 * time.Second)
+		c.logger.Info("Exiting for update...")
+		os.Exit(0)
+	}()
+}
+
+// performSelfUpdate performs the self-update process using external updater (legacy method)
 func (c *Client) performSelfUpdate() {
 	// 发送更新开始状态
 	c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
