@@ -17,7 +17,7 @@ RUN go mod download
 COPY . .
 
 # 构建应用
-RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o scum_run .
+RUN CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o scum_run_$(date +%s).exe .
 
 # 运行时镜像
 FROM alpine:latest AS runtime

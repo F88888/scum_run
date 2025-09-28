@@ -40,6 +40,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -1627,6 +1628,35 @@ func (c *Client) performSelfUpdateWithURL(downloadURL string) {
 
 	c.logger.Info("📥 更新下载链接: %s", downloadURL)
 
+	// 在更新前优雅地停止SCUM服务器
+	if c.process != nil && c.process.IsRunning() {
+		c.logger.Info("🛑 检测到SCUM服务器正在运行，发送Ctrl+C信号进行优雅关闭...")
+
+		// 发送更新状态，告知正在停止服务器
+		c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
+			"type":   "self_update",
+			"status": _const.UpdateStatusChecking,
+		}, "Stopping SCUM server before update...")
+
+		// 优雅停止SCUM服务器
+		if err := c.process.Stop(); err != nil {
+			c.logger.Warn("⚠️ 优雅停止SCUM服务器失败，将强制停止: %v", err)
+			// 如果优雅停止失败，尝试强制停止
+			if forceErr := c.process.ForceStop(); forceErr != nil {
+				c.logger.Error("❌ 强制停止SCUM服务器也失败: %v", forceErr)
+			} else {
+				c.logger.Info("✅ SCUM服务器已强制停止")
+			}
+		} else {
+			c.logger.Info("✅ SCUM服务器已优雅停止")
+		}
+
+		// 等待一段时间确保服务器完全停止
+		time.Sleep(2 * time.Second)
+	} else {
+		c.logger.Info("ℹ️ SCUM服务器未运行，无需停止")
+	}
+
 	// 准备更新配置
 	currentExe, err := os.Executable()
 	if err != nil {
@@ -1674,11 +1704,16 @@ func (c *Client) performSelfUpdateWithURL(downloadURL string) {
 		"status": _const.UpdateStatusInstalling,
 	}, "Updater started, shutting down for update...")
 
-	// 延迟一段时间让消息发送完成，然后退出让更新器接管
+	// 延迟一段时间让消息发送完成，然后强制退出让更新器接管
 	go func() {
-		time.Sleep(2 * time.Second)
+		time.Sleep(1 * time.Second) // 减少等待时间，确保更新器脚本先启动
 		c.logger.Info("🔄 正在退出以进行更新...")
-		os.Exit(0)
+		// 使用 syscall.Exit 强制退出，不等待子进程
+		if runtime.GOOS == "windows" {
+			syscall.Exit(0)
+		} else {
+			os.Exit(0)
+		}
 	}()
 }
 

@@ -82,7 +82,7 @@ del "%%%%~f0"
 echo "Starting SCUM Run updater..."
 
 # 等待主程序完全退出
-sleep 3
+sleep 1
 
 # 下载新版本
 echo "Downloading update from %s..."
@@ -155,11 +155,13 @@ func ExecuteUpdate(config UpdaterConfig) error {
 	var scriptName string
 	if runtime.GOOS == "windows" {
 		scriptName = "scum_run_updater.bat"
-		cmd = exec.Command("cmd", "/C", scriptName)
+		// 使用 start 命令启动，完全分离进程
+		cmd = exec.Command("cmd", "/C", "start", "/B", "", scriptName)
 		fmt.Printf("🪟 启动Windows更新器脚本: %s\n", scriptName)
 	} else {
 		scriptName = "scum_run_updater.sh"
-		cmd = exec.Command("bash", scriptName)
+		// 使用 nohup 启动，完全分离进程
+		cmd = exec.Command("nohup", "bash", scriptName, "&")
 		fmt.Printf("🐧 启动Linux更新器脚本: %s\n", scriptName)
 	}
 
@@ -171,6 +173,9 @@ func ExecuteUpdate(config UpdaterConfig) error {
 		fmt.Printf("❌ 启动更新器失败: %v\n", err)
 		return fmt.Errorf("failed to start updater: %w", err)
 	}
+
+	// 立即释放进程资源，不等待子进程结束
+	cmd.Process.Release()
 
 	fmt.Printf("✅ 更新器进程已启动，PID: %d\n", cmd.Process.Pid)
 	return nil
