@@ -1550,6 +1550,7 @@ func (c *Client) handleProcessOutput(_ string, line string) {
 func (c *Client) handleClientUpdate(data interface{}) {
 	updateData, ok := data.(map[string]interface{})
 	if !ok {
+		c.logger.Error("❌ 接收到无效的更新请求数据格式")
 		c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
 			"type":   "self_update",
 			"status": _const.UpdateStatusFailed,
@@ -1560,6 +1561,7 @@ func (c *Client) handleClientUpdate(data interface{}) {
 	// 检查更新动作
 	action, ok := updateData["action"].(string)
 	if !ok {
+		c.logger.Error("❌ 更新请求缺少action字段")
 		c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
 			"type":   "self_update",
 			"status": _const.UpdateStatusFailed,
@@ -1567,31 +1569,36 @@ func (c *Client) handleClientUpdate(data interface{}) {
 		return
 	}
 
+	c.logger.Info("🔄 接收到客户端更新请求: action=%s", action)
+
 	switch action {
 	case "update":
 		// 检查是否需要先停止服务器
 		stopServer, _ := updateData["stop_server"].(bool)
 		if stopServer {
-			c.logger.Info("Stopping SCUM server before client update...")
+			c.logger.Info("🛑 更新前需要先停止SCUM服务器...")
 			if c.process != nil && c.process.IsRunning() {
 				if err := c.process.Stop(); err != nil {
-					c.logger.Error("Failed to stop server before update: %v", err)
+					c.logger.Error("❌ 更新前停止服务器失败: %v", err)
 					c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
 						"type":   "self_update",
 						"status": _const.UpdateStatusFailed,
 					}, fmt.Sprintf("Failed to stop server: %v", err))
 					return
 				}
-				c.logger.Info("Server stopped successfully, proceeding with client update")
+				c.logger.Info("✅ 服务器已成功停止，继续客户端更新")
 			}
 		}
 
 		// 获取下载链接
 		downloadURL, _ := updateData["download_url"].(string)
+		c.logger.Info("📥 获取到下载链接: %s", downloadURL)
 
 		// 启动自我更新流程，传递下载链接
+		c.logger.Info("🚀 启动客户端自我更新流程...")
 		go c.performSelfUpdateWithURL(downloadURL)
 	default:
+		c.logger.Error("❌ 未知的更新动作: %s", action)
 		c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
 			"type":   "self_update",
 			"status": _const.UpdateStatusFailed,
@@ -1601,6 +1608,8 @@ func (c *Client) handleClientUpdate(data interface{}) {
 
 // performSelfUpdateWithURL performs the self-update process using provided download URL
 func (c *Client) performSelfUpdateWithURL(downloadURL string) {
+	c.logger.Info("🔄 开始执行客户端自我更新流程")
+
 	// 发送更新开始状态
 	c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
 		"type":   "self_update",
@@ -1608,7 +1617,7 @@ func (c *Client) performSelfUpdateWithURL(downloadURL string) {
 	}, "Starting update with provided download URL...")
 
 	if downloadURL == "" {
-		c.logger.Error("No download URL provided")
+		c.logger.Error("❌ 未提供下载链接")
 		c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
 			"type":   "self_update",
 			"status": _const.UpdateStatusFailed,
@@ -1616,12 +1625,12 @@ func (c *Client) performSelfUpdateWithURL(downloadURL string) {
 		return
 	}
 
-	c.logger.Info("Update download URL: %s", downloadURL)
+	c.logger.Info("📥 更新下载链接: %s", downloadURL)
 
 	// 准备更新配置
 	currentExe, err := os.Executable()
 	if err != nil {
-		c.logger.Error("Failed to get executable path: %v", err)
+		c.logger.Error("❌ 获取可执行文件路径失败: %v", err)
 		c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
 			"type":   "self_update",
 			"status": _const.UpdateStatusFailed,
@@ -1629,11 +1638,15 @@ func (c *Client) performSelfUpdateWithURL(downloadURL string) {
 		return
 	}
 
+	c.logger.Info("📁 当前可执行文件路径: %s", currentExe)
+
 	updateConfig := updater.UpdaterConfig{
 		CurrentExePath: currentExe,
 		UpdateURL:      downloadURL,
 		Args:           os.Args[1:], // 排除程序名本身
 	}
+
+	c.logger.Info("⚙️ 更新配置已准备: URL=%s, Args=%v", updateConfig.UpdateURL, updateConfig.Args)
 
 	// 发送更新状态并启动外部更新器
 	c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
@@ -1641,9 +1654,11 @@ func (c *Client) performSelfUpdateWithURL(downloadURL string) {
 		"status": _const.UpdateStatusDownloading,
 	}, "Starting updater with provided download URL...")
 
+	c.logger.Info("🚀 启动外部更新器...")
+
 	// 启动外部更新器
 	if err := updater.ExecuteUpdate(updateConfig); err != nil {
-		c.logger.Error("Failed to start updater: %v", err)
+		c.logger.Error("❌ 启动更新器失败: %v", err)
 		c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
 			"type":   "self_update",
 			"status": _const.UpdateStatusFailed,
@@ -1651,7 +1666,7 @@ func (c *Client) performSelfUpdateWithURL(downloadURL string) {
 		return
 	}
 
-	c.logger.Info("External updater started, shutting down current process...")
+	c.logger.Info("✅ 外部更新器已启动，准备关闭当前进程...")
 
 	// 发送最终状态
 	c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
@@ -1662,7 +1677,7 @@ func (c *Client) performSelfUpdateWithURL(downloadURL string) {
 	// 延迟一段时间让消息发送完成，然后退出让更新器接管
 	go func() {
 		time.Sleep(2 * time.Second)
-		c.logger.Info("Exiting for update...")
+		c.logger.Info("🔄 正在退出以进行更新...")
 		os.Exit(0)
 	}()
 }

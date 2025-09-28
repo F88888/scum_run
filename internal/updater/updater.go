@@ -135,26 +135,42 @@ rm -f "$0"
 
 // ExecuteUpdate 执行更新流程
 func ExecuteUpdate(config UpdaterConfig) error {
+	fmt.Printf("🔄 开始执行更新流程...\n")
+	fmt.Printf("📥 下载URL: %s\n", config.UpdateURL)
+	fmt.Printf("📁 当前程序路径: %s\n", config.CurrentExePath)
+	fmt.Printf("⚙️ 启动参数: %v\n", config.Args)
+
 	// 1. 创建更新器脚本
+	fmt.Printf("📝 创建更新器脚本...\n")
 	if err := CreateUpdaterScript(config); err != nil {
+		fmt.Printf("❌ 创建更新器脚本失败: %v\n", err)
 		return fmt.Errorf("failed to create updater script: %w", err)
 	}
+	fmt.Printf("✅ 更新器脚本创建成功\n")
 
 	// 2. 启动更新器脚本
 	var cmd *exec.Cmd
+	var scriptName string
 	if runtime.GOOS == "windows" {
-		cmd = exec.Command("cmd", "/C", "scum_run_updater.bat")
+		scriptName = "scum_run_updater.bat"
+		cmd = exec.Command("cmd", "/C", scriptName)
+		fmt.Printf("🪟 启动Windows更新器脚本: %s\n", scriptName)
 	} else {
-		cmd = exec.Command("bash", "scum_run_updater.sh")
+		scriptName = "scum_run_updater.sh"
+		cmd = exec.Command("bash", scriptName)
+		fmt.Printf("🐧 启动Linux更新器脚本: %s\n", scriptName)
 	}
 
 	// 分离进程，让更新器独立运行
 	cmd.SysProcAttr = getSysProcAttr()
 
+	fmt.Printf("🚀 启动更新器进程...\n")
 	if err := cmd.Start(); err != nil {
+		fmt.Printf("❌ 启动更新器失败: %v\n", err)
 		return fmt.Errorf("failed to start updater: %w", err)
 	}
 
+	fmt.Printf("✅ 更新器进程已启动，PID: %d\n", cmd.Process.Pid)
 	return nil
 }
 
