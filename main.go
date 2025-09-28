@@ -96,12 +96,15 @@ func main() {
 	}()
 
 	// Setup graceful shutdown
+	// 注意：只监听来自外部的信号，不监听可能被内部进程管理使用的信号
 	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGKILL)
+	// 移除 os.Interrupt 和 syscall.SIGTERM，因为这些信号可能被进程管理器使用
+	// 只监听明确的退出信号
+	signal.Notify(c, syscall.SIGQUIT, syscall.SIGKILL)
 
 	go func() {
 		sig := <-c
-		logger.Info("Received signal %v, shutting down...", sig)
+		logger.Info("Received external signal %v, shutting down...", sig)
 
 		// Always use ForceStop to ensure all processes are cleaned up
 		logger.Info("Force stopping all processes...")

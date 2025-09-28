@@ -64,29 +64,23 @@ func (m *Monitor) Start() error {
 
 	// Check if logs directory exists
 	if _, err := os.Stat(m.logsPath); os.IsNotExist(err) {
-		m.logger.Warn("⚠️ Logs directory does not exist: %s", m.logsPath)
+		m.logger.Warn("Logs directory does not exist: %s", m.logsPath)
 		return nil
 	}
-
-	m.logger.Info("📁 Logs directory exists: %s", m.logsPath)
 
 	// Add the logs directory to the watcher
 	if err := m.watcher.Add(m.logsPath); err != nil {
 		return fmt.Errorf("failed to add logs directory to watcher: %w", err)
 	}
 
-	m.logger.Info("🔍 Started monitoring logs directory: %s", m.logsPath)
-
 	// Scan existing log files
 	if err := m.scanExistingFiles(); err != nil {
-		m.logger.Warn("⚠️ Failed to scan existing files: %v", err)
+		m.logger.Warn("Failed to scan existing files: %v", err)
 	}
 
 	// Start the monitoring goroutine
 	m.wg.Add(1)
 	go m.monitorLoop()
-
-	m.logger.Info("✅ Log monitor fully initialized and running")
 	return nil
 }
 
@@ -101,12 +95,10 @@ func (m *Monitor) Stop() {
 	}
 
 	m.wg.Wait()
-	m.logger.Info("Log monitor stopped")
 }
 
 // scanExistingFiles scans for existing log files and initializes their states
 func (m *Monitor) scanExistingFiles() error {
-	m.logger.Info("🔍 Scanning existing log files in: %s", m.logsPath)
 
 	entries, err := os.ReadDir(m.logsPath)
 	if err != nil {
@@ -131,7 +123,6 @@ func (m *Monitor) scanExistingFiles() error {
 		filepath := filepath.Join(m.logsPath, filename)
 		fileInfo, err := os.Stat(filepath)
 		if err != nil {
-			m.logger.Warn("⚠️ Failed to stat file %s: %v", filepath, err)
 			continue
 		}
 
@@ -144,10 +135,7 @@ func (m *Monitor) scanExistingFiles() error {
 		m.mutex.Unlock()
 
 		acceptedCount++
-		m.logger.Info("✅ Initialized monitoring for log file: %s (size: %d bytes)", filename, fileInfo.Size())
 	}
-
-	m.logger.Info("📊 File scan complete: %d files scanned, %d log files accepted for monitoring", scannedCount, acceptedCount)
 	return nil
 }
 
@@ -178,11 +166,8 @@ func (m *Monitor) handleFileEvent(event fsnotify.Event) {
 	filename := filepath.Base(event.Name)
 
 	if !m.isLogFile(filename) {
-		m.logger.Debug("📄 Ignoring non-log file event: %s %s", event.Op.String(), filename)
 		return
 	}
-
-	m.logger.Debug("📁 File event: %s %s", event.Op.String(), filename)
 
 	switch {
 	case event.Op&fsnotify.Create == fsnotify.Create:
@@ -199,7 +184,6 @@ func (m *Monitor) handleFileCreated(filename string) {
 	filepath := filepath.Join(m.logsPath, filename)
 	fileInfo, err := os.Stat(filepath)
 	if err != nil {
-		m.logger.Warn("⚠️ Failed to stat newly created file %s: %v", filepath, err)
 		return
 	}
 
@@ -211,7 +195,6 @@ func (m *Monitor) handleFileCreated(filename string) {
 	}
 	m.mutex.Unlock()
 
-	m.logger.Info("🆕 Started monitoring new log file: %s (size: %d bytes)", filename, fileInfo.Size())
 	m.checkFileForNewLines(filename)
 }
 
@@ -225,8 +208,6 @@ func (m *Monitor) handleFileRemoved(filename string) {
 	m.mutex.Lock()
 	delete(m.fileStates, filename)
 	m.mutex.Unlock()
-
-	m.logger.Info("Stopped monitoring removed log file: %s", filename)
 }
 
 // checkFileChanges periodically checks all monitored files for changes
@@ -267,13 +248,11 @@ func (m *Monitor) checkFileForNewLines(filename string) {
 			lastModTime: fileInfo.ModTime(),
 		}
 		m.fileStates[filename] = state
-		m.logger.Debug("🆕 Initialized monitoring state for file: %s", filename)
 	}
 	m.mutex.Unlock()
 
 	// Check if file has grown
 	if fileInfo.Size() <= state.lastSize {
-		m.logger.Debug("📏 File %s size unchanged: %d bytes", filename, fileInfo.Size())
 		return
 	}
 
@@ -285,9 +264,6 @@ func (m *Monitor) checkFileForNewLines(filename string) {
 	}
 
 	if len(newLines) > 0 {
-		m.logger.Info("📝 Found %d new lines in %s (size: %d -> %d bytes)",
-			len(newLines), filename, state.lastSize, fileInfo.Size())
-
 		// Update state
 		m.mutex.Lock()
 		state.lastSize = fileInfo.Size()
@@ -296,13 +272,8 @@ func (m *Monitor) checkFileForNewLines(filename string) {
 
 		// Call callback with new lines
 		if m.callback != nil {
-			m.logger.Debug("📞 Calling callback for %s with %d lines", filename, len(newLines))
 			m.callback(filename, newLines)
-		} else {
-			m.logger.Warn("⚠️ No callback set for log monitor")
 		}
-	} else {
-		m.logger.Debug("📭 No new lines found in %s", filename)
 	}
 }
 
@@ -403,22 +374,19 @@ func (m *Monitor) isLogFile(filename string) bool {
 	// Check if file has .log extension
 	ext := strings.ToLower(filepath.Ext(filename))
 	if ext != ".log" {
-		m.logger.Debug("📄 File %s rejected: not a .log file", filename)
 		return false
 	}
 
 	// Check if filename starts with one of the specific SCUM log prefixes
 	scumLogPrefixes := []string{
-		"admin_", "chat_", "economy_", "event_kill_", "famepoints_",
-		"gameplay_", "kill_", "login_", "violations_", "vehicle_destruction_",
+		"admin", "chat", "economy", "event_kill", "famepoints",
+		"gameplay", "kill", "login", "violations", "vehicle_destruction",
 	}
 	for _, prefix := range scumLogPrefixes {
 		if strings.HasPrefix(lowerFilename, prefix) {
-			m.logger.Debug("✅ File %s accepted: matches prefix %s", filename, prefix)
 			return true
 		}
 	}
 
-	m.logger.Debug("📄 File %s rejected: no matching prefix", filename)
 	return false
 }

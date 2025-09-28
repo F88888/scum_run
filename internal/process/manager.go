@@ -207,11 +207,16 @@ func (m *Manager) Stop() error {
 	m.logger.Info("Stopping SCUM server (PID: %d)", m.cmd.Process.Pid)
 
 	// Try graceful shutdown first
+	// 注意：不要使用 os.Interrupt 或 syscall.SIGTERM，因为这些信号会被scum_run主程序捕获
+	// 使用更精确的信号发送方式，只影响SCUM服务器进程
 	if runtime.GOOS == "windows" {
+		// Windows下使用Ctrl+C信号，但只发送给子进程
 		if err := m.cmd.Process.Signal(os.Interrupt); err != nil {
 			m.logger.Warn("Failed to send interrupt signal: %v", err)
 		}
 	} else {
+		// Unix系统下使用SIGTERM，但只发送给子进程
+		// 注意：这里需要确保信号只发送给SCUM进程，不影响scum_run主程序
 		if err := m.cmd.Process.Signal(syscall.SIGTERM); err != nil {
 			m.logger.Warn("Failed to send SIGTERM: %v", err)
 		}
