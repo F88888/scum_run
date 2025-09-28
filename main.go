@@ -28,8 +28,6 @@ func cleanup() {
 }
 
 func main() {
-	fmt.Println("<UNK> <UNK> <UNK>")
-	return
 	var (
 		configFile = flag.String("config", "config.json", "Configuration file path")
 		token      = flag.String("token", "", "Server authentication token")
