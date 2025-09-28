@@ -9,12 +9,11 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf16"
-	"unicode/utf8"
 
 	"github.com/fsnotify/fsnotify"
 
 	"scum_run/internal/logger"
+	"scum_run/internal/utils"
 )
 
 // LogUpdateCallback is called when new log lines are detected
@@ -38,6 +37,8 @@ type fileState struct {
 	filename    string
 	lastSize    int64
 	lastModTime time.Time
+	encoding    utils.EncodingType
+	lastUsed    time.Time
 }
 
 // New creates a new log monitor
@@ -126,11 +127,16 @@ func (m *Monitor) scanExistingFiles() error {
 			continue
 		}
 
+		// Detect encoding for this file (only if file has enough content)
+		encoding := m.detectFileEncoding(filepath, fileInfo.Size())
+
 		m.mutex.Lock()
 		m.fileStates[filename] = &fileState{
 			filename:    filename,
 			lastSize:    fileInfo.Size(),
 			lastModTime: fileInfo.ModTime(),
+			encoding:    encoding,
+			lastUsed:    time.Now(),
 		}
 		m.mutex.Unlock()
 
@@ -146,6 +152,10 @@ func (m *Monitor) monitorLoop() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
+	// Cleanup ticker for unused encoding cache (every 2 hours)
+	cleanupTicker := time.NewTicker(2 * time.Hour)
+	defer cleanupTicker.Stop()
+
 	for {
 		select {
 		case <-m.ctx.Done():
@@ -157,6 +167,9 @@ func (m *Monitor) monitorLoop() {
 		case <-ticker.C:
 			// Periodic check for file changes
 			m.checkFileChanges()
+		case <-cleanupTicker.C:
+			// Cleanup unused encoding cache
+			m.cleanupUnusedEncodings()
 		}
 	}
 }
@@ -187,11 +200,16 @@ func (m *Monitor) handleFileCreated(filename string) {
 		return
 	}
 
+	// Detect encoding for this new file (only if file has enough content)
+	encoding := m.detectFileEncoding(filepath, fileInfo.Size())
+
 	m.mutex.Lock()
 	m.fileStates[filename] = &fileState{
 		filename:    filename,
 		lastSize:    0, // Start from beginning for new files
 		lastModTime: fileInfo.ModTime(),
+		encoding:    encoding,
+		lastUsed:    time.Now(),
 	}
 	m.mutex.Unlock()
 
@@ -242,12 +260,18 @@ func (m *Monitor) checkFileForNewLines(filename string) {
 	state, exists := m.fileStates[filename]
 	if !exists {
 		// Initialize state for this file
+		encoding := m.detectFileEncoding(filepath, fileInfo.Size())
 		state = &fileState{
 			filename:    filename,
 			lastSize:    0,
 			lastModTime: fileInfo.ModTime(),
+			encoding:    encoding,
+			lastUsed:    time.Now(),
 		}
 		m.fileStates[filename] = state
+	} else {
+		// Update last used time
+		state.lastUsed = time.Now()
 	}
 	m.mutex.Unlock()
 
@@ -256,10 +280,10 @@ func (m *Monitor) checkFileForNewLines(filename string) {
 		return
 	}
 
-	// Read new lines
-	newLines, err := m.readNewLines(filepath, state.lastSize, fileInfo.Size())
+	// Read new lines using cached encoding
+	newLines, err := m.readNewLinesWithEncoding(filepath, state.lastSize, fileInfo.Size(), state.encoding)
 	if err != nil {
-		m.logger.Error("❌ Failed to read new lines from %s: %v", filename, err)
+		m.logger.Error("Failed to read new lines from %s: %v", filename, err)
 		return
 	}
 
@@ -300,10 +324,11 @@ func (m *Monitor) readNewLines(filepath string, startOffset, endOffset int64) ([
 	}
 	content = content[:n]
 
-	// Detect encoding and decode content
-	text, err := m.decodeContent(content)
+	// Detect encoding and decode content using the improved encoding utility
+	text, _, err := utils.ConvertToUTF8(string(content))
 	if err != nil {
-		return nil, fmt.Errorf("failed to decode content: %w", err)
+		// If conversion fails, try to use the content as-is
+		text = string(content)
 	}
 
 	// Split into lines
@@ -319,50 +344,103 @@ func (m *Monitor) readNewLines(filepath string, startOffset, endOffset int64) ([
 	return result, nil
 }
 
-// decodeContent detects encoding and decodes the content
-func (m *Monitor) decodeContent(content []byte) (string, error) {
-	if len(content) == 0 {
-		return "", nil
+// detectFileEncoding detects the encoding of a file by reading a sample
+// Only detects encoding if file has enough content (at least 10 lines worth)
+func (m *Monitor) detectFileEncoding(filepath string, fileSize int64) utils.EncodingType {
+	// If file is too small (less than 1KB), default to UTF-8
+	if fileSize < 1024 {
+		return utils.EncodingUTF8
 	}
 
-	// Check for UTF-16LE BOM (Byte Order Mark)
-	if len(content) >= 2 && content[0] == 0xFF && content[1] == 0xFE {
-		// UTF-16LE with BOM
-		return m.decodeUTF16LE(content[2:])
+	file, err := os.Open(filepath)
+	if err != nil {
+		return utils.EncodingUTF8 // Default to UTF-8 if can't read
+	}
+	defer file.Close()
+
+	// Read first 4KB to detect encoding (enough for multiple lines)
+	sample := make([]byte, 4096)
+	n, err := file.Read(sample)
+	if err != nil && err != io.EOF {
+		return utils.EncodingUTF8 // Default to UTF-8 if can't read
+	}
+	sample = sample[:n]
+
+	// Use the encoding utility to detect encoding
+	_, encoding, _ := utils.ConvertToUTF8(string(sample))
+	return encoding
+}
+
+// readNewLinesWithEncoding reads new lines from a file using the specified encoding
+func (m *Monitor) readNewLinesWithEncoding(filepath string, startOffset, endOffset int64, encoding utils.EncodingType) ([]string, error) {
+	file, err := os.Open(filepath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	// Seek to the start offset
+	if _, err := file.Seek(startOffset, io.SeekStart); err != nil {
+		return nil, err
 	}
 
-	// Check if content is valid UTF-8
-	if utf8.Valid(content) {
-		return string(content), nil
+	// Read the new content
+	contentSize := endOffset - startOffset
+	content := make([]byte, contentSize)
+	n, err := io.ReadFull(file, content)
+	if err != nil && err != io.ErrUnexpectedEOF {
+		return nil, err
+	}
+	content = content[:n]
+
+	// Convert content to UTF-8 using the cached encoding
+	text, err := m.convertToUTF8WithEncoding(string(content), encoding)
+	if err != nil {
+		// If conversion fails, try to use the content as-is
+		text = string(content)
 	}
 
-	// Try to decode as UTF-16LE without BOM
-	// Check if content length is even (UTF-16LE requires even number of bytes)
-	if len(content)%2 == 0 {
-		// Try UTF-16LE decoding
-		if text, err := m.decodeUTF16LE(content); err == nil {
-			return text, nil
+	// Split into lines
+	lines := strings.Split(text, "\n")
+	var result []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			result = append(result, line)
 		}
 	}
 
-	// Fallback to UTF-8 with replacement characters
-	return string(content), nil
+	return result, nil
 }
 
-// decodeUTF16LE decodes UTF-16LE encoded content
-func (m *Monitor) decodeUTF16LE(content []byte) (string, error) {
-	if len(content)%2 != 0 {
-		return "", fmt.Errorf("UTF-16LE content must have even number of bytes")
+// convertToUTF8WithEncoding converts content to UTF-8 using the specified encoding
+func (m *Monitor) convertToUTF8WithEncoding(content string, encoding utils.EncodingType) (string, error) {
+	switch encoding {
+	case utils.EncodingUTF8:
+		return content, nil
+	case utils.EncodingUTF16LE, utils.EncodingUTF16BE:
+		// Use the encoding utility for UTF-16 conversion
+		text, _, err := utils.ConvertToUTF8(content)
+		return text, err
+	default:
+		// For unknown encodings, try the general conversion
+		text, _, err := utils.ConvertToUTF8(content)
+		return text, err
 	}
+}
 
-	// Convert bytes to UTF-16 code units
-	codeUnits := make([]uint16, len(content)/2)
-	for i := 0; i < len(content); i += 2 {
-		codeUnits[i/2] = uint16(content[i]) | (uint16(content[i+1]) << 8)
+// cleanupUnusedEncodings removes encoding cache for files not used in the last 2 hours
+func (m *Monitor) cleanupUnusedEncodings() {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	cutoff := time.Now().Add(-2 * time.Hour)
+	for _, state := range m.fileStates {
+		if state.lastUsed.Before(cutoff) {
+			// Reset encoding to force re-detection next time
+			state.encoding = utils.EncodingUnknown
+		}
 	}
-
-	// Convert UTF-16 to UTF-8
-	return string(utf16.Decode(codeUnits)), nil
 }
 
 // isLogFile determines if a file is a log file we should monitor
