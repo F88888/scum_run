@@ -73,7 +73,7 @@ echo Restarting SCUM Run client...
 start "" "%s" %s
 
 :: 删除更新器脚本自己
-del "%~f0"
+del "%%~f0"
 `, config.UpdateURL, config.UpdateURL, config.CurrentExePath, config.CurrentExePath, config.CurrentExePath, config.CurrentExePath, config.CurrentExePath, config.CurrentExePath, config.CurrentExePath, config.CurrentExePath, formatArgs(config.Args))
 	} else {
 		scriptName = "scum_run_updater.sh"
