@@ -89,6 +89,7 @@ const (
 	MsgTypeServerCommand    = "server_command"    // 服务器命令
 	MsgTypeCommandResult    = "command_result"    // 命令结果
 	MsgTypeLogData          = "log_data"          // 日志数据
+	MsgTypeProcessOutput    = "process_output"    // 进程输出
 	MsgTypeClientUpdate     = "client_update"     // 客户端更新
 
 	// File management
@@ -1518,10 +1519,38 @@ func (c *Client) sendLogData(content string) {
 	c.addLogToBuffer(content)
 }
 
+// sendProcessOutput sends process output to server
+func (c *Client) sendProcessOutput(content string) {
+	// 编码检测和转换
+	if _const.EncodingDetectionEnabled {
+		convertedContent, encoding, err := utils.ConvertToUTF8(content)
+		if err != nil {
+			c.logger.Warn("🔤 Failed to convert process output encoding: %v, using original", err)
+		} else if encoding != utils.EncodingUTF8 {
+			c.logger.Debug("🔤 Converted process output from %s to UTF-8", encoding.String())
+			content = convertedContent
+		}
+	}
+
+	// 检查消息大小限制
+	if len(content) > _const.MaxLogLineLength {
+		content = content[:_const.MaxLogLineLength] + _const.TruncateSuffix + " [truncated]"
+	}
+
+	// 发送进程输出
+	processData := map[string]interface{}{
+		"content": content,
+		"source":  "process_output",
+	}
+
+	c.logger.Debug("📤 Sending process output: %s", utils.TruncateString(content, _const.MaxStringPreviewLength))
+	c.sendResponse(MsgTypeProcessOutput, processData, "")
+}
+
 // handleProcessOutput handles real-time output from SCUM server process
 func (c *Client) handleProcessOutput(_ string, line string) {
-	// 直接发送原始日志内容，不添加前缀
-	c.sendLogData(line)
+	// 发送进程输出，使用专门的消息类型
+	c.sendProcessOutput(line)
 }
 
 // handleClientUpdate handles client update requests
