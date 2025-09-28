@@ -8,6 +8,6 @@ import "syscall"
 func getSysProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{
 		HideWindow:    true,
-		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP | syscall.CREATE_NEW_CONSOLE,
+		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
 	}
 }
