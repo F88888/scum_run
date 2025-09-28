@@ -33,6 +33,7 @@ import (
 	"scum_run/internal/steam"
 	"scum_run/internal/steamtools"
 	"scum_run/internal/updater"
+	"scum_run/internal/utils"
 	"scum_run/internal/websocket_client"
 	"scum_run/model"
 	"scum_run/model/request"
@@ -630,9 +631,28 @@ func (c *Client) handleDBQuery(data interface{}) {
 func (c *Client) onLogUpdate(filename string, lines []string) {
 	c.logger.Info("📁 Log file updated: %s, new lines: %d", filename, len(lines))
 
+	// 对日志行进行编码转换
+	var convertedLines []string
+	if _const.EncodingDetectionEnabled {
+		for _, line := range lines {
+			convertedLine, encoding, err := utils.ConvertToUTF8(line)
+			if err != nil {
+				c.logger.Warn("🔤 Failed to convert log line encoding: %v, using original", err)
+				convertedLines = append(convertedLines, line)
+			} else if encoding != utils.EncodingUTF8 {
+				c.logger.Debug("🔤 Converted log line from %s to UTF-8", encoding.String())
+				convertedLines = append(convertedLines, convertedLine)
+			} else {
+				convertedLines = append(convertedLines, line)
+			}
+		}
+	} else {
+		convertedLines = lines
+	}
+
 	logData := map[string]interface{}{
 		"filename":  filename,
-		"lines":     lines,
+		"lines":     convertedLines,
 		"timestamp": time.Now().Unix(),
 	}
 
@@ -640,7 +660,7 @@ func (c *Client) onLogUpdate(filename string, lines []string) {
 
 	// 将日志行添加到批量缓冲区，而不是立即发送
 	addedCount := 0
-	for _, line := range lines {
+	for _, line := range convertedLines {
 		if strings.TrimSpace(line) != "" {
 			c.addLogToBuffer(line)
 			addedCount++
@@ -2032,10 +2052,21 @@ func (c *Client) addLogToBuffer(content string) {
 	c.logBufferMux.Lock()
 	defer c.logBufferMux.Unlock()
 
+	// 编码检测和转换
+	if _const.EncodingDetectionEnabled {
+		convertedContent, encoding, err := utils.ConvertToUTF8(content)
+		if err != nil {
+			c.logger.Warn("🔤 Failed to convert encoding: %v, using original content", err)
+		} else if encoding != utils.EncodingUTF8 {
+			c.logger.Debug("🔤 Converted log from %s to UTF-8: %s", encoding.String(), utils.TruncateString(convertedContent, _const.MaxStringPreviewLength))
+			content = convertedContent
+		}
+	}
+
 	// 检查消息大小限制（单条日志最大1KB）
 	originalLength := len(content)
-	if len(content) > 1024 {
-		content = content[:1024] + "... [truncated]"
+	if len(content) > _const.MaxLogLineLength {
+		content = content[:_const.MaxLogLineLength] + _const.TruncateSuffix + " [truncated]"
 		c.logger.Debug("📏 Log content truncated from %d to %d bytes", originalLength, len(content))
 	}
 
@@ -2050,7 +2081,7 @@ func (c *Client) addLogToBuffer(content string) {
 
 	// 添加到缓冲区
 	c.logBuffer = append(c.logBuffer, content)
-	c.logger.Debug("📥 Added log to buffer: size=%d, content_preview=%s", len(c.logBuffer), truncateString(content, 50))
+	c.logger.Debug("📥 Added log to buffer: size=%d, content_preview=%s", len(c.logBuffer), utils.TruncateString(content, _const.MaxStringPreviewLength))
 
 	// 如果缓冲区满了，立即发送
 	if len(c.logBuffer) >= _const.LogBatchSize { // 批量大小限制

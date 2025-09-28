@@ -16,4 +16,5 @@ const (
 	LogRateWindow       = 500 // 日志频率控制窗口 (毫秒, 与服务端一致)
 	LogBatchInterval    = 500 // 日志批量发送间隔 (毫秒, 与服务端一致)
 	LogBatchSize        = 100 // 日志批量大小 (与服务端一致)
+
 )
