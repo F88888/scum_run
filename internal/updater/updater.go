@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 // UpdaterConfig 更新器配置
@@ -125,8 +126,9 @@ rm -f "$0"
 `, config.UpdateURL, config.UpdateURL, config.CurrentExePath, config.CurrentExePath, config.CurrentExePath, config.CurrentExePath, config.CurrentExePath, config.CurrentExePath, config.CurrentExePath, config.CurrentExePath, config.CurrentExePath, formatArgs(config.Args))
 	}
 
-	// 写入脚本文件
-	if err := os.WriteFile(scriptName, []byte(scriptContent), 0755); err != nil {
+	// 写入脚本文件 - 确保使用 Windows 风格的换行符
+	windowsContent := strings.ReplaceAll(scriptContent, "\n", "\r\n")
+	if err := os.WriteFile(scriptName, []byte(windowsContent), 0644); err != nil {
 		return fmt.Errorf("failed to create updater script: %w", err)
 	}
 
