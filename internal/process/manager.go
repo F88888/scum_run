@@ -262,14 +262,23 @@ func (m *Manager) ForceStop() error {
 		m.stdin = nil
 	}
 
-	// Force kill the main process
-	if err := m.cmd.Process.Kill(); err != nil {
-		m.logger.Warn("Failed to kill main process: %v", err)
-	}
-
-	// On Windows, also try to kill child processes
+	// On Windows, use enhanced process tree killing
 	if runtime.GOOS == "windows" {
-		m.killChildProcesses(pid)
+		m.logger.Info("Using Windows-specific process tree cleanup for PID: %d", pid)
+		m.killProcessTree(pid)
+	} else {
+		// On Unix-like systems, try graceful shutdown first
+		if err := m.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			m.logger.Warn("Failed to send SIGTERM: %v", err)
+		}
+
+		// Wait a bit for graceful shutdown
+		time.Sleep(2 * time.Second)
+
+		// Force kill if still running
+		if err := m.cmd.Process.Kill(); err != nil {
+			m.logger.Warn("Failed to kill main process: %v", err)
+		}
 	}
 
 	// Wait for process to exit
@@ -281,8 +290,12 @@ func (m *Manager) ForceStop() error {
 	select {
 	case <-done:
 		m.logger.Info("SCUM server force stopped")
-	case <-time.After(5 * time.Second):
+	case <-time.After(10 * time.Second):
 		m.logger.Warn("Force stop timeout, process may still be running")
+		// Final attempt - kill any remaining SCUM processes
+		if runtime.GOOS == "windows" {
+			m.killScumProcesses()
+		}
 	}
 
 	m.cmd = nil
@@ -316,11 +329,70 @@ func (m *Manager) killChildProcesses(parentPID int) {
 	}
 }
 
+// killProcessTree provides enhanced process tree cleanup for Windows
+func (m *Manager) killProcessTree(pid int) {
+	if runtime.GOOS != "windows" {
+		return
+	}
+
+	m.logger.Info("Attempting to kill process tree for PID: %d", pid)
+
+	// First try taskkill with /T flag to kill the entire process tree
+	cmd := exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprintf("%d", pid))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		m.logger.Warn("taskkill /T failed: %v, output: %s", err, string(output))
+
+		// Fallback: try to kill individual SCUM processes
+		m.killScumProcesses()
+	} else {
+		m.logger.Info("Successfully killed process tree: %s", string(output))
+	}
+}
+
+// killScumProcesses kills all SCUM-related processes as a fallback
+func (m *Manager) killScumProcesses() {
+	if runtime.GOOS != "windows" {
+		return
+	}
+
+	m.logger.Info("Attempting to kill all SCUM-related processes...")
+
+	// List of SCUM process names to kill
+	scumProcesses := []string{
+		"SCUMServer.exe",
+		"SCUM.exe",
+		"BattlEye.exe",
+		"BEService.exe",
+	}
+
+	for _, processName := range scumProcesses {
+		cmd := exec.Command("taskkill", "/F", "/IM", processName)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			m.logger.Debug("Failed to kill %s: %v, output: %s", processName, err, string(output))
+		} else {
+			m.logger.Info("Successfully killed %s: %s", processName, string(output))
+		}
+	}
+}
+
 // CleanupOnExit ensures all processes are cleaned up when the program exits
 func (m *Manager) CleanupOnExit() {
 	if m.cmd != nil && m.cmd.Process != nil {
-		m.logger.Info("Cleaning up SCUM server process on exit (PID: %d)", m.cmd.Process.Pid)
-		m.ForceStop()
+		pid := m.cmd.Process.Pid
+		m.logger.Info("Cleaning up SCUM server process on exit (PID: %d)", pid)
+
+		// Force stop with enhanced cleanup
+		if err := m.ForceStop(); err != nil {
+			m.logger.Error("Failed to force stop SCUM server: %v", err)
+		}
+
+		// Additional cleanup for Windows - ensure process tree is killed
+		if runtime.GOOS == "windows" {
+			m.logger.Info("Performing additional Windows process cleanup for PID: %d", pid)
+			m.killProcessTree(pid)
+		}
 	}
 }
 

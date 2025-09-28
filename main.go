@@ -6,6 +6,7 @@ import (
 	"os/signal"
 	"runtime"
 	"syscall"
+	"time"
 
 	"scum_run/config"
 	"scum_run/internal/client"
@@ -18,7 +19,10 @@ var scumClient *client.Client
 // cleanup ensures all processes are properly cleaned up on exit
 func cleanup() {
 	if scumClient != nil {
+		logger := logger.New()
+		logger.Info("Starting cleanup process...")
 		scumClient.ForceStop()
+		logger.Info("Cleanup process completed")
 	}
 }
 
@@ -82,9 +86,18 @@ func main() {
 		cleanup()
 	})
 
+	// Register additional cleanup for panic recovery
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Program panicked: %v", r)
+			cleanup()
+			os.Exit(1)
+		}
+	}()
+
 	// Setup graceful shutdown
 	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT, syscall.SIGKILL)
 
 	go func() {
 		sig := <-c
@@ -93,6 +106,9 @@ func main() {
 		// Always use ForceStop to ensure all processes are cleaned up
 		logger.Info("Force stopping all processes...")
 		cleanup()
+
+		// Give some time for cleanup to complete
+		time.Sleep(5 * time.Second)
 		os.Exit(0)
 	}()
 
