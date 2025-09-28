@@ -489,10 +489,17 @@ func (c *Client) handleServerStart() {
 	// Initialize log monitor if not already done
 	if c.logMonitor == nil && steamDetector.IsSCUMLogsDirectoryAvailable(c.steamDir) {
 		logsPath := steamDetector.GetSCUMLogsPath(c.steamDir)
+		c.logger.Info("🔍 Initializing log monitor for path: %s", logsPath)
 		c.logMonitor = logmonitor.New(logsPath, c.logger, c.onLogUpdate)
 		if err := c.logMonitor.Start(); err != nil {
-			c.logger.Warn("Failed to start log monitor: %v", err)
+			c.logger.Error("❌ Failed to start log monitor: %v", err)
+		} else {
+			c.logger.Info("✅ Log monitor started successfully")
 		}
+	} else if c.logMonitor == nil {
+		c.logger.Warn("⚠️ Log monitor not initialized: SCUM logs directory not available at %s", c.steamDir)
+	} else {
+		c.logger.Info("ℹ️ Log monitor already initialized")
 	}
 
 	// 先发送启动开始的响应，避免长时间无响应导致连接超时
@@ -621,6 +628,8 @@ func (c *Client) handleDBQuery(data interface{}) {
 
 // onLogUpdate handles log file updates
 func (c *Client) onLogUpdate(filename string, lines []string) {
+	c.logger.Info("📁 Log file updated: %s, new lines: %d", filename, len(lines))
+
 	logData := map[string]interface{}{
 		"filename":  filename,
 		"lines":     lines,
@@ -630,11 +639,15 @@ func (c *Client) onLogUpdate(filename string, lines []string) {
 	c.sendResponse(MsgTypeLogUpdate, logData, "")
 
 	// 将日志行添加到批量缓冲区，而不是立即发送
+	addedCount := 0
 	for _, line := range lines {
 		if strings.TrimSpace(line) != "" {
 			c.addLogToBuffer(line)
+			addedCount++
 		}
 	}
+
+	c.logger.Debug("📝 Added %d non-empty lines to log buffer from %s", addedCount, filename)
 }
 
 // sendResponse sends a response message to the server
@@ -649,8 +662,15 @@ func (c *Client) sendResponse(msgType string, data interface{}, errorMsg string)
 		response.Error = errorMsg
 	}
 
+	// 添加消息发送追踪
+	if msgType == MsgTypeLogData {
+		c.logger.Debug("📤 Sending %s message to server", msgType)
+	}
+
 	if err := c.wsClient.SendMessage(response); err != nil {
-		c.logger.Error("Failed to send response: %v", err)
+		c.logger.Error("❌ Failed to send %s response: %v", msgType, err)
+	} else if msgType == MsgTypeLogData {
+		c.logger.Debug("✅ Successfully sent %s message to server", msgType)
 	}
 }
 
@@ -1999,28 +2019,42 @@ func getFileOwner(_ os.FileInfo) string {
 	return "system"
 }
 
+// truncateString truncates a string to the specified length
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
 // addLogToBuffer adds a log line to the buffer for batch processing
 func (c *Client) addLogToBuffer(content string) {
 	c.logBufferMux.Lock()
 	defer c.logBufferMux.Unlock()
 
 	// 检查消息大小限制（单条日志最大1KB）
+	originalLength := len(content)
 	if len(content) > 1024 {
 		content = content[:1024] + "... [truncated]"
+		c.logger.Debug("📏 Log content truncated from %d to %d bytes", originalLength, len(content))
 	}
 
 	// 检查频率限制 - 放宽限制避免日志丢失
 	now := time.Now()
-	if now.Sub(c.lastLogSend) < c.logRateWindow && len(c.logBuffer) < _const.LogBatchSize/2 {
+	timeSinceLastSend := now.Sub(c.lastLogSend)
+	if timeSinceLastSend < c.logRateWindow && len(c.logBuffer) < _const.LogBatchSize/2 {
 		// 只有在缓冲区未满一半时才跳过日志
+		c.logger.Debug("⏱️ Log skipped due to rate limit: %v since last send, buffer size: %d", timeSinceLastSend, len(c.logBuffer))
 		return
 	}
 
 	// 添加到缓冲区
 	c.logBuffer = append(c.logBuffer, content)
+	c.logger.Debug("📥 Added log to buffer: size=%d, content_preview=%s", len(c.logBuffer), truncateString(content, 50))
 
 	// 如果缓冲区满了，立即发送
 	if len(c.logBuffer) >= _const.LogBatchSize { // 批量大小限制
+		c.logger.Info("🚀 Log buffer full (%d), flushing immediately", len(c.logBuffer))
 		c.flushLogBufferUnsafe()
 	}
 }
@@ -2047,12 +2081,15 @@ func (c *Client) flushLogBuffer() {
 // flushLogBufferUnsafe sends all buffered logs without locking (caller must hold lock)
 func (c *Client) flushLogBufferUnsafe() {
 	if len(c.logBuffer) == 0 {
+		c.logger.Debug("📭 Log buffer is empty, nothing to flush")
 		return
 	}
 
 	// 检查发送频率限制
 	now := time.Now()
-	if now.Sub(c.lastLogSend) < c.logRateWindow {
+	timeSinceLastSend := now.Sub(c.lastLogSend)
+	if timeSinceLastSend < c.logRateWindow {
+		c.logger.Debug("⏱️ Flush skipped due to rate limit: %v since last send", timeSinceLastSend)
 		return
 	}
 
@@ -2060,6 +2097,7 @@ func (c *Client) flushLogBufferUnsafe() {
 	batchSize := len(c.logBuffer)
 	if batchSize > c.maxLogRate {
 		batchSize = c.maxLogRate
+		c.logger.Debug("📊 Batch size limited from %d to %d", len(c.logBuffer), batchSize)
 	}
 
 	// 发送批量日志数据
@@ -2068,6 +2106,8 @@ func (c *Client) flushLogBufferUnsafe() {
 
 	// 从缓冲区移除已发送的日志
 	c.logBuffer = c.logBuffer[batchSize:]
+
+	c.logger.Info("📤 Flushing log batch: %d logs, remaining in buffer: %d", batchSize, len(c.logBuffer))
 
 	// 发送批量日志
 	c.sendBatchLogData(batch)
@@ -2079,6 +2119,7 @@ func (c *Client) flushLogBufferUnsafe() {
 // sendBatchLogData sends a batch of log data to web terminals
 func (c *Client) sendBatchLogData(logs []string) {
 	if len(logs) == 0 {
+		c.logger.Debug("📭 No logs to send in batch")
 		return
 	}
 
@@ -2091,6 +2132,7 @@ func (c *Client) sendBatchLogData(logs []string) {
 	}
 
 	if len(logContents) == 0 {
+		c.logger.Debug("📭 No non-empty logs to send in batch")
 		return
 	}
 
@@ -2099,6 +2141,7 @@ func (c *Client) sendBatchLogData(logs []string) {
 		"batch":   true, // 标识这是批量数据
 	}
 
+	c.logger.Info("📡 Sending batch log data to server: %d logs", len(logContents))
 	c.sendResponse(MsgTypeLogData, logData, "")
 }
 
