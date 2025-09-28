@@ -68,6 +68,8 @@ func (m *Monitor) Start() error {
 		return nil
 	}
 
+	m.logger.Info("📁 Logs directory exists: %s", m.logsPath)
+
 	// Add the logs directory to the watcher
 	if err := m.watcher.Add(m.logsPath); err != nil {
 		return fmt.Errorf("failed to add logs directory to watcher: %w", err)
@@ -104,10 +106,15 @@ func (m *Monitor) Stop() {
 
 // scanExistingFiles scans for existing log files and initializes their states
 func (m *Monitor) scanExistingFiles() error {
+	m.logger.Info("🔍 Scanning existing log files in: %s", m.logsPath)
+
 	entries, err := os.ReadDir(m.logsPath)
 	if err != nil {
 		return err
 	}
+
+	scannedCount := 0
+	acceptedCount := 0
 
 	for _, entry := range entries {
 		if entry.IsDir() {
@@ -115,6 +122,8 @@ func (m *Monitor) scanExistingFiles() error {
 		}
 
 		filename := entry.Name()
+		scannedCount++
+
 		if !m.isLogFile(filename) {
 			continue
 		}
@@ -122,7 +131,7 @@ func (m *Monitor) scanExistingFiles() error {
 		filepath := filepath.Join(m.logsPath, filename)
 		fileInfo, err := os.Stat(filepath)
 		if err != nil {
-			m.logger.Warn("Failed to stat file %s: %v", filepath, err)
+			m.logger.Warn("⚠️ Failed to stat file %s: %v", filepath, err)
 			continue
 		}
 
@@ -134,9 +143,11 @@ func (m *Monitor) scanExistingFiles() error {
 		}
 		m.mutex.Unlock()
 
-		m.logger.Debug("Initialized state for log file: %s", filename)
+		acceptedCount++
+		m.logger.Info("✅ Initialized monitoring for log file: %s (size: %d bytes)", filename, fileInfo.Size())
 	}
 
+	m.logger.Info("📊 File scan complete: %d files scanned, %d log files accepted for monitoring", scannedCount, acceptedCount)
 	return nil
 }
 
@@ -384,7 +395,7 @@ func (m *Monitor) decodeUTF16LE(content []byte) (string, error) {
 }
 
 // isLogFile determines if a file is a log file we should monitor
-// Only monitor specific SCUM log files: chat, login, kill, economy, gameplay, vehicle_destruction
+// Only monitor specific SCUM log files: admin_, chat_, economy_, event_kill_, famepoints_, gameplay_, kill_, login_, violations_, vehicle_destruction_
 func (m *Monitor) isLogFile(filename string) bool {
 	// Convert filename to lowercase for case-insensitive matching
 	lowerFilename := strings.ToLower(filename)
@@ -392,16 +403,22 @@ func (m *Monitor) isLogFile(filename string) bool {
 	// Check if file has .log extension
 	ext := strings.ToLower(filepath.Ext(filename))
 	if ext != ".log" {
+		m.logger.Debug("📄 File %s rejected: not a .log file", filename)
 		return false
 	}
 
 	// Check if filename starts with one of the specific SCUM log prefixes
-	scumLogPrefixes := []string{"chat", "login", "kill", "economy", "gameplay", "vehicle_destruction"}
+	scumLogPrefixes := []string{
+		"admin_", "chat_", "economy_", "event_kill_", "famepoints_",
+		"gameplay_", "kill_", "login_", "violations_", "vehicle_destruction_",
+	}
 	for _, prefix := range scumLogPrefixes {
 		if strings.HasPrefix(lowerFilename, prefix) {
+			m.logger.Debug("✅ File %s accepted: matches prefix %s", filename, prefix)
 			return true
 		}
 	}
 
+	m.logger.Debug("📄 File %s rejected: no matching prefix", filename)
 	return false
 }

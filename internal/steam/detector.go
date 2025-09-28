@@ -106,7 +106,7 @@ func (d *Detector) GetSCUMDatabasePath(steamDir string) string {
 
 // GetSCUMLogsPath returns the path to the SCUM logs directory
 func (d *Detector) GetSCUMLogsPath(steamDir string) string {
-	return filepath.Join(steamDir, "SCUM", "Saved", "Logs")
+	return filepath.Join(steamDir, "SCUM", "Saved", "SaveFiles", "Logs")
 }
 
 // IsSCUMServerInstalled checks if SCUM Dedicated Server is installed
