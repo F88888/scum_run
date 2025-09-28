@@ -60,11 +60,19 @@ type Client struct {
 	installing bool       // 安装状态标志
 	installMux sync.Mutex // 安装锁
 
-	// 日志批量处理
-	logBuffer     []string
-	logBufferMux  sync.Mutex
-	logTicker     *time.Ticker
-	lastLogSend   time.Time
+	// 日志文件数据批量处理（用于processLogLine）
+	logFileDataBuffer    []string
+	logFileDataBufferMux sync.Mutex
+	logFileDataTicker    *time.Ticker
+	lastLogFileDataSend  time.Time
+
+	// 进程输出批量处理（用于终端显示）
+	processOutputBuffer    []string
+	processOutputBufferMux sync.Mutex
+	processOutputTicker    *time.Ticker
+	lastProcessOutputSend  time.Time
+
+	// 通用配置
 	maxLogRate    int           // 每秒最大日志发送数量
 	logRateWindow time.Duration // 日志频率控制窗口
 }
@@ -77,7 +85,8 @@ const (
 	MsgTypeServerRestart    = "server_restart"
 	MsgTypeServerStatus     = "server_status"
 	MsgTypeDBQuery          = "db_query"
-	MsgTypeLogUpdate        = "log_update"
+	MsgTypeLogFileData      = "log_file_data"  // SCUM日志文件数据（用于processLogLine处理）
+	MsgTypeProcessOutput    = "process_output" // 服务器进程输出（用于终端显示）
 	MsgTypeHeartbeat        = "heartbeat"
 	MsgTypeSteamToolsStatus = "steamtools_status"
 	MsgTypeConfigSync       = "config_sync"       // 配置同步
@@ -88,8 +97,6 @@ const (
 	MsgTypeScheduledRestart = "scheduled_restart" // 定时重启
 	MsgTypeServerCommand    = "server_command"    // 服务器命令
 	MsgTypeCommandResult    = "command_result"    // 命令结果
-	MsgTypeLogData          = "log_data"          // 日志数据
-	MsgTypeProcessOutput    = "process_output"    // 进程输出
 	MsgTypeClientUpdate     = "client_update"     // 客户端更新
 
 	// File management
@@ -126,18 +133,19 @@ func New(cfg *config.Config, steamDir string, logger *logger.Logger) *Client {
 	steamDetector := steam.NewDetector(logger)
 
 	client := &Client{
-		config:        cfg,
-		steamDir:      steamDir,
-		logger:        logger,
-		ctx:           ctx,
-		cancel:        cancel,
-		db:            database.New(steamDetector.GetSCUMDatabasePath(steamDir), logger),
-		process:       process.New(steamDetector.GetSCUMServerPath(steamDir), logger),
-		steamTools:    steamtools.New(&cfg.SteamTools, logger),
-		sysMonitor:    monitor.New(logger, 10*time.Second),                    // 每10秒监控一次
-		logBuffer:     make([]string, 0, 100),                                 // 预分配100条日志的缓冲区
-		maxLogRate:    _const.LogMaxRatePerSecond,                             // 每秒最多发送日志数量
-		logRateWindow: time.Duration(_const.LogRateWindow) * time.Millisecond, // 频率控制窗口
+		config:              cfg,
+		steamDir:            steamDir,
+		logger:              logger,
+		ctx:                 ctx,
+		cancel:              cancel,
+		db:                  database.New(steamDetector.GetSCUMDatabasePath(steamDir), logger),
+		process:             process.New(steamDetector.GetSCUMServerPath(steamDir), logger),
+		steamTools:          steamtools.New(&cfg.SteamTools, logger),
+		sysMonitor:          monitor.New(logger, 10*time.Second),                    // 每10秒监控一次
+		logFileDataBuffer:   make([]string, 0, 100),                                 // 预分配100条日志文件数据的缓冲区
+		processOutputBuffer: make([]string, 0, 100),                                 // 预分配100条进程输出的缓冲区
+		maxLogRate:          _const.LogMaxRatePerSecond,                             // 每秒最多发送日志数量
+		logRateWindow:       time.Duration(_const.LogRateWindow) * time.Millisecond, // 频率控制窗口
 	}
 
 	// 设置进程输出回调函数
@@ -146,9 +154,13 @@ func New(cfg *config.Config, steamDir string, logger *logger.Logger) *Client {
 	// 设置系统监控回调函数
 	client.sysMonitor.SetCallback(client.handleSystemMonitorData)
 
-	// 启动日志批量处理定时器
-	client.logTicker = time.NewTicker(time.Duration(_const.LogBatchInterval) * time.Millisecond) // 批量发送间隔
-	go client.logBatchProcessor()
+	// 启动日志文件数据批量处理定时器
+	client.logFileDataTicker = time.NewTicker(time.Duration(_const.LogBatchInterval) * time.Millisecond) // 批量发送间隔
+	go client.logFileDataBatchProcessor()
+
+	// 启动进程输出批量处理定时器
+	client.processOutputTicker = time.NewTicker(time.Duration(_const.LogBatchInterval) * time.Millisecond) // 批量发送间隔
+	go client.processOutputBatchProcessor()
 
 	return client
 }
@@ -628,9 +640,9 @@ func (c *Client) handleDBQuery(data interface{}) {
 	c.sendResponse(MsgTypeDBQuery, result, "")
 }
 
-// onLogUpdate handles log file updates
+// onLogUpdate 处理SCUM日志文件更新，只发送日志文件数据给processLogLine处理
 func (c *Client) onLogUpdate(filename string, lines []string) {
-	c.logger.Info("📁 Log file updated: %s, new lines: %d", filename, len(lines))
+	c.logger.Info("📁 SCUM日志文件更新: %s, 新增行数: %d", filename, len(lines))
 
 	// 对日志行进行编码转换
 	var convertedLines []string
@@ -638,10 +650,10 @@ func (c *Client) onLogUpdate(filename string, lines []string) {
 		for _, line := range lines {
 			convertedLine, encoding, err := utils.ConvertToUTF8(line)
 			if err != nil {
-				c.logger.Warn("🔤 Failed to convert log line encoding: %v, using original", err)
+				c.logger.Warn("🔤 日志行编码转换失败: %v, 使用原始内容", err)
 				convertedLines = append(convertedLines, line)
 			} else if encoding != utils.EncodingUTF8 {
-				c.logger.Debug("🔤 Converted log line from %s to UTF-8", encoding.String())
+				c.logger.Debug("🔤 日志行从 %s 转换为 UTF-8", encoding.String())
 				convertedLines = append(convertedLines, convertedLine)
 			} else {
 				convertedLines = append(convertedLines, line)
@@ -651,24 +663,17 @@ func (c *Client) onLogUpdate(filename string, lines []string) {
 		convertedLines = lines
 	}
 
-	logData := map[string]interface{}{
-		"filename":  filename,
-		"lines":     convertedLines,
-		"timestamp": time.Now().Unix(),
-	}
-
-	c.sendResponse(MsgTypeLogUpdate, logData, "")
-
-	// 将日志行添加到批量缓冲区，而不是立即发送
+	// 只发送SCUM日志文件数据，用于processLogLine处理
+	// 不再发送重复的log_update通知
 	addedCount := 0
 	for _, line := range convertedLines {
 		if strings.TrimSpace(line) != "" {
-			c.addLogToBuffer(line)
+			c.addLogFileDataToBuffer(line)
 			addedCount++
 		}
 	}
 
-	c.logger.Debug("📝 Added %d non-empty lines to log buffer from %s", addedCount, filename)
+	c.logger.Debug("📝 从 %s 添加了 %d 行非空日志到文件数据缓冲区", filename, addedCount)
 }
 
 // sendResponse sends a response message to the server
@@ -1519,38 +1524,10 @@ func (c *Client) sendLogData(content string) {
 	c.addLogToBuffer(content)
 }
 
-// sendProcessOutput sends process output to server
-func (c *Client) sendProcessOutput(content string) {
-	// 编码检测和转换
-	if _const.EncodingDetectionEnabled {
-		convertedContent, encoding, err := utils.ConvertToUTF8(content)
-		if err != nil {
-			c.logger.Warn("🔤 Failed to convert process output encoding: %v, using original", err)
-		} else if encoding != utils.EncodingUTF8 {
-			c.logger.Debug("🔤 Converted process output from %s to UTF-8", encoding.String())
-			content = convertedContent
-		}
-	}
-
-	// 检查消息大小限制
-	if len(content) > _const.MaxLogLineLength {
-		content = content[:_const.MaxLogLineLength] + _const.TruncateSuffix + " [truncated]"
-	}
-
-	// 发送进程输出
-	processData := map[string]interface{}{
-		"content": content,
-		"source":  "process_output",
-	}
-
-	c.logger.Debug("📤 Sending process output: %s", utils.TruncateString(content, _const.MaxStringPreviewLength))
-	c.sendResponse(MsgTypeProcessOutput, processData, "")
-}
-
-// handleProcessOutput handles real-time output from SCUM server process
+// handleProcessOutput 处理SCUM服务器进程的实时输出，发送给终端显示
 func (c *Client) handleProcessOutput(_ string, line string) {
-	// 发送进程输出，使用专门的消息类型
-	c.sendProcessOutput(line)
+	// 发送进程输出数据，用于终端显示
+	c.addProcessOutputToBuffer(line)
 }
 
 // handleClientUpdate handles client update requests
@@ -2076,18 +2053,18 @@ func truncateString(s string, maxLen int) string {
 	return s[:maxLen] + "..."
 }
 
-// addLogToBuffer adds a log line to the buffer for batch processing
-func (c *Client) addLogToBuffer(content string) {
-	c.logBufferMux.Lock()
-	defer c.logBufferMux.Unlock()
+// addLogFileDataToBuffer 添加SCUM日志文件数据到缓冲区，用于processLogLine处理
+func (c *Client) addLogFileDataToBuffer(content string) {
+	c.logFileDataBufferMux.Lock()
+	defer c.logFileDataBufferMux.Unlock()
 
 	// 编码检测和转换
 	if _const.EncodingDetectionEnabled {
 		convertedContent, encoding, err := utils.ConvertToUTF8(content)
 		if err != nil {
-			c.logger.Warn("🔤 Failed to convert encoding: %v, using original content", err)
+			c.logger.Warn("🔤 日志文件数据编码转换失败: %v, 使用原始内容", err)
 		} else if encoding != utils.EncodingUTF8 {
-			c.logger.Debug("🔤 Converted log from %s to UTF-8: %s", encoding.String(), utils.TruncateString(convertedContent, _const.MaxStringPreviewLength))
+			c.logger.Debug("🔤 日志文件数据从 %s 转换为 UTF-8: %s", encoding.String(), utils.TruncateString(convertedContent, _const.MaxStringPreviewLength))
 			content = convertedContent
 		}
 	}
@@ -2096,90 +2073,188 @@ func (c *Client) addLogToBuffer(content string) {
 	originalLength := len(content)
 	if len(content) > _const.MaxLogLineLength {
 		content = content[:_const.MaxLogLineLength] + _const.TruncateSuffix + " [truncated]"
-		c.logger.Debug("📏 Log content truncated from %d to %d bytes", originalLength, len(content))
+		c.logger.Debug("📏 日志文件数据内容截断: %d -> %d 字节", originalLength, len(content))
 	}
 
-	// 检查频率限制 - 放宽限制避免日志丢失
+	// 检查频率限制
 	now := time.Now()
-	timeSinceLastSend := now.Sub(c.lastLogSend)
-	if timeSinceLastSend < c.logRateWindow && len(c.logBuffer) < _const.LogBatchSize/2 {
-		// 只有在缓冲区未满一半时才跳过日志
-		c.logger.Debug("⏱️ Log skipped due to rate limit: %v since last send, buffer size: %d", timeSinceLastSend, len(c.logBuffer))
+	timeSinceLastSend := now.Sub(c.lastLogFileDataSend)
+	if timeSinceLastSend < c.logRateWindow && len(c.logFileDataBuffer) < _const.LogBatchSize/2 {
+		c.logger.Debug("⏱️ 日志文件数据因频率限制跳过: %v 自上次发送, 缓冲区大小: %d", timeSinceLastSend, len(c.logFileDataBuffer))
 		return
 	}
 
 	// 添加到缓冲区
-	c.logBuffer = append(c.logBuffer, content)
-	c.logger.Debug("📥 Added log to buffer: size=%d, content_preview=%s", len(c.logBuffer), utils.TruncateString(content, _const.MaxStringPreviewLength))
+	c.logFileDataBuffer = append(c.logFileDataBuffer, content)
+	c.logger.Debug("📥 添加日志文件数据到缓冲区: 大小=%d, 内容预览=%s", len(c.logFileDataBuffer), utils.TruncateString(content, _const.MaxStringPreviewLength))
 
 	// 如果缓冲区满了，立即发送
-	if len(c.logBuffer) >= _const.LogBatchSize { // 批量大小限制
-		c.logger.Info("🚀 Log buffer full (%d), flushing immediately", len(c.logBuffer))
-		c.flushLogBufferUnsafe()
+	if len(c.logFileDataBuffer) >= _const.LogBatchSize {
+		c.logger.Info("🚀 日志文件数据缓冲区已满 (%d), 立即刷新", len(c.logFileDataBuffer))
+		c.flushLogFileDataBufferUnsafe()
 	}
 }
 
-// logBatchProcessor processes log batches at regular intervals
-func (c *Client) logBatchProcessor() {
+// addProcessOutputToBuffer 添加进程输出到缓冲区，用于终端显示
+func (c *Client) addProcessOutputToBuffer(content string) {
+	c.processOutputBufferMux.Lock()
+	defer c.processOutputBufferMux.Unlock()
+
+	// 编码检测和转换
+	if _const.EncodingDetectionEnabled {
+		convertedContent, encoding, err := utils.ConvertToUTF8(content)
+		if err != nil {
+			c.logger.Warn("🔤 进程输出编码转换失败: %v, 使用原始内容", err)
+		} else if encoding != utils.EncodingUTF8 {
+			c.logger.Debug("🔤 进程输出从 %s 转换为 UTF-8: %s", encoding.String(), utils.TruncateString(convertedContent, _const.MaxStringPreviewLength))
+			content = convertedContent
+		}
+	}
+
+	// 检查消息大小限制
+	originalLength := len(content)
+	if len(content) > _const.MaxLogLineLength {
+		content = content[:_const.MaxLogLineLength] + _const.TruncateSuffix + " [truncated]"
+		c.logger.Debug("📏 进程输出内容截断: %d -> %d 字节", originalLength, len(content))
+	}
+
+	// 检查频率限制
+	now := time.Now()
+	timeSinceLastSend := now.Sub(c.lastProcessOutputSend)
+	if timeSinceLastSend < c.logRateWindow && len(c.processOutputBuffer) < _const.LogBatchSize/2 {
+		c.logger.Debug("⏱️ 进程输出因频率限制跳过: %v 自上次发送, 缓冲区大小: %d", timeSinceLastSend, len(c.processOutputBuffer))
+		return
+	}
+
+	// 添加到缓冲区
+	c.processOutputBuffer = append(c.processOutputBuffer, content)
+	c.logger.Debug("📥 添加进程输出到缓冲区: 大小=%d, 内容预览=%s", len(c.processOutputBuffer), utils.TruncateString(content, _const.MaxStringPreviewLength))
+
+	// 如果缓冲区满了，立即发送
+	if len(c.processOutputBuffer) >= _const.LogBatchSize {
+		c.logger.Info("🚀 进程输出缓冲区已满 (%d), 立即刷新", len(c.processOutputBuffer))
+		c.flushProcessOutputBufferUnsafe()
+	}
+}
+
+// logFileDataBatchProcessor 定期处理日志文件数据批次
+func (c *Client) logFileDataBatchProcessor() {
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
-		case <-c.logTicker.C:
-			c.flushLogBuffer()
+		case <-c.logFileDataTicker.C:
+			c.flushLogFileDataBuffer()
 		}
 	}
 }
 
-// flushLogBuffer sends all buffered logs to the server
-func (c *Client) flushLogBuffer() {
-	c.logBufferMux.Lock()
-	defer c.logBufferMux.Unlock()
-	c.flushLogBufferUnsafe()
+// processOutputBatchProcessor 定期处理进程输出批次
+func (c *Client) processOutputBatchProcessor() {
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-c.processOutputTicker.C:
+			c.flushProcessOutputBuffer()
+		}
+	}
 }
 
-// flushLogBufferUnsafe sends all buffered logs without locking (caller must hold lock)
-func (c *Client) flushLogBufferUnsafe() {
-	if len(c.logBuffer) == 0 {
-		c.logger.Debug("📭 Log buffer is empty, nothing to flush")
+// flushLogFileDataBuffer 发送所有缓冲的日志文件数据到服务器
+func (c *Client) flushLogFileDataBuffer() {
+	c.logFileDataBufferMux.Lock()
+	defer c.logFileDataBufferMux.Unlock()
+	c.flushLogFileDataBufferUnsafe()
+}
+
+// flushLogFileDataBufferUnsafe 发送所有缓冲的日志文件数据（调用者必须持有锁）
+func (c *Client) flushLogFileDataBufferUnsafe() {
+	if len(c.logFileDataBuffer) == 0 {
+		c.logger.Debug("📭 日志文件数据缓冲区为空，无需刷新")
 		return
 	}
 
 	// 检查发送频率限制
 	now := time.Now()
-	timeSinceLastSend := now.Sub(c.lastLogSend)
+	timeSinceLastSend := now.Sub(c.lastLogFileDataSend)
 	if timeSinceLastSend < c.logRateWindow {
-		c.logger.Debug("⏱️ Flush skipped due to rate limit: %v since last send", timeSinceLastSend)
+		c.logger.Debug("⏱️ 日志文件数据刷新因频率限制跳过: %v 自上次发送", timeSinceLastSend)
 		return
 	}
 
 	// 限制批量大小，避免单次发送过多数据
-	batchSize := len(c.logBuffer)
+	batchSize := len(c.logFileDataBuffer)
 	if batchSize > c.maxLogRate {
 		batchSize = c.maxLogRate
-		c.logger.Debug("📊 Batch size limited from %d to %d", len(c.logBuffer), batchSize)
+		c.logger.Debug("📊 日志文件数据批量大小限制: %d -> %d", len(c.logFileDataBuffer), batchSize)
 	}
 
-	// 发送批量日志数据
+	// 发送批量日志文件数据
 	batch := make([]string, batchSize)
-	copy(batch, c.logBuffer[:batchSize])
+	copy(batch, c.logFileDataBuffer[:batchSize])
 
 	// 从缓冲区移除已发送的日志
-	c.logBuffer = c.logBuffer[batchSize:]
+	c.logFileDataBuffer = c.logFileDataBuffer[batchSize:]
 
-	c.logger.Info("📤 Flushing log batch: %d logs, remaining in buffer: %d", batchSize, len(c.logBuffer))
+	c.logger.Info("📤 刷新日志文件数据批次: %d 条日志, 缓冲区剩余: %d", batchSize, len(c.logFileDataBuffer))
 
-	// 发送批量日志
-	c.sendBatchLogData(batch)
+	// 发送批量日志文件数据
+	c.sendBatchLogFileData(batch)
 
 	// 更新最后发送时间
-	c.lastLogSend = now
+	c.lastLogFileDataSend = now
 }
 
-// sendBatchLogData sends a batch of log data to web terminals
-func (c *Client) sendBatchLogData(logs []string) {
+// flushProcessOutputBuffer 发送所有缓冲的进程输出到服务器
+func (c *Client) flushProcessOutputBuffer() {
+	c.processOutputBufferMux.Lock()
+	defer c.processOutputBufferMux.Unlock()
+	c.flushProcessOutputBufferUnsafe()
+}
+
+// flushProcessOutputBufferUnsafe 发送所有缓冲的进程输出（调用者必须持有锁）
+func (c *Client) flushProcessOutputBufferUnsafe() {
+	if len(c.processOutputBuffer) == 0 {
+		c.logger.Debug("📭 进程输出缓冲区为空，无需刷新")
+		return
+	}
+
+	// 检查发送频率限制
+	now := time.Now()
+	timeSinceLastSend := now.Sub(c.lastProcessOutputSend)
+	if timeSinceLastSend < c.logRateWindow {
+		c.logger.Debug("⏱️ 进程输出刷新因频率限制跳过: %v 自上次发送", timeSinceLastSend)
+		return
+	}
+
+	// 限制批量大小，避免单次发送过多数据
+	batchSize := len(c.processOutputBuffer)
+	if batchSize > c.maxLogRate {
+		batchSize = c.maxLogRate
+		c.logger.Debug("📊 进程输出批量大小限制: %d -> %d", len(c.processOutputBuffer), batchSize)
+	}
+
+	// 发送批量进程输出
+	batch := make([]string, batchSize)
+	copy(batch, c.processOutputBuffer[:batchSize])
+
+	// 从缓冲区移除已发送的输出
+	c.processOutputBuffer = c.processOutputBuffer[batchSize:]
+
+	c.logger.Info("📤 刷新进程输出批次: %d 条输出, 缓冲区剩余: %d", batchSize, len(c.processOutputBuffer))
+
+	// 发送批量进程输出
+	c.sendBatchProcessOutput(batch)
+
+	// 更新最后发送时间
+	c.lastProcessOutputSend = now
+}
+
+// sendBatchLogFileData 发送一批日志文件数据到服务器（用于processLogLine处理）
+func (c *Client) sendBatchLogFileData(logs []string) {
 	if len(logs) == 0 {
-		c.logger.Debug("📭 No logs to send in batch")
+		c.logger.Debug("📭 没有日志文件数据要发送")
 		return
 	}
 
@@ -2192,7 +2267,7 @@ func (c *Client) sendBatchLogData(logs []string) {
 	}
 
 	if len(logContents) == 0 {
-		c.logger.Debug("📭 No non-empty logs to send in batch")
+		c.logger.Debug("📭 没有非空日志文件数据要发送")
 		return
 	}
 
@@ -2201,8 +2276,37 @@ func (c *Client) sendBatchLogData(logs []string) {
 		"batch":   true, // 标识这是批量数据
 	}
 
-	c.logger.Info("📡 Sending batch log data to server: %d logs", len(logContents))
-	c.sendResponse(MsgTypeLogData, logData, "")
+	c.logger.Info("📡 发送批量日志文件数据到服务器: %d 条日志", len(logContents))
+	c.sendResponse(MsgTypeLogFileData, logData, "")
+}
+
+// sendBatchProcessOutput 发送一批进程输出到服务器（用于终端显示）
+func (c *Client) sendBatchProcessOutput(outputs []string) {
+	if len(outputs) == 0 {
+		c.logger.Debug("📭 没有进程输出要发送")
+		return
+	}
+
+	// 确保输出数据格式正确
+	var outputContents []interface{}
+	for _, output := range outputs {
+		if strings.TrimSpace(output) != "" {
+			outputContents = append(outputContents, output)
+		}
+	}
+
+	if len(outputContents) == 0 {
+		c.logger.Debug("📭 没有非空进程输出要发送")
+		return
+	}
+
+	outputData := map[string]interface{}{
+		"content": outputContents,
+		"batch":   true, // 标识这是批量数据
+	}
+
+	c.logger.Info("📡 发送批量进程输出到服务器: %d 条输出", len(outputContents))
+	c.sendResponse(MsgTypeProcessOutput, outputData, "")
 }
 
 // readFileWithEncoding 根据指定编码读取文件内容
