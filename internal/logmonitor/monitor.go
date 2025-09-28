@@ -127,17 +127,24 @@ func (m *Monitor) scanExistingFiles() error {
 			continue
 		}
 
-		// Detect encoding for this file (only if file has enough content)
+		// Detect encoding for this file
 		encoding := m.detectFileEncoding(filepath, fileInfo.Size())
 
 		m.mutex.Lock()
-		m.fileStates[filename] = &fileState{
+		state := &fileState{
 			filename:    filename,
 			lastSize:    fileInfo.Size(),
 			lastModTime: fileInfo.ModTime(),
 			encoding:    encoding,
 			lastUsed:    time.Now(),
 		}
+
+		// For small files, don't cache encoding (set to Unknown to force re-detection)
+		if fileInfo.Size() < 1024 {
+			state.encoding = utils.EncodingUnknown
+		}
+
+		m.fileStates[filename] = state
 		m.mutex.Unlock()
 
 		acceptedCount++
@@ -200,17 +207,24 @@ func (m *Monitor) handleFileCreated(filename string) {
 		return
 	}
 
-	// Detect encoding for this new file (only if file has enough content)
+	// Detect encoding for this new file
 	encoding := m.detectFileEncoding(filepath, fileInfo.Size())
 
 	m.mutex.Lock()
-	m.fileStates[filename] = &fileState{
+	state := &fileState{
 		filename:    filename,
 		lastSize:    0, // Start from beginning for new files
 		lastModTime: fileInfo.ModTime(),
 		encoding:    encoding,
 		lastUsed:    time.Now(),
 	}
+
+	// For small files, don't cache encoding (set to Unknown to force re-detection)
+	if fileInfo.Size() < 1024 {
+		state.encoding = utils.EncodingUnknown
+	}
+
+	m.fileStates[filename] = state
 	m.mutex.Unlock()
 
 	m.checkFileForNewLines(filename)
@@ -268,6 +282,12 @@ func (m *Monitor) checkFileForNewLines(filename string) {
 			encoding:    encoding,
 			lastUsed:    time.Now(),
 		}
+
+		// For small files, don't cache encoding (set to Unknown to force re-detection)
+		if fileInfo.Size() < 1024 {
+			state.encoding = utils.EncodingUnknown
+		}
+
 		m.fileStates[filename] = state
 	} else {
 		// Update last used time
@@ -280,8 +300,17 @@ func (m *Monitor) checkFileForNewLines(filename string) {
 		return
 	}
 
-	// Read new lines using cached encoding
-	newLines, err := m.readNewLinesWithEncoding(filepath, state.lastSize, fileInfo.Size(), state.encoding)
+	// Read new lines using cached encoding (or detect if Unknown)
+	var encoding utils.EncodingType
+	if state.encoding == utils.EncodingUnknown {
+		// For small files or unknown encoding, detect each time
+		encoding = m.detectFileEncoding(filepath, fileInfo.Size())
+	} else {
+		// Use cached encoding for large files
+		encoding = state.encoding
+	}
+
+	newLines, err := m.readNewLinesWithEncoding(filepath, state.lastSize, fileInfo.Size(), encoding)
 	if err != nil {
 		m.logger.Error("Failed to read new lines from %s: %v", filename, err)
 		return
@@ -345,21 +374,24 @@ func (m *Monitor) readNewLines(filepath string, startOffset, endOffset int64) ([
 }
 
 // detectFileEncoding detects the encoding of a file by reading a sample
-// Only detects encoding if file has enough content (at least 10 lines worth)
+// For small files, always detect but don't cache the result
 func (m *Monitor) detectFileEncoding(filepath string, fileSize int64) utils.EncodingType {
-	// If file is too small (less than 1KB), default to UTF-8
-	if fileSize < 1024 {
-		return utils.EncodingUTF8
-	}
-
 	file, err := os.Open(filepath)
 	if err != nil {
 		return utils.EncodingUTF8 // Default to UTF-8 if can't read
 	}
 	defer file.Close()
 
-	// Read first 4KB to detect encoding (enough for multiple lines)
-	sample := make([]byte, 4096)
+	// For small files, read the entire file for detection
+	// For large files, read a sample
+	var sampleSize int64
+	if fileSize < 1024 {
+		sampleSize = fileSize // Read entire small file
+	} else {
+		sampleSize = 4096 // Read 4KB sample for large files
+	}
+
+	sample := make([]byte, sampleSize)
 	n, err := file.Read(sample)
 	if err != nil && err != io.EOF {
 		return utils.EncodingUTF8 // Default to UTF-8 if can't read
