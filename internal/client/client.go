@@ -2151,33 +2151,26 @@ func (c *Client) addLogFileDataToBuffer(content string) {
 		if err != nil {
 			c.logger.Warn("🔤 日志文件数据编码转换失败: %v, 使用原始内容", err)
 		} else if encoding != utils.EncodingUTF8 {
-			c.logger.Debug("🔤 日志文件数据从 %s 转换为 UTF-8: %s", encoding.String(), utils.TruncateString(convertedContent, _const.MaxStringPreviewLength))
 			content = convertedContent
 		}
 	}
 
 	// 检查消息大小限制（单条日志最大1KB）
-	originalLength := len(content)
 	if len(content) > _const.MaxLogLineLength {
 		content = content[:_const.MaxLogLineLength] + _const.TruncateSuffix + " [truncated]"
-		c.logger.Debug("📏 日志文件数据内容截断: %d -> %d 字节", originalLength, len(content))
 	}
 
 	// 检查频率限制
 	now := time.Now()
 	timeSinceLastSend := now.Sub(c.lastLogFileDataSend)
 	if timeSinceLastSend < c.logRateWindow && len(c.logFileDataBuffer) < _const.LogBatchSize/2 {
-		c.logger.Debug("⏱️ 日志文件数据因频率限制跳过: %v 自上次发送, 缓冲区大小: %d", timeSinceLastSend, len(c.logFileDataBuffer))
 		return
 	}
 
 	// 添加到缓冲区
 	c.logFileDataBuffer = append(c.logFileDataBuffer, content)
-	c.logger.Debug("📥 添加日志文件数据到缓冲区: 大小=%d, 内容预览=%s", len(c.logFileDataBuffer), utils.TruncateString(content, _const.MaxStringPreviewLength))
-
 	// 如果缓冲区满了，立即发送
 	if len(c.logFileDataBuffer) >= _const.LogBatchSize {
-		c.logger.Info("🚀 日志文件数据缓冲区已满 (%d), 立即刷新", len(c.logFileDataBuffer))
 		c.flushLogFileDataBufferUnsafe()
 	}
 }
@@ -2193,33 +2186,26 @@ func (c *Client) addProcessOutputToBuffer(content string) {
 		if err != nil {
 			c.logger.Warn("🔤 进程输出编码转换失败: %v, 使用原始内容", err)
 		} else if encoding != utils.EncodingUTF8 {
-			c.logger.Debug("🔤 进程输出从 %s 转换为 UTF-8: %s", encoding.String(), utils.TruncateString(convertedContent, _const.MaxStringPreviewLength))
 			content = convertedContent
 		}
 	}
 
 	// 检查消息大小限制
-	originalLength := len(content)
 	if len(content) > _const.MaxLogLineLength {
 		content = content[:_const.MaxLogLineLength] + _const.TruncateSuffix + " [truncated]"
-		c.logger.Debug("📏 进程输出内容截断: %d -> %d 字节", originalLength, len(content))
 	}
 
 	// 检查频率限制
 	now := time.Now()
 	timeSinceLastSend := now.Sub(c.lastProcessOutputSend)
 	if timeSinceLastSend < c.logRateWindow && len(c.processOutputBuffer) < _const.LogBatchSize/2 {
-		c.logger.Debug("⏱️ 进程输出因频率限制跳过: %v 自上次发送, 缓冲区大小: %d", timeSinceLastSend, len(c.processOutputBuffer))
 		return
 	}
 
 	// 添加到缓冲区
 	c.processOutputBuffer = append(c.processOutputBuffer, content)
-	c.logger.Debug("📥 添加进程输出到缓冲区: 大小=%d, 内容预览=%s", len(c.processOutputBuffer), utils.TruncateString(content, _const.MaxStringPreviewLength))
-
 	// 如果缓冲区满了，立即发送
 	if len(c.processOutputBuffer) >= _const.LogBatchSize {
-		c.logger.Info("🚀 进程输出缓冲区已满 (%d), 立即刷新", len(c.processOutputBuffer))
 		c.flushProcessOutputBufferUnsafe()
 	}
 }
@@ -2258,7 +2244,6 @@ func (c *Client) flushLogFileDataBuffer() {
 // flushLogFileDataBufferUnsafe 发送所有缓冲的日志文件数据（调用者必须持有锁）
 func (c *Client) flushLogFileDataBufferUnsafe() {
 	if len(c.logFileDataBuffer) == 0 {
-		c.logger.Debug("📭 日志文件数据缓冲区为空，无需刷新")
 		return
 	}
 
@@ -2266,7 +2251,6 @@ func (c *Client) flushLogFileDataBufferUnsafe() {
 	now := time.Now()
 	timeSinceLastSend := now.Sub(c.lastLogFileDataSend)
 	if timeSinceLastSend < c.logRateWindow {
-		c.logger.Debug("⏱️ 日志文件数据刷新因频率限制跳过: %v 自上次发送", timeSinceLastSend)
 		return
 	}
 
@@ -2274,7 +2258,6 @@ func (c *Client) flushLogFileDataBufferUnsafe() {
 	batchSize := len(c.logFileDataBuffer)
 	if batchSize > c.maxLogRate {
 		batchSize = c.maxLogRate
-		c.logger.Debug("📊 日志文件数据批量大小限制: %d -> %d", len(c.logFileDataBuffer), batchSize)
 	}
 
 	// 发送批量日志文件数据
@@ -2283,8 +2266,6 @@ func (c *Client) flushLogFileDataBufferUnsafe() {
 
 	// 从缓冲区移除已发送的日志
 	c.logFileDataBuffer = c.logFileDataBuffer[batchSize:]
-
-	c.logger.Info("📤 刷新日志文件数据批次: %d 条日志, 缓冲区剩余: %d", batchSize, len(c.logFileDataBuffer))
 
 	// 发送批量日志文件数据
 	c.sendBatchLogFileData(batch)
@@ -2303,7 +2284,6 @@ func (c *Client) flushProcessOutputBuffer() {
 // flushProcessOutputBufferUnsafe 发送所有缓冲的进程输出（调用者必须持有锁）
 func (c *Client) flushProcessOutputBufferUnsafe() {
 	if len(c.processOutputBuffer) == 0 {
-		c.logger.Debug("📭 进程输出缓冲区为空，无需刷新")
 		return
 	}
 
@@ -2311,7 +2291,6 @@ func (c *Client) flushProcessOutputBufferUnsafe() {
 	now := time.Now()
 	timeSinceLastSend := now.Sub(c.lastProcessOutputSend)
 	if timeSinceLastSend < c.logRateWindow {
-		c.logger.Debug("⏱️ 进程输出刷新因频率限制跳过: %v 自上次发送", timeSinceLastSend)
 		return
 	}
 
@@ -2319,7 +2298,6 @@ func (c *Client) flushProcessOutputBufferUnsafe() {
 	batchSize := len(c.processOutputBuffer)
 	if batchSize > c.maxLogRate {
 		batchSize = c.maxLogRate
-		c.logger.Debug("📊 进程输出批量大小限制: %d -> %d", len(c.processOutputBuffer), batchSize)
 	}
 
 	// 发送批量进程输出
@@ -2328,8 +2306,6 @@ func (c *Client) flushProcessOutputBufferUnsafe() {
 
 	// 从缓冲区移除已发送的输出
 	c.processOutputBuffer = c.processOutputBuffer[batchSize:]
-
-	c.logger.Info("📤 刷新进程输出批次: %d 条输出, 缓冲区剩余: %d", batchSize, len(c.processOutputBuffer))
 
 	// 发送批量进程输出
 	c.sendBatchProcessOutput(batch)
@@ -2341,7 +2317,6 @@ func (c *Client) flushProcessOutputBufferUnsafe() {
 // sendBatchLogFileData 发送一批日志文件数据到服务器（用于processLogLine处理）
 func (c *Client) sendBatchLogFileData(logs []string) {
 	if len(logs) == 0 {
-		c.logger.Debug("📭 没有日志文件数据要发送")
 		return
 	}
 
@@ -2354,7 +2329,6 @@ func (c *Client) sendBatchLogFileData(logs []string) {
 	}
 
 	if len(logContents) == 0 {
-		c.logger.Debug("📭 没有非空日志文件数据要发送")
 		return
 	}
 
@@ -2370,7 +2344,6 @@ func (c *Client) sendBatchLogFileData(logs []string) {
 // sendBatchProcessOutput 发送一批进程输出到服务器（用于终端显示）
 func (c *Client) sendBatchProcessOutput(outputs []string) {
 	if len(outputs) == 0 {
-		c.logger.Debug("📭 没有进程输出要发送")
 		return
 	}
 
@@ -2383,7 +2356,6 @@ func (c *Client) sendBatchProcessOutput(outputs []string) {
 	}
 
 	if len(outputContents) == 0 {
-		c.logger.Debug("📭 没有非空进程输出要发送")
 		return
 	}
 
@@ -2462,8 +2434,6 @@ func (c *Client) readFileWithEncoding(filePath, encoding string) (string, error)
 			return string(fileData), nil
 		}
 
-		c.logger.Debug("Detected encoding: %s (confidence: %.2f)", result.Charset, result.Confidence)
-
 		// 如果检测到的编码不是UTF-8，尝试转换
 		if result.Charset != "UTF-8" {
 			// 这里可以添加更多编码转换逻辑
@@ -2473,12 +2443,10 @@ func (c *Client) readFileWithEncoding(filePath, encoding string) (string, error)
 				decoder := simplifiedchinese.GBK.NewDecoder()
 				utf8Data, err := decoder.Bytes(fileData)
 				if err != nil {
-					c.logger.Warn("Failed to convert detected encoding to UTF-8: %v", err)
 					return string(fileData), nil
 				}
 				return string(utf8Data), nil
 			default:
-				c.logger.Warn("Unsupported encoding detected: %s", result.Charset)
 				return string(fileData), nil
 			}
 		}
@@ -3305,8 +3273,6 @@ func (c *Client) handleFileUpload(data interface{}) {
 		return
 	}
 
-	c.logger.Debug("Writing file: %s (encoding: %s, size: %d bytes)", fullPath, encoding, len(content))
-
 	// 确保目录存在
 	dir := filepath.Dir(fullPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
@@ -3386,8 +3352,6 @@ func (c *Client) handleFileDownload(data interface{}) {
 		}, "Access denied: path outside allowed directory")
 		return
 	}
-
-	c.logger.Debug("Reading file: %s (encoding: %s)", fullPath, encoding)
 
 	// 检查文件是否存在
 	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
