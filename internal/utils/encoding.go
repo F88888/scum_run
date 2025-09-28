@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"golang.org/x/text/encoding/unicode"
 	"golang.org/x/text/transform"
-	_const "s
+	_const "scum_run/internal/const"
 	"strings"
 	"unicode/utf8"
 )
