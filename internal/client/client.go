@@ -281,13 +281,21 @@ func (c *Client) Stop() {
 
 	c.cancel()
 
-	// 停止日志批量处理定时器
-	if c.logTicker != nil {
-		c.logTicker.Stop()
+	// 停止日志文件数据批量处理定时器
+	if c.logFileDataTicker != nil {
+		c.logFileDataTicker.Stop()
 	}
 
-	// 发送剩余的日志缓冲区
-	c.flushLogBuffer()
+	// 停止进程输出批量处理定时器
+	if c.processOutputTicker != nil {
+		c.processOutputTicker.Stop()
+	}
+
+	// 发送剩余的日志文件数据缓冲区
+	c.flushLogFileDataBuffer()
+
+	// 发送剩余的进程输出缓冲区
+	c.flushProcessOutputBuffer()
 
 	if c.logMonitor != nil {
 		c.logMonitor.Stop()
@@ -332,13 +340,21 @@ func (c *Client) ForceStop() {
 
 	c.cancel()
 
-	// 停止日志批量处理定时器
-	if c.logTicker != nil {
-		c.logTicker.Stop()
+	// 停止日志文件数据批量处理定时器
+	if c.logFileDataTicker != nil {
+		c.logFileDataTicker.Stop()
 	}
 
-	// 发送剩余的日志缓冲区
-	c.flushLogBuffer()
+	// 停止进程输出批量处理定时器
+	if c.processOutputTicker != nil {
+		c.processOutputTicker.Stop()
+	}
+
+	// 发送剩余的日志文件数据缓冲区
+	c.flushLogFileDataBuffer()
+
+	// 发送剩余的进程输出缓冲区
+	c.flushProcessOutputBuffer()
 
 	if c.logMonitor != nil {
 		c.logMonitor.Stop()
@@ -689,14 +705,14 @@ func (c *Client) sendResponse(msgType string, data interface{}, errorMsg string)
 	}
 
 	// 添加消息发送追踪
-	if msgType == MsgTypeLogData {
-		c.logger.Debug("📤 Sending %s message to server", msgType)
+	if msgType == MsgTypeLogFileData || msgType == MsgTypeProcessOutput {
+		c.logger.Debug("📤 发送 %s 消息到服务器", msgType)
 	}
 
 	if err := c.wsClient.SendMessage(response); err != nil {
-		c.logger.Error("❌ Failed to send %s response: %v", msgType, err)
-	} else if msgType == MsgTypeLogData {
-		c.logger.Debug("✅ Successfully sent %s message to server", msgType)
+		c.logger.Error("❌ 发送 %s 响应失败: %v", msgType, err)
+	} else if msgType == MsgTypeLogFileData || msgType == MsgTypeProcessOutput {
+		c.logger.Debug("✅ 成功发送 %s 消息到服务器", msgType)
 	}
 }
 
@@ -1518,10 +1534,10 @@ func (c *Client) executeServerCommand(command string) (string, error) {
 	return fmt.Sprintf("Command '%s' has been sent to the server", command), nil
 }
 
-// sendLogData sends real-time log data to web terminals (deprecated - use addLogToBuffer instead)
+// sendLogData 发送实时日志数据到Web终端（已弃用 - 使用addProcessOutputToBuffer代替）
 func (c *Client) sendLogData(content string) {
-	// 使用新的批量处理机制
-	c.addLogToBuffer(content)
+	// 使用新的批量处理机制，发送到进程输出缓冲区
+	c.addProcessOutputToBuffer(content)
 }
 
 // handleProcessOutput 处理SCUM服务器进程的实时输出，发送给终端显示
