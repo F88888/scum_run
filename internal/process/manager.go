@@ -119,7 +119,7 @@ func (m *Manager) Start() error {
 
 	// Check if the configured port is already in use
 	if m.config.GamePort > 0 {
-		portChecker := network.NewPortChecker(3 * time.Second)
+		portChecker := network.NewPortChecker(_const.DefaultWaitTime + _const.ShortWaitTime)
 		host := m.config.ServerIP
 		if host == "" {
 			host = _const.DefaultServerIP
@@ -278,7 +278,7 @@ func (m *Manager) ForceStop() error {
 		}
 
 		// Wait a bit for graceful shutdown
-		time.Sleep(2 * time.Second)
+		time.Sleep(_const.DefaultWaitTime)
 
 		// Force kill if still running
 		if err := m.cmd.Process.Kill(); err != nil {
@@ -408,7 +408,7 @@ func (m *Manager) Restart() error {
 			return fmt.Errorf("failed to stop server: %w", err)
 		}
 		// Wait a bit for the process to fully terminate
-		time.Sleep(2 * time.Second)
+		time.Sleep(_const.DefaultWaitTime)
 	}
 
 	return m.Start()

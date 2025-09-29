@@ -9,18 +9,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"scum_run/model"
 )
 
-// UpdaterConfig 更新器配置
-type UpdaterConfig struct {
-	CurrentExePath string   // 当前程序路径
-	UpdateURL      string   // 更新下载URL
-	UpdaterExeName string   // 更新器程序名
-	Args           []string // 程序启动参数
-}
-
 // CreateUpdaterScript 创建独立的更新器脚本
-func CreateUpdaterScript(config UpdaterConfig) error {
+func CreateUpdaterScript(config model.UpdaterConfig) error {
 	var scriptContent string
 	var scriptName string
 
@@ -136,7 +130,7 @@ rm -f "$0"
 }
 
 // ExecuteUpdate 执行更新流程
-func ExecuteUpdate(config UpdaterConfig) error {
+func ExecuteUpdate(config model.UpdaterConfig) error {
 	fmt.Printf("🔄 开始执行更新流程...\n")
 	fmt.Printf("📥 下载URL: %s\n", config.UpdateURL)
 	fmt.Printf("📁 当前程序路径: %s\n", config.CurrentExePath)

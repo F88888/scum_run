@@ -9,6 +9,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	_const "scum_run/internal/const"
 	"scum_run/internal/logger"
 )
 
@@ -52,14 +53,14 @@ func New(url string, logger *logger.Logger) *Client {
 		cancel:            cancel,
 		stopChan:          make(chan struct{}),
 		reconnectChan:     make(chan struct{}),
-		maxRetries:        -1,               // 无限重试
-		retryInterval:     5 * time.Second,  // 增加重连间隔，减少频繁重连
-		maxRetryInterval:  60 * time.Second, // 增加最大重连间隔
-		heartbeatInterval: 40 * time.Second, // 与服务端错开的心跳时间，避免冲突
-		heartbeatTimeout:  5 * time.Minute,  // 合理的心跳超时时间，给网络波动缓冲
-		readBufferSize:    128 * 1024,       // 与服务端一致的缓冲区大小
-		writeBufferSize:   128 * 1024,       // 与服务端一致的缓冲区大小
-		maxMessageSize:    2 * 1024 * 1024,  // 与服务端一致的最大消息大小
+		maxRetries:        -1,                       // 无限重试
+		retryInterval:     _const.RetryInterval,     // 增加重连间隔，减少频繁重连
+		maxRetryInterval:  _const.MaxRetryInterval,  // 增加最大重连间隔
+		heartbeatInterval: _const.HeartbeatInterval, // 与服务端错开的心跳时间，避免冲突
+		heartbeatTimeout:  _const.HeartbeatTimeout,  // 合理的心跳超时时间，给网络波动缓冲
+		readBufferSize:    _const.ReadBufferSize,    // 与服务端一致的缓冲区大小
+		writeBufferSize:   _const.WriteBufferSize,   // 与服务端一致的缓冲区大小
+		maxMessageSize:    _const.MaxMessageSize,    // 与服务端一致的最大消息大小
 	}
 }
 
@@ -67,9 +68,9 @@ func New(url string, logger *logger.Logger) *Client {
 func (c *Client) Connect() error {
 	c.mutex.Lock()
 	dialer := websocket.Dialer{
-		HandshakeTimeout: 60 * time.Second,  // 延长握手超时时间到60秒
-		ReadBufferSize:   c.readBufferSize,  // 使用配置的读取缓冲区
-		WriteBufferSize:  c.writeBufferSize, // 使用配置的写入缓冲区
+		HandshakeTimeout: _const.ConnectionTimeout, // 延长握手超时时间到60秒
+		ReadBufferSize:   c.readBufferSize,         // 使用配置的读取缓冲区
+		WriteBufferSize:  c.writeBufferSize,        // 使用配置的写入缓冲区
 		// 添加更多连接优化配置
 		EnableCompression: false, // 禁用压缩减少CPU开销
 	}
@@ -270,7 +271,7 @@ func (c *Client) SetHeartbeatConfig(interval, timeout time.Duration) {
 
 // monitorConnection monitors the connection and handles reconnection
 func (c *Client) monitorConnection() {
-	ticker := time.NewTicker(5 * time.Minute) // 每5分钟检查一次连接，减少频繁检查
+	ticker := time.NewTicker(_const.HeartbeatTimeout) // 每5分钟检查一次连接，减少频繁检查
 	defer ticker.Stop()
 
 	for {
@@ -376,7 +377,7 @@ func (c *Client) reconnect() {
 		case <-time.After(backoff):
 			// 首次重连前等待更长时间，避免启动时的频繁重连
 			if isFirstAttempt {
-				time.Sleep(1 * time.Second) // 减少初始等待时间
+				time.Sleep(_const.ShortWaitTime) // 减少初始等待时间
 				isFirstAttempt = false
 			}
 
@@ -397,15 +398,15 @@ func (c *Client) reconnect() {
 					backoff = c.retryInterval
 				} else {
 					// 其他错误，使用指数退避
-					backoff *= 2
+					backoff *= 2 // 指数退避算法
 					if backoff > c.maxRetryInterval {
 						backoff = c.maxRetryInterval
 					}
 				}
 
 				// 对于频繁的连接失败，增加额外延迟
-				if retryCount > 5 {
-					time.Sleep(5 * time.Second)
+				if retryCount > _const.ClientRetryCount {
+					time.Sleep(_const.LongWaitTime)
 				}
 			} else {
 				// 调用重连回调

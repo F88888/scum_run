@@ -233,7 +233,7 @@ func (c *Client) Start() error {
 	go func() {
 		defer c.wg.Done()
 		// Wait a bit for authentication to complete
-		time.Sleep(2 * time.Second)
+		time.Sleep(_const.DefaultWaitTime)
 		c.requestConfigSync()
 	}()
 
@@ -400,8 +400,7 @@ func (c *Client) handleMessages() {
 		default:
 			// 检查WebSocket客户端是否仍然连接
 			if !c.wsClient.IsConnected() {
-				c.logger.Debug("WebSocket not connected, waiting for reconnection...")
-				time.Sleep(2 * time.Second)
+				time.Sleep(_const.DefaultWaitTime)
 				continue
 			}
 
@@ -410,11 +409,10 @@ func (c *Client) handleMessages() {
 				// 使用更详细的错误处理
 				if strings.Contains(err.Error(), "connection not running") ||
 					strings.Contains(err.Error(), "websocket: close") {
-					c.logger.Debug("WebSocket connection closed, waiting for reconnection...")
-					time.Sleep(2 * time.Second)
+					time.Sleep(_const.DefaultWaitTime)
 				} else {
 					c.logger.Error("Failed to read WebSocket message: %v", err)
-					time.Sleep(1 * time.Second)
+					time.Sleep(_const.ShortWaitTime)
 				}
 				continue
 			}
@@ -426,10 +424,6 @@ func (c *Client) handleMessages() {
 
 // handleMessage handles a single WebSocket message
 func (c *Client) handleMessage(msg request.WebSocketMessage) {
-	c.logger.Info("Received message: %s, Success: %v", msg.Type, msg.Success)
-	if msg.Error != "" {
-		c.logger.Error("Message error: %s", msg.Error)
-	}
 
 	switch msg.Type {
 	case MsgTypeServerStart:
@@ -450,7 +444,6 @@ func (c *Client) handleMessage(msg request.WebSocketMessage) {
 		c.handleConfigUpdate(msg.Data)
 	case MsgTypeInstallServer:
 		// 安装消息已移除，不再处理此消息类型
-		c.logger.Debug("Received install_server message (deprecated)")
 	case MsgTypeDownloadSteamCmd:
 		c.handleDownloadSteamCmd(msg.Data)
 	case MsgTypeServerUpdate:
@@ -471,7 +464,6 @@ func (c *Client) handleMessage(msg request.WebSocketMessage) {
 		c.handleFileWrite(msg.Data)
 	case MsgTypeHeartbeat:
 		// Heartbeat messages from server are handled silently
-		c.logger.Debug("Received heartbeat from server")
 	case MsgTypeAuth:
 		// Handle authentication response from server
 		c.handleAuthResponse(msg)
@@ -557,11 +549,11 @@ func (c *Client) handleServerStart() {
 		// This is done after server start because the database file is created by SCUM server
 		go func() {
 			// 减少等待时间，提高响应速度
-			time.Sleep(2 * time.Second)
+			time.Sleep(_const.DefaultWaitTime)
 			c.logger.Info("Attempting to initialize database connection after server start...")
 
 			// 使用重试机制而不是单次检查
-			maxRetries := 5
+			maxRetries := _const.ClientRetryCount
 			for i := 0; i < maxRetries; i++ {
 				if c.db.IsAvailable() {
 					if err := c.db.Initialize(); err != nil {
@@ -573,7 +565,7 @@ func (c *Client) handleServerStart() {
 				} else {
 					c.logger.Info("Database file not yet available, retrying in 1 second (attempt %d/%d)", i+1, maxRetries)
 				}
-				time.Sleep(1 * time.Second)
+				time.Sleep(_const.ShortWaitTime)
 			}
 			c.logger.Warn("Failed to initialize database after %d attempts", maxRetries)
 		}()
@@ -604,7 +596,7 @@ func (c *Client) handleServerRestart() {
 	}
 
 	// 减少等待时间，提高重启速度
-	time.Sleep(1 * time.Second)
+	time.Sleep(_const.ShortWaitTime)
 
 	// Start again
 	if err := c.process.Start(); err != nil {
@@ -670,7 +662,6 @@ func (c *Client) onLogUpdate(filename string, lines []string) {
 				c.logger.Warn("🔤 日志行编码转换失败: %v, 使用原始内容", err)
 				convertedLines = append(convertedLines, line)
 			} else if encoding != utils.EncodingUTF8 {
-				c.logger.Debug("🔤 日志行从 %s 转换为 UTF-8", encoding.String())
 				convertedLines = append(convertedLines, convertedLine)
 			} else {
 				convertedLines = append(convertedLines, line)
@@ -689,8 +680,6 @@ func (c *Client) onLogUpdate(filename string, lines []string) {
 			addedCount++
 		}
 	}
-
-	c.logger.Debug("📝 从 %s 添加了 %d 行非空日志到文件数据缓冲区", filename, addedCount)
 }
 
 // sendResponse sends a response message to the server
@@ -706,14 +695,9 @@ func (c *Client) sendResponse(msgType string, data interface{}, errorMsg string)
 	}
 
 	// 添加消息发送追踪
-	if msgType == MsgTypeLogFileData || msgType == MsgTypeProcessOutput {
-		c.logger.Debug("📤 发送 %s 消息到服务器", msgType)
-	}
 
 	if err := c.wsClient.SendMessage(response); err != nil {
 		c.logger.Error("❌ 发送 %s 响应失败: %v", msgType, err)
-	} else if msgType == MsgTypeLogFileData || msgType == MsgTypeProcessOutput {
-		c.logger.Debug("✅ 成功发送 %s 消息到服务器", msgType)
 	}
 }
 
@@ -831,7 +815,7 @@ func (c *Client) updateServerConfig(configData map[string]interface{}) {
 			// 使用更长的延迟，确保WebSocket连接稳定
 			go func() {
 				// 等待更长时间确保配置完全更新且连接稳定
-				time.Sleep(5 * time.Second)
+				time.Sleep(_const.LongWaitTime)
 				c.logger.Info("Starting SCUM server after config sync...")
 				c.handleServerStart()
 			}()
@@ -955,7 +939,7 @@ func (c *Client) initializeComponentsAfterInstall() {
 		c.logger.Info("Auto-start is enabled, starting SCUM server after installation...")
 		go func() {
 			// 等待一段时间让组件完全初始化
-			time.Sleep(2 * time.Second)
+			time.Sleep(_const.DefaultWaitTime)
 			c.handleServerStart()
 		}()
 	}
@@ -1136,7 +1120,6 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 func (c *Client) checkServerInstallation(steamDetector *steam.Detector) bool {
 	// 首先检查配置的steamDir
 	if c.steamDir != "" && steamDetector.IsSCUMServerInstalled(c.steamDir) {
-		c.logger.Debug("SCUM server found in configured steam directory: %s", c.steamDir)
 		return true
 	}
 
@@ -1476,7 +1459,7 @@ func (c *Client) extractZip(src, dest string) error {
 func (c *Client) handleServerCommand(data interface{}) {
 	commandData, ok := data.(map[string]interface{})
 	if !ok {
-		c.logger.Error("DEBUG: Invalid command data format")
+		c.logger.Error("Invalid command data format")
 		c.sendResponse(MsgTypeCommandResult, map[string]interface{}{
 			"success": false,
 			"output":  "Invalid command data format",
@@ -1486,7 +1469,7 @@ func (c *Client) handleServerCommand(data interface{}) {
 
 	command, ok := commandData["command"].(string)
 	if !ok || command == "" {
-		c.logger.Error("DEBUG: Command is empty or not a string")
+		c.logger.Error("Command is empty or not a string")
 		c.sendResponse(MsgTypeCommandResult, map[string]interface{}{
 			"success": false,
 			"output":  "Command is required",
@@ -1497,7 +1480,7 @@ func (c *Client) handleServerCommand(data interface{}) {
 	// 执行服务器命令
 	output, err := c.executeServerCommand(command)
 	if err != nil {
-		c.logger.Error("DEBUG: Command execution failed: %v", err)
+		c.logger.Error("Command execution failed: %v", err)
 		c.sendResponse(MsgTypeCommandResult, map[string]interface{}{
 			"command": command,
 			"success": false,
@@ -1516,18 +1499,18 @@ func (c *Client) handleServerCommand(data interface{}) {
 func (c *Client) executeServerCommand(command string) (string, error) {
 	// 检查服务器是否在运行
 	if c.process == nil {
-		c.logger.Error("DEBUG: Process manager is nil")
+		c.logger.Error("Process manager is nil")
 		return "", fmt.Errorf("process manager is not initialized")
 	}
 
 	if !c.process.IsRunning() {
-		c.logger.Error("DEBUG: Server is not running")
+		c.logger.Error("Server is not running")
 		return "", fmt.Errorf("server is not running")
 	}
 
 	// 发送命令到SCUM服务器
 	if err := c.process.SendCommand(command); err != nil {
-		c.logger.Error("DEBUG: Failed to send command to server: %v", err)
+		c.logger.Error("Failed to send command to server: %v", err)
 		return "", fmt.Errorf("failed to send command to server: %w", err)
 	}
 	// 发送日志数据显示命令已执行
@@ -1652,7 +1635,7 @@ func (c *Client) performSelfUpdateWithURL(downloadURL string) {
 		}
 
 		// 等待一段时间确保服务器完全停止
-		time.Sleep(2 * time.Second)
+		time.Sleep(_const.LongWaitTime)
 	} else {
 		c.logger.Info("ℹ️ SCUM服务器未运行，无需停止")
 	}
@@ -1670,7 +1653,7 @@ func (c *Client) performSelfUpdateWithURL(downloadURL string) {
 
 	c.logger.Info("📁 当前可执行文件路径: %s", currentExe)
 
-	updateConfig := updater.UpdaterConfig{
+	updateConfig := model.UpdaterConfig{
 		CurrentExePath: currentExe,
 		UpdateURL:      downloadURL,
 		Args:           os.Args[1:], // 排除程序名本身
@@ -1706,7 +1689,7 @@ func (c *Client) performSelfUpdateWithURL(downloadURL string) {
 
 	// 延迟一段时间让消息发送完成，然后强制退出让更新器接管
 	go func() {
-		time.Sleep(1 * time.Second) // 减少等待时间，确保更新器脚本先启动
+		time.Sleep(_const.ShortWaitTime) // 减少等待时间，确保更新器脚本先启动
 		c.logger.Info("🔄 正在退出以进行更新...")
 		// 使用 syscall.Exit 强制退出，不等待子进程
 		if runtime.GOOS == "windows" {
@@ -1758,7 +1741,7 @@ func (c *Client) performSelfUpdate() {
 		return
 	}
 
-	updateConfig := updater.UpdaterConfig{
+	updateConfig := model.UpdaterConfig{
 		CurrentExePath: currentExe,
 		UpdateURL:      downloadURL,
 		Args:           os.Args[1:], // 排除程序名本身
@@ -1790,7 +1773,7 @@ func (c *Client) performSelfUpdate() {
 
 	// 延迟一段时间让消息发送完成，然后退出让更新器接管
 	go func() {
-		time.Sleep(2 * time.Second)
+		time.Sleep(_const.DefaultWaitTime)
 		c.logger.Info("Exiting for update...")
 		os.Exit(0)
 	}()
@@ -1862,10 +1845,10 @@ func (c *Client) handleFileBrowse(data interface{}) {
 
 // handleFileList 处理文件列表响应（通常不会在客户端收到）
 func (c *Client) handleFileList(_ interface{}) {
-	c.logger.Debug("Received file list response (unexpected)")
+	// 文件列表响应通常不会在客户端收到
 }
 
-// handleFileRead 处理文件内容读取请求
+// handleFileRead 处理文件内容读取请求 - 只传输文件，不进行转码
 func (c *Client) handleFileRead(data interface{}) {
 	dataMap, ok := data.(map[string]interface{})
 	if !ok {
@@ -1875,7 +1858,6 @@ func (c *Client) handleFileRead(data interface{}) {
 	}
 
 	path, _ := dataMap["path"].(string)
-	encoding, _ := dataMap["encoding"].(string)
 	requestID, _ := dataMap["request_id"].(string)
 
 	if path == "" {
@@ -1886,10 +1868,6 @@ func (c *Client) handleFileRead(data interface{}) {
 		}
 		c.sendResponse(MsgTypeFileRead, errorData, "File path is required")
 		return
-	}
-
-	if encoding == "" {
-		encoding = "utf-8"
 	}
 
 	// 构建完整文件路径
@@ -1927,8 +1905,9 @@ func (c *Client) handleFileRead(data interface{}) {
 		return
 	}
 
-	// 读取文件内容
-	content, err := c.readFileWithEncoding(fullPath, encoding)
+	// 直接读取文件原始字节，不进行任何转码
+	// 转码工作交由前端处理
+	fileData, err := os.ReadFile(fullPath)
 	if err != nil {
 		c.logger.Error("Failed to read file %s: %v", fullPath, err)
 		errorData := map[string]interface{}{}
@@ -1939,11 +1918,10 @@ func (c *Client) handleFileRead(data interface{}) {
 		return
 	}
 
-	// 发送文件内容响应
+	// 发送文件内容响应 - 返回原始字节数据
 	responseData := map[string]interface{}{
-		"content":  content,
-		"encoding": encoding,
-		"size":     len(content),
+		"content": string(fileData), // 直接返回原始字节数据
+		"size":    len(fileData),
 	}
 
 	// 在响应中包含请求ID
@@ -1951,12 +1929,12 @@ func (c *Client) handleFileRead(data interface{}) {
 		responseData["request_id"] = requestID
 	}
 
+	c.logger.Info("Successfully read file: %s (size: %d bytes)", path, len(fileData))
 	c.sendResponse(MsgTypeFileRead, responseData, "")
 }
 
 // handleFileWrite 处理文件内容写入请求
 func (c *Client) handleFileWrite(data interface{}) {
-	c.logger.Debug("Handling file write request")
 
 	dataMap, ok := data.(map[string]interface{})
 	if !ok {
@@ -2419,6 +2397,7 @@ func (c *Client) sendBatchProcessOutput(outputs []string) {
 }
 
 // readFileWithEncoding 根据指定编码读取文件内容
+// 已弃用：转码工作已移至前端处理，此函数仅保留用于向后兼容
 func (c *Client) readFileWithEncoding(filePath, encoding string) (string, error) {
 	// 读取文件原始字节
 	fileData, err := os.ReadFile(filePath)
@@ -2569,13 +2548,8 @@ func (c *Client) writeFileWithEncoding(filePath, content, encoding string) error
 
 // handleSystemMonitor 处理系统监控消息
 func (c *Client) handleSystemMonitor(data interface{}) {
-	//c.logger.Debug("Received system monitor message")
-
 	// 系统监控消息通常是从服务器发送的配置或控制指令
 	// 这里可以根据需要处理服务器发送的系统监控相关指令
-	if data != nil {
-		//c.logger.Debug("System monitor data: %+v", data)
-	}
 }
 
 // handleGetSystemInfo 处理获取系统信息请求
@@ -2726,7 +2700,6 @@ func (c *Client) getOSInfo() string {
 func (c *Client) handleSystemMonitorData(data *request.SystemMonitorData) {
 	// 检查WebSocket连接是否可用
 	if !c.wsClient.IsConnected() {
-		c.logger.Debug("WebSocket not connected, skipping system monitor data")
 		return
 	}
 
@@ -3148,7 +3121,6 @@ func (c *Client) cleanOldBackups(backupDir string, serverID uint, keepCount int)
 // sendBackupResponse 发送备份响应
 func (c *Client) sendBackupResponse(msgType string, data interface{}) {
 	if !c.wsClient.IsConnected() {
-		c.logger.Debug("WebSocket not connected, skipping backup response")
 		return
 	}
 
@@ -3238,7 +3210,6 @@ func (c *Client) validateBackupPath(path string, installPath string) error {
 
 // handleFileTransfer 处理文件传输请求
 func (c *Client) handleFileTransfer(data interface{}) {
-	c.logger.Debug("Handling file transfer request")
 
 	dataMap, ok := data.(map[string]interface{})
 	if !ok {
@@ -3265,7 +3236,6 @@ func (c *Client) handleFileTransfer(data interface{}) {
 
 // handleFileUpload 处理文件上传请求
 func (c *Client) handleFileUpload(data interface{}) {
-	c.logger.Debug("Handling file upload request")
 
 	dataMap, ok := data.(map[string]interface{})
 	if !ok {
@@ -3306,7 +3276,6 @@ func (c *Client) handleFileUpload(data interface{}) {
 		// 移除开头的斜杠，然后基于steamDir构建完整路径
 		relativePath := strings.TrimPrefix(filePath, "/")
 		fullPath = filepath.Join(c.steamDir, relativePath)
-		c.logger.Debug("Converting absolute path %s to %s", filePath, fullPath)
 	} else {
 		// 相对路径，基于Steam目录
 		fullPath = filepath.Join(c.steamDir, filePath)
@@ -3349,12 +3318,10 @@ func (c *Client) handleFileUpload(data interface{}) {
 		"file_path":   filePath,
 		"file_size":   len(content),
 	}, "")
-	c.logger.Debug("File uploaded successfully: %s, transfer_id: %s", filePath, transferID)
 }
 
 // handleFileDownload 处理文件下载请求
 func (c *Client) handleFileDownload(data interface{}) {
-	c.logger.Debug("Handling file download request")
 
 	dataMap, ok := data.(map[string]interface{})
 	if !ok {
@@ -3386,7 +3353,6 @@ func (c *Client) handleFileDownload(data interface{}) {
 		// 移除开头的斜杠，然后基于steamDir构建完整路径
 		relativePath := strings.TrimPrefix(filePath, "/")
 		fullPath = filepath.Join(c.steamDir, relativePath)
-		c.logger.Debug("Converting absolute path %s to %s", filePath, fullPath)
 	} else {
 		// 相对路径，基于Steam目录
 		fullPath = filepath.Join(c.steamDir, filePath)
@@ -3431,12 +3397,10 @@ func (c *Client) handleFileDownload(data interface{}) {
 	}
 
 	c.sendResponse(MsgTypeFileDownload, responseData, "")
-	c.logger.Debug("File downloaded successfully: %s (%d bytes), transfer_id: %s", filePath, len(content), transferID)
 }
 
 // handleFileDelete 处理文件删除请求
 func (c *Client) handleFileDelete(data interface{}) {
-	c.logger.Debug("Handling file delete request")
 
 	dataMap, ok := data.(map[string]interface{})
 	if !ok {
@@ -3460,7 +3424,6 @@ func (c *Client) handleFileDelete(data interface{}) {
 		// 移除开头的斜杠，然后基于steamDir构建完整路径
 		relativePath := strings.TrimPrefix(filePath, "/")
 		fullPath = filepath.Join(c.steamDir, relativePath)
-		c.logger.Debug("Converting absolute path %s to %s", filePath, fullPath)
 	} else {
 		// 相对路径，基于Steam目录
 		fullPath = filepath.Join(c.steamDir, filePath)
@@ -3474,8 +3437,6 @@ func (c *Client) handleFileDelete(data interface{}) {
 		c.sendResponse(MsgTypeFileDelete, nil, "Access denied: path outside allowed directory")
 		return
 	}
-
-	c.logger.Debug("Deleting file: %s", fullPath)
 
 	// 检查文件是否存在
 	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
@@ -3499,12 +3460,10 @@ func (c *Client) handleFileDelete(data interface{}) {
 	}
 
 	c.sendResponse(MsgTypeFileDelete, responseData, "")
-	c.logger.Debug("File deleted successfully: %s", filePath)
 }
 
 // handleCloudUpload 处理云存储上传请求
 func (c *Client) handleCloudUpload(data interface{}) {
-	c.logger.Debug("Handling cloud upload request")
 
 	dataMap, ok := data.(map[string]interface{})
 	if !ok {
@@ -3533,7 +3492,6 @@ func (c *Client) handleCloudUpload(data interface{}) {
 		// 移除开头的斜杠，然后基于steamDir构建完整路径
 		relativePath := strings.TrimPrefix(filePath, "/")
 		fullPath = filepath.Join(c.steamDir, relativePath)
-		c.logger.Debug("Converting absolute path %s to %s", filePath, fullPath)
 	} else {
 		// 相对路径，基于Steam目录
 		fullPath = filepath.Join(c.steamDir, filePath)
@@ -3549,8 +3507,6 @@ func (c *Client) handleCloudUpload(data interface{}) {
 		}, "Access denied: path outside allowed directory")
 		return
 	}
-
-	c.logger.Debug("Uploading file to cloud: %s -> %s", fullPath, cloudPath)
 
 	// 检查文件是否存在
 	if _, err := os.Stat(fullPath); os.IsNotExist(err) {
@@ -3602,18 +3558,11 @@ func (c *Client) uploadFileToCloud(filePath, cloudPath, transferID string, uploa
 		return fmt.Errorf("file %s is empty", filePath)
 	}
 
-	c.logger.Debug("Read file %s (%d bytes), uploading to cloud path: %s", filePath, len(fileData), cloudPath)
-
-	// 记录上传凭证信息（用于调试）
-	c.logger.Debug("Upload signature received: %+v", uploadSignature)
-
 	// 检测云存储提供商
 	provider := c.detectCloudProvider(uploadSignature)
 	if provider == "" {
 		return fmt.Errorf("unable to detect cloud storage provider from upload signature")
 	}
-
-	c.logger.Debug("Detected cloud storage provider: %s", provider)
 
 	// 根据提供商选择上传方法
 	switch provider {
@@ -3809,9 +3758,6 @@ func (c *Client) uploadToQiniuURL(fileData []byte, cloudPath, token, key, upload
 		return fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	// 记录响应信息
-	c.logger.Debug("Qiniu upload response: status=%d, body=%s", resp.StatusCode, string(responseBody))
-
 	// 检查响应状态
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("qiniu upload failed with status %d: %s", resp.StatusCode, string(responseBody))
@@ -3855,8 +3801,6 @@ func (c *Client) uploadToAliyun(fileData []byte, cloudPath string, uploadSignatu
 
 	// 构建上传URL
 	uploadURL := fmt.Sprintf("https://%s", endpoint)
-
-	c.logger.Debug("Uploading to Aliyun OSS: %s -> %s (%d bytes)", cloudPath, uploadURL, len(fileData))
 
 	// 创建multipart form data
 	var buf bytes.Buffer
@@ -3938,7 +3882,6 @@ func (c *Client) uploadToAliyun(fileData []byte, cloudPath string, uploadSignatu
 
 // handleCloudDownload 处理云存储下载请求
 func (c *Client) handleCloudDownload(data interface{}) {
-	c.logger.Debug("Handling cloud download request")
 
 	dataMap, ok := data.(map[string]interface{})
 	if !ok {
@@ -3948,7 +3891,6 @@ func (c *Client) handleCloudDownload(data interface{}) {
 	}
 
 	filePath, _ := dataMap["file_path"].(string)
-	cloudPath, _ := dataMap["cloud_path"].(string)
 	transferID, _ := dataMap["transfer_id"].(string)
 
 	if filePath == "" {
@@ -3969,17 +3911,9 @@ func (c *Client) handleCloudDownload(data interface{}) {
 		fullPath = filepath.Join(c.steamDir, filePath)
 	}
 
-	c.logger.Debug("Downloading file from cloud: %s -> %s", cloudPath, fullPath)
-
-	// TODO: 实现云存储下载逻辑
-	// 这里需要根据具体的云存储提供商实现下载逻辑
-	// 1. 从云存储下载文件内容
-	// 2. 保存到本地文件路径
-	// 3. 返回下载结果
-
 	c.logger.Warn("Cloud download not implemented yet")
 	c.sendResponse(MsgTypeCloudDownload, map[string]interface{}{
 		"transfer_id": transferID,
-		"file_path":   filePath,
+		"file_path":   fullPath,
 	}, "Cloud download not implemented yet")
 }

@@ -14,6 +14,7 @@ import (
 	"github.com/shirou/gopsutil/v3/process"
 
 	"scum_run/internal/logger"
+	"scum_run/model"
 )
 
 // PerformanceMonitor 性能监控器
@@ -41,34 +42,7 @@ type PerformanceMonitor struct {
 }
 
 // PerformanceMonitorCallback 性能监控数据回调函数
-type PerformanceMonitorCallback func(data *PerformanceData)
-
-// PerformanceData 性能数据结构
-type PerformanceData struct {
-	// 基础系统信息
-	CPUCores        int   `json:"cpu_cores"`
-	TotalMemory     int64 `json:"total_memory_bytes"`
-	AvailableMemory int64 `json:"available_memory_bytes"`
-	TotalDiskSpace  int64 `json:"total_disk_space_bytes"`
-	FreeDiskSpace   int64 `json:"free_disk_space_bytes"`
-
-	// 实时性能数据
-	CPUUsage       float64   `json:"cpu_usage"`
-	MemoryUsage    float64   `json:"memory_usage"`
-	DiskUsage      float64   `json:"disk_usage"`
-	NetworkIn      int64     `json:"network_in_bytes"`
-	NetworkOut     int64     `json:"network_out_bytes"`
-	DiskReadSpeed  float64   `json:"disk_read_speed"`
-	DiskWriteSpeed float64   `json:"disk_write_speed"`
-	ProcessCount   int       `json:"process_count"`
-	LoadAverage    []float64 `json:"load_average"`
-
-	// 性能指标
-	FilesPerSecond float64 `json:"files_per_second"`
-	DataThroughput float64 `json:"data_throughput"`
-
-	Timestamp time.Time `json:"timestamp"`
-}
+type PerformanceMonitorCallback func(data *model.PerformanceData)
 
 // NewPerformanceMonitor 创建新的性能监控器
 func NewPerformanceMonitor(logger *logger.Logger, interval time.Duration) *PerformanceMonitor {
@@ -111,12 +85,12 @@ func (pm *PerformanceMonitor) Stop() {
 }
 
 // GetAverageData 获取平均性能数据
-func (pm *PerformanceMonitor) GetAverageData() *PerformanceData {
+func (pm *PerformanceMonitor) GetAverageData() *model.PerformanceData {
 	pm.mutex.RLock()
 	defer pm.mutex.RUnlock()
 
 	if len(pm.cpuReadings) == 0 {
-		return &PerformanceData{}
+		return &model.PerformanceData{}
 	}
 
 	// 计算平均值
@@ -145,7 +119,7 @@ func (pm *PerformanceMonitor) GetAverageData() *PerformanceData {
 		}
 	}
 
-	return &PerformanceData{
+	return &model.PerformanceData{
 		CPUCores:        pm.getCPUCores(),
 		TotalMemory:     pm.getTotalMemory(),
 		AvailableMemory: pm.getAvailableMemory(),
@@ -230,8 +204,8 @@ func (pm *PerformanceMonitor) monitorLoop() {
 }
 
 // collectPerformanceData 收集性能数据
-func (pm *PerformanceMonitor) collectPerformanceData() (*PerformanceData, error) {
-	data := &PerformanceData{
+func (pm *PerformanceMonitor) collectPerformanceData() (*model.PerformanceData, error) {
+	data := &model.PerformanceData{
 		Timestamp: time.Now(),
 	}
 
@@ -281,7 +255,7 @@ func (pm *PerformanceMonitor) collectPerformanceData() (*PerformanceData, error)
 }
 
 // accumulateData 累积性能数据
-func (pm *PerformanceMonitor) accumulateData(data *PerformanceData) {
+func (pm *PerformanceMonitor) accumulateData(data *model.PerformanceData) {
 	pm.mutex.Lock()
 	defer pm.mutex.Unlock()
 
@@ -311,7 +285,7 @@ func (pm *PerformanceMonitor) accumulateData(data *PerformanceData) {
 }
 
 // collectCPUUsage 收集CPU使用率
-func (pm *PerformanceMonitor) collectCPUUsage(data *PerformanceData) error {
+func (pm *PerformanceMonitor) collectCPUUsage(data *model.PerformanceData) error {
 	percentages, err := cpu.Percent(time.Second, false)
 	if err != nil {
 		return fmt.Errorf("failed to get CPU percentage: %w", err)
@@ -325,7 +299,7 @@ func (pm *PerformanceMonitor) collectCPUUsage(data *PerformanceData) error {
 }
 
 // collectMemoryUsage 收集内存使用率
-func (pm *PerformanceMonitor) collectMemoryUsage(data *PerformanceData) error {
+func (pm *PerformanceMonitor) collectMemoryUsage(data *model.PerformanceData) error {
 	memInfo, err := mem.VirtualMemory()
 	if err != nil {
 		return fmt.Errorf("failed to get memory info: %w", err)
@@ -336,7 +310,7 @@ func (pm *PerformanceMonitor) collectMemoryUsage(data *PerformanceData) error {
 }
 
 // collectDiskUsage 收集磁盘使用率
-func (pm *PerformanceMonitor) collectDiskUsage(data *PerformanceData) error {
+func (pm *PerformanceMonitor) collectDiskUsage(data *model.PerformanceData) error {
 	// 获取系统根目录的磁盘使用情况
 	diskUsage, err := disk.Usage("/")
 	if err != nil {
@@ -352,7 +326,7 @@ func (pm *PerformanceMonitor) collectDiskUsage(data *PerformanceData) error {
 }
 
 // collectNetworkUsage 收集网络流量
-func (pm *PerformanceMonitor) collectNetworkUsage(data *PerformanceData) error {
+func (pm *PerformanceMonitor) collectNetworkUsage(data *model.PerformanceData) error {
 	netIO, err := net.IOCounters(false)
 	if err != nil {
 		return fmt.Errorf("failed to get network IO counters: %w", err)
@@ -389,7 +363,7 @@ func (pm *PerformanceMonitor) collectNetworkUsage(data *PerformanceData) error {
 }
 
 // collectDiskIOSpeed 收集磁盘IO速度
-func (pm *PerformanceMonitor) collectDiskIOSpeed(data *PerformanceData) error {
+func (pm *PerformanceMonitor) collectDiskIOSpeed(data *model.PerformanceData) error {
 	diskIO, err := disk.IOCounters()
 	if err != nil {
 		return fmt.Errorf("failed to get disk IO counters: %w", err)
@@ -410,7 +384,7 @@ func (pm *PerformanceMonitor) collectDiskIOSpeed(data *PerformanceData) error {
 }
 
 // collectProcessCount 收集进程数量
-func (pm *PerformanceMonitor) collectProcessCount(data *PerformanceData) error {
+func (pm *PerformanceMonitor) collectProcessCount(data *model.PerformanceData) error {
 	processes, err := process.Processes()
 	if err != nil {
 		return fmt.Errorf("failed to get processes: %w", err)
@@ -421,7 +395,7 @@ func (pm *PerformanceMonitor) collectProcessCount(data *PerformanceData) error {
 }
 
 // collectLoadAverage 收集系统负载
-func (pm *PerformanceMonitor) collectLoadAverage(data *PerformanceData) error {
+func (pm *PerformanceMonitor) collectLoadAverage(data *model.PerformanceData) error {
 	loadAvg, err := load.Avg()
 	if err != nil {
 		return fmt.Errorf("failed to get load average: %w", err)

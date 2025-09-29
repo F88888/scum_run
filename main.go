@@ -2,17 +2,16 @@ package main
 
 import (
 	"flag"
-	"fmt"
 	"os"
 	"os/signal"
 	"runtime"
-	"syscall"
-	"time"
-
 	"scum_run/config"
 	"scum_run/internal/client"
+	_const "scum_run/internal/const"
 	"scum_run/internal/logger"
 	"scum_run/internal/steam"
+	"syscall"
+	"time"
 )
 
 var scumClient *client.Client
@@ -112,7 +111,7 @@ func main() {
 		cleanup()
 
 		// Give some time for cleanup to complete
-		time.Sleep(5 * time.Second)
+		time.Sleep(_const.CleanupWaitTime)
 		os.Exit(0)
 	}()
 
