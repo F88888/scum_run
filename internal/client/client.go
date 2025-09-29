@@ -189,7 +189,6 @@ func (c *Client) Start() error {
 	// 设置重连回调
 	c.wsClient.SetCallbacks(
 		func() {
-			c.logger.Info("WebSocket connected, sending authentication...")
 			// 连接成功后自动发送认证
 			authMsg := request.WebSocketMessage{
 				Type: MsgTypeAuth,
@@ -197,17 +196,14 @@ func (c *Client) Start() error {
 					"token": c.config.Token,
 				},
 			}
-			if err := c.wsClient.SendMessage(authMsg); err != nil {
+			if err = c.wsClient.SendMessage(authMsg); err != nil {
 				c.logger.Error("Failed to send authentication: %v", err)
-			} else {
-				c.logger.Info("Authentication message sent successfully")
 			}
 		},
 		func() {
 			c.logger.Warn("WebSocket disconnected")
 		},
 		func() {
-			c.logger.Info("WebSocket reconnected, re-authenticating...")
 			// 重连成功后重新发送认证
 			authMsg := request.WebSocketMessage{
 				Type: MsgTypeAuth,
@@ -215,16 +211,14 @@ func (c *Client) Start() error {
 					"token": c.config.Token,
 				},
 			}
-			if err := c.wsClient.SendMessage(authMsg); err != nil {
+			if err = c.wsClient.SendMessage(authMsg); err != nil {
 				c.logger.Error("Failed to send re-authentication: %v", err)
-			} else {
-				c.logger.Info("Re-authentication message sent successfully")
 			}
 		},
 	)
 
 	// 使用自动重连连接
-	if err := c.wsClient.ConnectWithAutoReconnect(); err != nil {
+	if err = c.wsClient.ConnectWithAutoReconnect(); err != nil {
 		return fmt.Errorf("failed to connect to WebSocket server: %w", err)
 	}
 
@@ -244,10 +238,7 @@ func (c *Client) Start() error {
 	// Start system monitoring
 	if err := c.sysMonitor.Start(); err != nil {
 		c.logger.Error("Failed to start system monitor: %v", err)
-	} else {
-		c.logger.Info("System monitor started successfully")
 	}
-
 	// WebSocket client handles heartbeat automatically
 
 	// Check if SCUM server is installed before initializing database and log monitor
@@ -257,8 +248,6 @@ func (c *Client) Start() error {
 	isInstalled := c.checkServerInstallation(steamDetector)
 
 	if !isInstalled {
-		c.logger.Warn("SCUM Dedicated Server is not installed")
-
 		// 检查是否启用自动安装
 		if c.config.AutoInstall.Enabled {
 			c.logger.Info("Auto-install is enabled, starting SCUM server installation...")
@@ -266,13 +255,10 @@ func (c *Client) Start() error {
 		} else {
 			c.logger.Info("Please install SCUM Dedicated Server first, or use the web interface to install it")
 		}
-		c.logger.Info("Database and log monitoring will be initialized when server is installed")
 	} else {
-		c.logger.Info("SCUM Dedicated Server is installed, initializing components...")
 		c.initializeServerComponents(steamDetector)
 	}
 
-	c.logger.Info("SCUM Run client started successfully")
 	return nil
 }
 
@@ -332,13 +318,10 @@ func (c *Client) Stop() {
 	}
 
 	c.wg.Wait()
-	c.logger.Info("SCUM Run client stopped")
 }
 
 // ForceStop forcefully stops the client and all associated processes
 func (c *Client) ForceStop() {
-	c.logger.Info("Force stopping SCUM Run client and all processes...")
-
 	c.cancel()
 
 	// 停止日志文件数据批量处理定时器
@@ -516,13 +499,9 @@ func (c *Client) handleServerStart() {
 		c.logMonitor = logmonitor.New(logsPath, c.logger, c.onLogUpdate)
 		if err := c.logMonitor.Start(); err != nil {
 			c.logger.Error("❌ Failed to start log monitor: %v", err)
-		} else {
-			c.logger.Info("✅ Log monitor started successfully")
 		}
 	} else if c.logMonitor == nil {
 		c.logger.Warn("⚠️ Log monitor not initialized: SCUM logs directory not available at %s", c.steamDir)
-	} else {
-		c.logger.Info("ℹ️ Log monitor already initialized")
 	}
 
 	// 先发送启动开始的响应，避免长时间无响应导致连接超时
@@ -550,7 +529,6 @@ func (c *Client) handleServerStart() {
 		go func() {
 			// 减少等待时间，提高响应速度
 			time.Sleep(_const.DefaultWaitTime)
-			c.logger.Info("Attempting to initialize database connection after server start...")
 
 			// 使用重试机制而不是单次检查
 			maxRetries := _const.ClientRetryCount
@@ -562,20 +540,15 @@ func (c *Client) handleServerStart() {
 						c.logger.Info("Database connection initialized successfully after server start")
 						return
 					}
-				} else {
-					c.logger.Info("Database file not yet available, retrying in 1 second (attempt %d/%d)", i+1, maxRetries)
 				}
 				time.Sleep(_const.ShortWaitTime)
 			}
-			c.logger.Warn("Failed to initialize database after %d attempts", maxRetries)
 		}()
 	}()
 }
 
 // handleServerStop handles server stop request
 func (c *Client) handleServerStop() {
-	c.logger.Info("Stopping SCUM server...")
-
 	if err := c.process.Stop(); err != nil {
 		c.sendResponse(MsgTypeServerStop, nil, fmt.Sprintf("Failed to stop server: %v", err))
 		return
@@ -588,8 +561,6 @@ func (c *Client) handleServerStop() {
 
 // handleServerRestart handles server restart request
 func (c *Client) handleServerRestart() {
-	c.logger.Info("Restarting SCUM server...")
-
 	// Stop first
 	if err := c.process.Stop(); err != nil {
 		c.logger.Warn("Failed to stop server gracefully: %v", err)
@@ -651,8 +622,6 @@ func (c *Client) handleDBQuery(data interface{}) {
 
 // onLogUpdate 处理SCUM日志文件更新，只发送日志文件数据给processLogLine处理
 func (c *Client) onLogUpdate(filename string, lines []string) {
-	c.logger.Info("📁 SCUM日志文件更新: %s, 新增行数: %d", filename, len(lines))
-
 	// 对日志行进行编码转换
 	var convertedLines []string
 	if _const.EncodingDetectionEnabled {
@@ -695,7 +664,6 @@ func (c *Client) sendResponse(msgType string, data interface{}, errorMsg string)
 	}
 
 	// 添加消息发送追踪
-
 	if err := c.wsClient.SendMessage(response); err != nil {
 		c.logger.Error("❌ 发送 %s 响应失败: %v", msgType, err)
 	}
@@ -711,8 +679,6 @@ func (c *Client) requestConfigSync() {
 	}
 	if err := c.wsClient.SendMessage(syncMsg); err != nil {
 		c.logger.Error("Failed to request config sync: %v", err)
-	} else {
-		c.logger.Info("Requested configuration sync from server")
 	}
 }
 
@@ -723,8 +689,6 @@ func (c *Client) handleConfigSync(data interface{}) {
 		c.logger.Error("Invalid config sync data format")
 		return
 	}
-
-	c.logger.Info("Received configuration sync from server")
 	c.updateServerConfig(configData)
 }
 
@@ -735,8 +699,6 @@ func (c *Client) handleConfigUpdate(data interface{}) {
 		c.logger.Error("Invalid config update data format")
 		return
 	}
-
-	c.logger.Info("Received configuration update from server")
 	c.updateServerConfig(configData)
 }
 
@@ -834,23 +796,17 @@ func (c *Client) handleAuthResponse(msg request.WebSocketMessage) {
 				c.logger.Info("Connected to server: %v", serverName)
 			}
 		}
-	} else {
-		c.logger.Error("Authentication failed: %s", msg.Error)
 	}
 }
 
 // handleDownloadSteamCmd handles SteamCmd download requests
 func (c *Client) handleDownloadSteamCmd(_ interface{}) {
-	c.logger.Info("Received SteamCmd download request")
-
 	// 在后台执行SteamCmd下载
 	go c.performSteamCmdDownload()
 }
 
 // performAutoInstall performs automatic SCUM server installation on startup
 func (c *Client) performAutoInstall() {
-	c.logger.Info("Starting automatic SCUM server installation...")
-
 	// 检查是否已经在安装中
 	c.installMux.Lock()
 	if c.installing {
@@ -889,8 +845,6 @@ func (c *Client) performAutoInstall() {
 
 // initializeComponentsAfterInstall initializes components after server installation
 func (c *Client) initializeComponentsAfterInstall() {
-	c.logger.Info("Initializing components after server installation...")
-
 	// 使用安装路径而不是steamDir来验证安装
 	installPath := c.config.AutoInstall.InstallPath
 	if installPath == "" {
@@ -909,8 +863,6 @@ func (c *Client) initializeComponentsAfterInstall() {
 		c.logger.Error("Server installation failed, SCUM server still not found")
 		return
 	}
-
-	c.logger.Info("SCUM Dedicated Server installation verified, initializing components...")
 
 	// 更新steamDir为实际安装路径
 	c.steamDir = absInstallPath
@@ -932,11 +884,8 @@ func (c *Client) initializeComponentsAfterInstall() {
 		}
 	}
 
-	c.logger.Info("Components initialized successfully after installation")
-
 	// 检查是否需要自动启动服务器
 	if c.config.AutoInstall.AutoStartAfterInstall {
-		c.logger.Info("Auto-start is enabled, starting SCUM server after installation...")
 		go func() {
 			// 等待一段时间让组件完全初始化
 			time.Sleep(_const.DefaultWaitTime)
@@ -947,9 +896,6 @@ func (c *Client) initializeComponentsAfterInstall() {
 
 // performServerInstallation performs the actual server installation
 func (c *Client) performServerInstallation(installPath, steamCmdPath string, forceReinstall bool) {
-	c.logger.Info("Starting SCUM server installation...")
-	c.logger.Info("Installation parameters - installPath: %s, steamCmdPath: %s, forceReinstall: %t", installPath, steamCmdPath, forceReinstall)
-
 	// 开始安装 - 不再发送状态消息
 
 	// 设置默认SteamCmd路径（如果为空）
@@ -972,18 +918,16 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	steamCmdPath = filepath.Clean(steamCmdPath)
 
 	// 检查SteamCmd是否存在
-	c.logger.Info("Checking if SteamCmd exists at: %s", steamCmdPath)
-	if _, err := os.Stat(steamCmdPath); os.IsNotExist(err) {
+	if _, err = os.Stat(steamCmdPath); os.IsNotExist(err) {
 		c.logger.Info("SteamCmd not found at path: %s, downloading...", steamCmdPath)
-		if err := c.downloadSteamCmd(); err != nil {
+		if err = c.downloadSteamCmd(); err != nil {
 			c.logger.Error("Failed to download SteamCmd: %v", err)
 			return
 		}
-		c.logger.Info("SteamCmd downloaded successfully")
 
 		// 再次检查SteamCmd是否存在，使用绝对路径
 		absDownloadPath, _ := filepath.Abs(_const.DefaultSteamCmdPath)
-		if _, err := os.Stat(absDownloadPath); os.IsNotExist(err) {
+		if _, err = os.Stat(absDownloadPath); os.IsNotExist(err) {
 			c.logger.Error("SteamCmd still not found after download at path: %s", absDownloadPath)
 			return
 		}
@@ -991,7 +935,6 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 		steamCmdPath = absDownloadPath
 		c.logger.Info("Updated SteamCmd path after download: %s", steamCmdPath)
 	}
-	c.logger.Info("SteamCmd found at: %s", steamCmdPath)
 
 	// 设置安装路径
 	if installPath == "" {
@@ -1009,15 +952,12 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 
 	// 确保安装路径使用正确的分隔符
 	installPath = filepath.Clean(installPath)
-	c.logger.Info("Using install path: %s", installPath)
 
 	// 创建安装目录
-	if err := os.MkdirAll(installPath, 0755); err != nil {
+	if err = os.MkdirAll(installPath, 0755); err != nil {
 		c.logger.Error("Failed to create install directory: %v", err)
 		return
 	}
-
-	c.logger.Info("Installing SCUM server...")
 
 	// 构建SteamCmd命令
 	args := []string{
@@ -2392,7 +2332,6 @@ func (c *Client) sendBatchProcessOutput(outputs []string) {
 		"batch":   true, // 标识这是批量数据
 	}
 
-	c.logger.Info("📡 发送批量进程输出到服务器: %d 条输出", len(outputContents))
 	c.sendResponse(MsgTypeProcessOutput, outputData, "")
 }
 
@@ -2717,8 +2656,6 @@ func (c *Client) handleSystemMonitorData(data *request.SystemMonitorData) {
 
 // handleBackupStart 处理开始备份请求
 func (c *Client) handleBackupStart(data interface{}) {
-	c.logger.Info("Received backup start request")
-
 	backupData, ok := data.(map[string]interface{})
 	if !ok {
 		c.logger.Error("Invalid backup data format")
@@ -2782,7 +2719,6 @@ func (c *Client) handleBackupStart(data interface{}) {
 
 // handleBackupStop 处理停止备份请求
 func (c *Client) handleBackupStop(data interface{}) {
-	c.logger.Info("Received backup stop request")
 	// 这里可以实现停止备份的逻辑
 	c.sendBackupResponse(MsgTypeBackupStatus, map[string]interface{}{
 		"success": true,
@@ -2792,7 +2728,6 @@ func (c *Client) handleBackupStop(data interface{}) {
 
 // handleBackupStatus 处理备份状态请求
 func (c *Client) handleBackupStatus(data interface{}) {
-	c.logger.Info("Received backup status request")
 	// 返回当前备份状态
 	c.sendBackupResponse(MsgTypeBackupStatus, map[string]interface{}{
 		"success": true,
@@ -2803,7 +2738,6 @@ func (c *Client) handleBackupStatus(data interface{}) {
 
 // handleBackupList 处理备份列表请求
 func (c *Client) handleBackupList(data interface{}) {
-	c.logger.Info("Received backup list request")
 	// 这里可以实现获取备份列表的逻辑
 	c.sendBackupResponse(MsgTypeBackupList, map[string]interface{}{
 		"success": true,
@@ -2814,7 +2748,6 @@ func (c *Client) handleBackupList(data interface{}) {
 
 // handleBackupDelete 处理删除备份请求
 func (c *Client) handleBackupDelete(data interface{}) {
-	c.logger.Info("Received backup delete request")
 	// 这里可以实现删除备份的逻辑
 	c.sendBackupResponse(MsgTypeBackupStatus, map[string]interface{}{
 		"success": true,
@@ -2824,8 +2757,6 @@ func (c *Client) handleBackupDelete(data interface{}) {
 
 // executeBackup 执行备份操作
 func (c *Client) executeBackup(serverID uint, backupPath, description string) {
-	c.logger.Info("Starting backup for server %d, path: %s", serverID, backupPath)
-
 	// 创建性能监控器
 	perfMonitor := monitor.NewPerformanceMonitor(c.logger, 10*time.Second) // 每10秒监控一次
 	perfMonitor.Start()
@@ -2960,8 +2891,6 @@ func (c *Client) executeBackup(serverID uint, backupPath, description string) {
 		"file_path": filePath,
 		"result":    backupResult,
 	})
-
-	c.logger.Info("Backup completed successfully for server %d: %s", serverID, fileName)
 }
 
 // createBackupArchive 创建备份压缩包
@@ -3109,10 +3038,8 @@ func (c *Client) cleanOldBackups(backupDir string, serverID uint, keepCount int)
 	if len(matches) > keepCount {
 		toDelete := matches[keepCount:]
 		for _, file := range toDelete {
-			if err := os.Remove(file); err != nil {
+			if err = os.Remove(file); err != nil {
 				c.logger.Warn("Failed to delete old backup file %s: %v", file, err)
-			} else {
-				c.logger.Info("Deleted old backup file: %s", file)
 			}
 		}
 	}
@@ -3165,14 +3092,11 @@ func (c *Client) getDefaultBackupPath(serverID uint) string {
 	if _, err := os.Stat(scumSavePath); err == nil {
 		// SCUM 自建服：备份路径是 \SCUM\Saved\SaveFiles
 		backupPath = scumSavePath
-		c.logger.Info("Detected SCUM self-hosted server, using SaveFiles path")
 	} else {
 		// CMD 服务器：备份路径是根目录
 		backupPath = installPath
-		c.logger.Info("Detected CMD server, using root directory")
 	}
 
-	c.logger.Info("Server %d backup path: %s (install path: %s)", serverID, backupPath, installPath)
 	return backupPath
 }
 
@@ -3527,7 +3451,6 @@ func (c *Client) handleCloudUpload(data interface{}) {
 		return
 	}
 
-	c.logger.Info("Successfully uploaded file to cloud: %s -> %s", fullPath, cloudPath)
 	c.sendResponse(MsgTypeCloudUpload, map[string]interface{}{
 		"transfer_id": transferID,
 		"cloud_path":  cloudPath,
@@ -3627,7 +3550,6 @@ func (c *Client) uploadToQiniuWithRetry(fileData []byte, cloudPath, token, key, 
 	err := c.uploadToQiniuURL(fileData, cloudPath, token, key, uploadURL)
 	if err == nil {
 		// 上传成功
-		c.logger.Info("Successfully uploaded file to Qiniu: %s (%d bytes)", cloudPath, len(fileData))
 		return nil
 	}
 
@@ -3876,7 +3798,6 @@ func (c *Client) uploadToAliyun(fileData []byte, cloudPath string, uploadSignatu
 		return fmt.Errorf("aliyun OSS upload failed with status %d: %s", resp.StatusCode, string(responseBody))
 	}
 
-	c.logger.Info("Successfully uploaded file to Aliyun OSS: %s (%d bytes)", cloudPath, len(fileData))
 	return nil
 }
 
