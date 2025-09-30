@@ -614,26 +614,60 @@ func (c *Client) handleDBQuery(data interface{}) {
 	// 获取query_id用于响应
 	queryID, _ := queryData["query_id"].(string)
 
-	result, err := c.db.Query(query)
-	if err != nil {
-		// 在错误响应中包含query_id
-		errorData := map[string]interface{}{}
-		if queryID != "" {
-			errorData["query_id"] = queryID
+	// 智能判断是查询还是命令
+	queryUpper := strings.ToUpper(strings.TrimSpace(query))
+	isCommand := strings.HasPrefix(queryUpper, "INSERT") ||
+		strings.HasPrefix(queryUpper, "UPDATE") ||
+		strings.HasPrefix(queryUpper, "DELETE") ||
+		strings.HasPrefix(queryUpper, "CREATE") ||
+		strings.HasPrefix(queryUpper, "DROP") ||
+		strings.HasPrefix(queryUpper, "ALTER")
+
+	if isCommand {
+		// 执行命令
+		rowsAffected, err := c.db.Execute(query)
+		if err != nil {
+			// 在错误响应中包含query_id
+			errorData := map[string]interface{}{}
+			if queryID != "" {
+				errorData["query_id"] = queryID
+			}
+			c.sendResponse(MsgTypeDBQuery, errorData, fmt.Sprintf("Command failed: %v", err))
+			return
 		}
-		c.sendResponse(MsgTypeDBQuery, errorData, fmt.Sprintf("Query failed: %v", err))
-		return
-	}
 
-	// 在成功响应中包含query_id和result
-	responseData := map[string]interface{}{
-		"result": result,
-	}
-	if queryID != "" {
-		responseData["query_id"] = queryID
-	}
+		// 在成功响应中包含query_id和rows_affected
+		responseData := map[string]interface{}{
+			"rows_affected": rowsAffected,
+		}
+		if queryID != "" {
+			responseData["query_id"] = queryID
+		}
 
-	c.sendResponse(MsgTypeDBQuery, responseData, "")
+		c.sendResponse(MsgTypeDBQuery, responseData, "")
+	} else {
+		// 执行查询
+		result, err := c.db.Query(query)
+		if err != nil {
+			// 在错误响应中包含query_id
+			errorData := map[string]interface{}{}
+			if queryID != "" {
+				errorData["query_id"] = queryID
+			}
+			c.sendResponse(MsgTypeDBQuery, errorData, fmt.Sprintf("Query failed: %v", err))
+			return
+		}
+
+		// 在成功响应中包含query_id和result
+		responseData := map[string]interface{}{
+			"result": result,
+		}
+		if queryID != "" {
+			responseData["query_id"] = queryID
+		}
+
+		c.sendResponse(MsgTypeDBQuery, responseData, "")
+	}
 }
 
 // onLogUpdate 处理SCUM日志文件更新，只发送日志文件数据给processLogLine处理
