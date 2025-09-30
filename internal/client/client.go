@@ -3803,7 +3803,6 @@ func (c *Client) uploadToAliyun(fileData []byte, cloudPath string, uploadSignatu
 
 // handleCloudDownload 处理云存储下载请求
 func (c *Client) handleCloudDownload(data interface{}) {
-
 	dataMap, ok := data.(map[string]interface{})
 	if !ok {
 		c.logger.Error("Invalid cloud download request data")
@@ -3811,30 +3810,148 @@ func (c *Client) handleCloudDownload(data interface{}) {
 		return
 	}
 
-	filePath, _ := dataMap["file_path"].(string)
-	transferID, _ := dataMap["transfer_id"].(string)
+	targetPath, _ := dataMap["target_path"].(string)
+	downloadURL, _ := dataMap["download_url"].(string)
+	cloudPath, _ := dataMap["cloud_path"].(string)
 
-	if filePath == "" {
-		c.logger.Error("File path is required")
-		c.sendResponse(MsgTypeCloudDownload, map[string]interface{}{
-			"transfer_id": transferID,
-		}, "File path is required")
+	if targetPath == "" {
+		c.logger.Error("Target path is required")
+		c.sendResponse(MsgTypeCloudDownload, nil, "Target path is required")
+		return
+	}
+
+	if downloadURL == "" {
+		c.logger.Error("Download URL is required")
+		c.sendResponse(MsgTypeCloudDownload, nil, "Download URL is required")
 		return
 	}
 
 	// 构建完整文件路径
 	var fullPath string
-	if strings.HasPrefix(filePath, "/") {
-		// 绝对路径，直接使用
-		fullPath = filePath
+	if strings.HasPrefix(targetPath, "/") {
+		// 绝对路径，将其视为相对于steamDir的路径
+		relativePath := strings.TrimPrefix(targetPath, "/")
+		fullPath = filepath.Join(c.steamDir, relativePath)
 	} else {
 		// 相对路径，基于Steam目录
-		fullPath = filepath.Join(c.steamDir, filePath)
+		fullPath = filepath.Join(c.steamDir, targetPath)
 	}
 
-	c.logger.Warn("Cloud download not implemented yet")
+	// 验证最终路径是否在允许的目录内
+	cleanFullPath := filepath.Clean(fullPath)
+	cleanSteamDir := filepath.Clean(c.steamDir)
+	if !strings.HasPrefix(cleanFullPath, cleanSteamDir) {
+		c.logger.Error("Access denied: path outside Steam directory: %s (resolved to %s, steamDir: %s)", targetPath, cleanFullPath, cleanSteamDir)
+		c.sendResponse(MsgTypeCloudDownload, nil, "Access denied: path outside allowed directory")
+		return
+	}
+
+	// 确保目标目录存在
+	targetDir := filepath.Dir(fullPath)
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		c.logger.Error("Failed to create target directory %s: %v", targetDir, err)
+		c.sendResponse(MsgTypeCloudDownload, nil, fmt.Sprintf("Failed to create target directory: %v", err))
+		return
+	}
+
+	c.logger.Info("开始从云存储下载文件: %s -> %s", cloudPath, fullPath)
+
+	// 下载文件
+	err := c.downloadFileFromURL(downloadURL, fullPath)
+	if err != nil {
+		c.logger.Error("Failed to download file from cloud: %v", err)
+		c.sendResponse(MsgTypeCloudDownload, map[string]interface{}{
+			"target_path": targetPath,
+			"cloud_path":  cloudPath,
+		}, fmt.Sprintf("Failed to download file from cloud: %v", err))
+		return
+	}
+
+	c.logger.Info("云存储文件下载完成: %s", fullPath)
 	c.sendResponse(MsgTypeCloudDownload, map[string]interface{}{
-		"transfer_id": transferID,
+		"target_path": targetPath,
+		"cloud_path":  cloudPath,
 		"file_path":   fullPath,
-	}, "Cloud download not implemented yet")
+	}, "")
+}
+
+// downloadFileFromURL 从URL下载文件到指定路径
+func (c *Client) downloadFileFromURL(url, filepath string) error {
+	// 创建 HTTP 请求
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute) // 10分钟超时
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("创建请求失败: %w", err)
+	}
+
+	// 设置 User-Agent
+	req.Header.Set("User-Agent", "SCUM-Run-Client/1.0")
+
+	// 发送请求
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("请求失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// 检查状态码
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("下载失败，HTTP状态码: %d", resp.StatusCode)
+	}
+
+	// 创建目标文件
+	out, err := os.Create(filepath)
+	if err != nil {
+		return fmt.Errorf("创建文件失败: %w", err)
+	}
+	defer out.Close()
+
+	// 获取文件大小用于显示进度
+	contentLength := resp.ContentLength
+
+	// 创建进度报告器
+	progressReader := &progressReader{
+		Reader:        resp.Body,
+		contentLength: contentLength,
+		logger:        c.logger,
+	}
+
+	// 复制文件内容
+	_, err = io.Copy(out, progressReader)
+	if err != nil {
+		return fmt.Errorf("下载文件内容失败: %w", err)
+	}
+
+	c.logger.Info("文件下载完成: %s", filepath)
+	return nil
+}
+
+// progressReader 实现下载进度显示
+type progressReader struct {
+	io.Reader
+	contentLength int64
+	bytesRead     int64
+	logger        *logger.Logger
+	lastReport    time.Time
+}
+
+func (pr *progressReader) Read(p []byte) (int, error) {
+	n, err := pr.Reader.Read(p)
+	pr.bytesRead += int64(n)
+
+	// 每5秒报告一次进度
+	now := time.Now()
+	if now.Sub(pr.lastReport) >= 5*time.Second {
+		if pr.contentLength > 0 {
+			percentage := float64(pr.bytesRead) / float64(pr.contentLength) * 100
+			pr.logger.Info("下载进度: %.1f%% (%d/%d 字节)", percentage, pr.bytesRead, pr.contentLength)
+		} else {
+			pr.logger.Info("已下载: %d 字节", pr.bytesRead)
+		}
+		pr.lastReport = now
+	}
+
+	return n, err
 }
