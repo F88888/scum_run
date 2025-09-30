@@ -611,13 +611,29 @@ func (c *Client) handleDBQuery(data interface{}) {
 		return
 	}
 
+	// 获取query_id用于响应
+	queryID, _ := queryData["query_id"].(string)
+
 	result, err := c.db.Query(query)
 	if err != nil {
-		c.sendResponse(MsgTypeDBQuery, nil, fmt.Sprintf("Query failed: %v", err))
+		// 在错误响应中包含query_id
+		errorData := map[string]interface{}{}
+		if queryID != "" {
+			errorData["query_id"] = queryID
+		}
+		c.sendResponse(MsgTypeDBQuery, errorData, fmt.Sprintf("Query failed: %v", err))
 		return
 	}
 
-	c.sendResponse(MsgTypeDBQuery, result, "")
+	// 在成功响应中包含query_id和result
+	responseData := map[string]interface{}{
+		"result": result,
+	}
+	if queryID != "" {
+		responseData["query_id"] = queryID
+	}
+
+	c.sendResponse(MsgTypeDBQuery, responseData, "")
 }
 
 // onLogUpdate 处理SCUM日志文件更新，只发送日志文件数据给processLogLine处理
