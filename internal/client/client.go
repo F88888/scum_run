@@ -1179,14 +1179,52 @@ func (c *Client) handleServerUpdate(data interface{}) {
 func (c *Client) handleServerUpdateCheck() {
 	c.logger.Info("Checking for SCUM server updates...")
 
-	// 这里可以实现检查更新的逻辑
-	// 比如检查Steam上的最新版本信息
+	// 检查SteamCmd是否可用
+	steamCmdPath := c.config.AutoInstall.SteamCmdPath
+	if steamCmdPath == "" {
+		steamCmdPath = _const.DefaultSteamCmdPath
+	}
 
-	c.sendResponse(MsgTypeServerUpdate, map[string]interface{}{
-		"type":    "check",
-		"status":  "completed",
-		"message": "Update check completed",
-	}, "")
+	// 验证SteamCmd是否存在
+	if err := c.validateSteamCmdExecutable(steamCmdPath); err != nil {
+		c.logger.Error("SteamCmd validation failed: %v", err)
+		c.sendResponse(MsgTypeServerUpdate, map[string]interface{}{
+			"type":    "check",
+			"status":  "failed",
+			"message": "SteamCmd not available: " + err.Error(),
+		}, "")
+		return
+	}
+
+	// 使用SteamCmd检查更新
+	updateAvailable, err := c.checkSteamUpdate(steamCmdPath)
+	if err != nil {
+		c.logger.Error("Failed to check for updates: %v", err)
+		c.sendResponse(MsgTypeServerUpdate, map[string]interface{}{
+			"type":    "check",
+			"status":  "failed",
+			"message": "Update check failed: " + err.Error(),
+		}, "")
+		return
+	}
+
+	if updateAvailable {
+		c.logger.Info("SCUM server update is available")
+		c.sendResponse(MsgTypeServerUpdate, map[string]interface{}{
+			"type":             "check",
+			"status":           "completed",
+			"message":          "Update available",
+			"update_available": true,
+		}, "")
+	} else {
+		c.logger.Info("SCUM server is up to date")
+		c.sendResponse(MsgTypeServerUpdate, map[string]interface{}{
+			"type":             "check",
+			"status":           "completed",
+			"message":          "No updates available",
+			"update_available": false,
+		}, "")
+	}
 }
 
 // handleServerUpdateInstall performs server update installation
@@ -1231,7 +1269,14 @@ func (c *Client) handleServerUpdateInstall(_ map[string]interface{}) {
 
 	// 执行更新安装
 	go func() {
+		// 临时禁用自动启动，避免更新后自动启动服务器
+		originalAutoStart := c.config.AutoInstall.AutoStartAfterInstall
+		c.config.AutoInstall.AutoStartAfterInstall = false
+
 		c.performServerInstallation(installPath, steamCmdPath, forceReinstall)
+
+		// 恢复原始配置
+		c.config.AutoInstall.AutoStartAfterInstall = originalAutoStart
 
 		// 安装完成后重新初始化组件
 		c.initializeComponentsAfterInstall()
@@ -1239,7 +1284,7 @@ func (c *Client) handleServerUpdateInstall(_ map[string]interface{}) {
 		c.sendResponse(MsgTypeServerUpdate, map[string]interface{}{
 			"type":    "install",
 			"status":  "completed",
-			"message": "Server update installation completed",
+			"message": "Server update installation completed. Server is stopped and ready for manual start.",
 		}, "")
 	}()
 
@@ -1948,15 +1993,8 @@ func (c *Client) handleFileWrite(data interface{}) {
 		return
 	}
 
-	if content == "" {
-		c.logger.Error("File content is required")
-		errorData := map[string]interface{}{}
-		if requestID != "" {
-			errorData["request_id"] = requestID
-		}
-		c.sendResponse(MsgTypeFileWrite, errorData, "File content is required")
-		return
-	}
+	// 允许空内容，用户可能想要清空文件
+	// 不再检查 content 是否为空
 
 	if encoding == "" {
 		encoding = "utf-8"
@@ -3527,9 +3565,8 @@ func (c *Client) uploadFileToCloud(filePath, cloudPath, transferID string, uploa
 		return fmt.Errorf("failed to read file %s: %w", filePath, err)
 	}
 
-	if len(fileData) == 0 {
-		return fmt.Errorf("file %s is empty", filePath)
-	}
+	// 空文件也是合法的，允许上传
+	// 不再检查文件是否为空，因为配置文件等可能确实为空
 
 	// 检测云存储提供商
 	provider := c.detectCloudProvider(uploadSignature)
@@ -4004,4 +4041,59 @@ func (pr *progressReader) Read(p []byte) (int, error) {
 	}
 
 	return n, err
+}
+
+// checkSteamUpdate checks if SCUM server update is available using SteamCmd
+func (c *Client) checkSteamUpdate(steamCmdPath string) (bool, error) {
+	// 获取安装路径
+	installPath := c.config.AutoInstall.InstallPath
+	if installPath == "" {
+		installPath = _const.DefaultInstallPath
+	}
+
+	// 构建SteamCmd命令来检查更新
+	args := []string{
+		"+force_install_dir", installPath,
+		"+login", "anonymous",
+		"+app_info_update", "1",
+		"+app_info_print", _const.SCUMServerAppID,
+		"+quit",
+	}
+
+	c.logger.Info("Checking for updates with SteamCmd: %s %v", steamCmdPath, args)
+
+	// 执行SteamCmd命令
+	cmd := exec.Command(steamCmdPath, args...)
+	steamCmdDir := filepath.Dir(steamCmdPath)
+	cmd.Dir = steamCmdDir
+
+	// 捕获输出
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	// 执行命令
+	err := cmd.Run()
+	if err != nil {
+		c.logger.Error("SteamCmd update check failed: %v, stderr: %s", err, stderr.String())
+		return false, fmt.Errorf("SteamCmd execution failed: %w", err)
+	}
+
+	// 分析输出以确定是否有更新
+	output := stdout.String()
+	c.logger.Debug("SteamCmd output: %s", output)
+
+	// 检查输出中是否包含更新信息
+	// SteamCmd会在有更新时输出特定的信息
+	// 这里我们使用一个简单的方法：检查是否包含"update"相关的关键词
+	hasUpdate := strings.Contains(strings.ToLower(output), "update") &&
+		!strings.Contains(strings.ToLower(output), "no update")
+
+	if hasUpdate {
+		c.logger.Info("SteamCmd detected available update")
+	} else {
+		c.logger.Info("SteamCmd reports no update available")
+	}
+
+	return hasUpdate, nil
 }
