@@ -3565,9 +3565,6 @@ func (c *Client) uploadFileToCloud(filePath, cloudPath, transferID string, uploa
 		return fmt.Errorf("failed to read file %s: %w", filePath, err)
 	}
 
-	// 空文件也是合法的，允许上传
-	// 不再检查文件是否为空，因为配置文件等可能确实为空
-
 	// 检测云存储提供商
 	provider := c.detectCloudProvider(uploadSignature)
 	if provider == "" {

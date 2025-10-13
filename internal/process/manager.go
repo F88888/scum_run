@@ -207,12 +207,24 @@ func (m *Manager) Stop() error {
 	m.logger.Info("Stopping SCUM server (PID: %d)", m.cmd.Process.Pid)
 
 	// Try graceful shutdown first
-	// 注意：不要使用 os.Interrupt 或 syscall.SIGTERM，因为这些信号会被scum_run主程序捕获
-	// 使用更精确的信号发送方式，只影响SCUM服务器进程
+	// 注意：避免使用可能影响scum_run主程序的信号
+	// 优先使用进程特定的停止方法
 	if runtime.GOOS == "windows" {
-		// Windows下使用Ctrl+C信号，但只发送给子进程
-		if err := m.cmd.Process.Signal(os.Interrupt); err != nil {
-			m.logger.Warn("Failed to send interrupt signal: %v", err)
+		// Windows下先尝试优雅关闭，避免使用可能影响主程序的信号
+		// 直接关闭stdin管道，让SCUM服务器自然退出
+		if m.stdin != nil {
+			m.stdin.Close()
+			m.stdin = nil
+		}
+
+		// 等待一段时间让进程自然退出
+		time.Sleep(2 * time.Second)
+
+		// 如果进程仍然运行，再尝试发送信号
+		if m.cmd.Process != nil {
+			if err := m.cmd.Process.Signal(os.Interrupt); err != nil {
+				m.logger.Warn("Failed to send interrupt signal: %v", err)
+			}
 		}
 	} else {
 		// Unix系统下使用SIGTERM，但只发送给子进程
@@ -313,9 +325,9 @@ func (m *Manager) createProcessGroup() error {
 		return nil
 	}
 
-	// On Windows, we'll rely on taskkill with /T flag to kill the process tree
-	// This is simpler and more reliable than trying to create process groups
-	m.logger.Info("Process group management will be handled by taskkill /T")
+	// On Windows, we'll use safer process management methods
+	// This avoids using /T flag which could affect the scum_run main process
+	m.logger.Info("Process group management will use safe individual process killing")
 	return nil
 }
 
@@ -325,13 +337,9 @@ func (m *Manager) killChildProcesses(parentPID int) {
 		return
 	}
 
-	// Use taskkill to kill the process tree
-	cmd := exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprintf("%d", parentPID))
-	if err := cmd.Run(); err != nil {
-		m.logger.Warn("Failed to kill process tree: %v", err)
-	} else {
-		m.logger.Info("Successfully killed process tree for PID: %d", parentPID)
-	}
+	// 注意：避免使用 /T 参数，因为它可能影响scum_run主程序
+	// 使用更安全的方法逐个杀死子进程
+	m.killScumChildProcesses(parentPID)
 }
 
 // killProcessTree provides enhanced process tree cleanup for Windows
@@ -342,16 +350,62 @@ func (m *Manager) killProcessTree(pid int) {
 
 	m.logger.Info("Attempting to kill process tree for PID: %d", pid)
 
-	// First try taskkill with /T flag to kill the entire process tree
-	cmd := exec.Command("taskkill", "/F", "/T", "/PID", fmt.Sprintf("%d", pid))
+	// 注意：避免使用 /T 参数，因为它可能影响scum_run主程序
+	// 先尝试只杀死指定的进程
+	cmd := exec.Command("taskkill", "/F", "/PID", fmt.Sprintf("%d", pid))
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		m.logger.Warn("taskkill /T failed: %v, output: %s", err, string(output))
+		m.logger.Warn("taskkill failed for PID %d: %v, output: %s", pid, err, string(output))
 
 		// Fallback: try to kill individual SCUM processes
 		m.killScumProcesses()
 	} else {
-		m.logger.Info("Successfully killed process tree: %s", string(output))
+		m.logger.Info("Successfully killed process PID %d: %s", pid, string(output))
+
+		// 等待一段时间，然后检查是否还有子进程需要清理
+		time.Sleep(1 * time.Second)
+
+		// 尝试清理可能的子进程，但不使用 /T 参数
+		m.killScumChildProcesses(pid)
+	}
+}
+
+// killScumChildProcesses kills child processes of a specific parent PID
+func (m *Manager) killScumChildProcesses(parentPID int) {
+	if runtime.GOOS != "windows" {
+		return
+	}
+
+	m.logger.Info("Attempting to kill child processes of PID: %d", parentPID)
+
+	// 使用wmic命令查找子进程，然后逐个杀死
+	// 这比使用 /T 参数更安全，不会影响scum_run主程序
+	cmd := exec.Command("wmic", "process", "where", fmt.Sprintf("ParentProcessId=%d", parentPID), "get", "ProcessId", "/format:value")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		m.logger.Debug("Failed to get child processes: %v", err)
+		return
+	}
+
+	// 解析输出，提取子进程PID
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "ProcessId=") {
+			parts := strings.Split(line, "=")
+			if len(parts) == 2 {
+				childPID := strings.TrimSpace(parts[1])
+				if childPID != "" && childPID != "0" {
+					m.logger.Info("Killing child process PID: %s", childPID)
+					killCmd := exec.Command("taskkill", "/F", "/PID", childPID)
+					killOutput, killErr := killCmd.CombinedOutput()
+					if killErr != nil {
+						m.logger.Debug("Failed to kill child process %s: %v, output: %s", childPID, killErr, string(killOutput))
+					} else {
+						m.logger.Info("Successfully killed child process %s: %s", childPID, string(killOutput))
+					}
+				}
+			}
+		}
 	}
 }
 
