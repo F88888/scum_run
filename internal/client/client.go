@@ -407,6 +407,7 @@ func (c *Client) handleMessages() {
 
 // handleMessage handles a single WebSocket message
 func (c *Client) handleMessage(msg request.WebSocketMessage) {
+	c.logger.Info("🔍 [DEBUG] 接收到WebSocket消息: type=%s, data=%+v", msg.Type, msg.Data)
 
 	switch msg.Type {
 	case MsgTypeServerStart:
@@ -483,6 +484,7 @@ func (c *Client) handleMessage(msg request.WebSocketMessage) {
 
 // handleServerStart handles server start request
 func (c *Client) handleServerStart() {
+	c.logger.Info("🔍 [DEBUG] 接收到服务器启动请求")
 	c.logger.Info("Starting SCUM server...")
 
 	// Check if SCUM server is installed before attempting to start
@@ -549,6 +551,7 @@ func (c *Client) handleServerStart() {
 
 // handleServerStop handles server stop request
 func (c *Client) handleServerStop() {
+	c.logger.Info("🔍 [DEBUG] 接收到服务器停止请求")
 	if err := c.process.Stop(); err != nil {
 		c.sendResponse(MsgTypeServerStop, nil, fmt.Sprintf("Failed to stop server: %v", err))
 		return
@@ -561,6 +564,7 @@ func (c *Client) handleServerStop() {
 
 // handleServerRestart handles server restart request
 func (c *Client) handleServerRestart() {
+	c.logger.Info("🔍 [DEBUG] 接收到服务器重启请求")
 	// Stop first
 	if err := c.process.Stop(); err != nil {
 		c.logger.Warn("Failed to stop server gracefully: %v", err)
@@ -1567,6 +1571,8 @@ func (c *Client) handleProcessOutput(_ string, line string) {
 
 // handleClientUpdate handles client update requests
 func (c *Client) handleClientUpdate(data interface{}) {
+	c.logger.Info("🔍 [DEBUG] 接收到客户端更新消息，数据: %+v", data)
+
 	updateData, ok := data.(map[string]interface{})
 	if !ok {
 		c.logger.Error("❌ 接收到无效的更新请求数据格式")
@@ -1588,7 +1594,7 @@ func (c *Client) handleClientUpdate(data interface{}) {
 		return
 	}
 
-	c.logger.Info("🔄 接收到客户端更新请求: action=%s", action)
+	c.logger.Info("🔄 接收到客户端更新请求: action=%s, 完整数据: %+v", action, updateData)
 
 	switch action {
 	case "update":
@@ -1726,6 +1732,7 @@ func (c *Client) performSelfUpdateWithURL(downloadURL string) {
 	go func() {
 		time.Sleep(_const.ShortWaitTime) // 减少等待时间，确保更新器脚本先启动
 		c.logger.Info("🔄 正在退出以进行更新...")
+		c.logger.Info("🔍 [DEBUG] 即将执行 os.Exit(0) 进行客户端更新")
 		// 使用 syscall.Exit 强制退出，不等待子进程
 		if runtime.GOOS == "windows" {
 			syscall.Exit(0)
@@ -1810,6 +1817,7 @@ func (c *Client) performSelfUpdate() {
 	go func() {
 		time.Sleep(_const.DefaultWaitTime)
 		c.logger.Info("Exiting for update...")
+		c.logger.Info("🔍 [DEBUG] 即将执行 os.Exit(0) 进行客户端更新 (legacy方法)")
 		os.Exit(0)
 	}()
 }
