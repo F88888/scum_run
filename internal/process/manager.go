@@ -152,6 +152,14 @@ func (m *Manager) Start() error {
 		m.logger.Info("Setting working directory to: %s", execDir)
 	}
 
+	// On Windows, create the process in a new console so it can receive Ctrl+C
+	if runtime.GOOS == "windows" {
+		m.cmd.SysProcAttr = &syscall.SysProcAttr{
+			CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
+		}
+		m.logger.Info("Process will be created in new process group for Ctrl+C handling")
+	}
+
 	// Set up stdin, stdout and stderr pipes
 	stdin, err := m.cmd.StdinPipe()
 	if err != nil {
@@ -204,26 +212,48 @@ func (m *Manager) Stop() error {
 		return fmt.Errorf("server is not running")
 	}
 
-	m.logger.Info("Stopping SCUM server (PID: %d)", m.cmd.Process.Pid)
+	pid := m.cmd.Process.Pid
+	m.logger.Info("Stopping SCUM server (PID: %d)", pid)
 
 	// Try graceful shutdown first
 	// 注意：避免使用可能影响scum_run主程序的信号
 	// 优先使用进程特定的停止方法
 	if runtime.GOOS == "windows" {
-		// Windows下先尝试优雅关闭，避免使用可能影响主程序的信号
-		// 直接关闭stdin管道，让SCUM服务器自然退出
-		if m.stdin != nil {
-			m.stdin.Close()
-			m.stdin = nil
-		}
+		// Windows下使用Ctrl+C信号优雅关闭SCUM服务器
+		// 这是SCUM服务器正确的关闭方式，能够保存游戏数据
+		m.logger.Info("Sending Ctrl+C to SCUM server process (PID: %d) for graceful shutdown", pid)
 
-		// 等待一段时间让进程自然退出
-		time.Sleep(2 * time.Second)
+		// 尝试发送Ctrl+C信号
+		if err := m.sendCtrlC(pid); err != nil {
+			m.logger.Warn("Failed to send Ctrl+C via console API: %v, will try alternative method", err)
 
-		// 如果进程仍然运行，再尝试发送信号
-		if m.cmd.Process != nil {
-			if err := m.cmd.Process.Signal(os.Interrupt); err != nil {
-				m.logger.Warn("Failed to send interrupt signal: %v", err)
+			// 如果Ctrl+C发送失败，尝试关闭stdin让进程自然退出
+			if m.stdin != nil {
+				m.logger.Info("Closing stdin pipe as fallback method")
+				m.stdin.Close()
+				m.stdin = nil
+			}
+
+			// 等待一段时间看进程是否自然退出
+			time.Sleep(2 * time.Second)
+
+			// 如果进程还在运行，使用taskkill作为最后手段
+			// 但这可能导致数据丢失
+			if m.cmd.Process != nil {
+				m.logger.Warn("Process still running, using taskkill as last resort (may cause data loss)")
+				cmd := exec.Command("taskkill", "/PID", fmt.Sprintf("%d", pid))
+				output, err := cmd.CombinedOutput()
+				if err != nil {
+					m.logger.Warn("taskkill command failed: %v, output: %s", err, string(output))
+				} else {
+					m.logger.Info("taskkill sent to process %d: %s", pid, string(output))
+				}
+			}
+		} else {
+			// Ctrl+C发送成功，关闭stdin
+			if m.stdin != nil {
+				m.stdin.Close()
+				m.stdin = nil
 			}
 		}
 	} else {

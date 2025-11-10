@@ -1301,8 +1301,11 @@ func (c *Client) handleServerUpdateInstall(_ map[string]interface{}) {
 
 // handleScheduledRestart handles scheduled restart requests
 func (c *Client) handleScheduledRestart(data interface{}) {
+	c.logger.Info("📅 [定时重启] 接收到定时重启请求，数据: %+v", data)
+
 	restartData, ok := data.(map[string]interface{})
 	if !ok {
+		c.logger.Error("📅 [定时重启] 数据格式错误，无法解析")
 		c.sendResponse(MsgTypeScheduledRestart, nil, "Invalid restart request data format")
 		return
 	}
@@ -1312,10 +1315,21 @@ func (c *Client) handleScheduledRestart(data interface{}) {
 	if reasonStr, exists := restartData["reason"].(string); exists && reasonStr != "" {
 		reason = reasonStr
 	}
+	c.logger.Info("📅 [定时重启] 重启原因: %s", reason)
 
 	// 检查服务器是否在运行
-	if c.process == nil || !c.process.IsRunning() {
-		c.logger.Info("Server is not running, skipping scheduled restart")
+	if c.process == nil {
+		c.logger.Warn("📅 [定时重启] 进程管理器为空，无法重启")
+		c.sendResponse(MsgTypeScheduledRestart, map[string]interface{}{
+			"status":  "skipped",
+			"reason":  "Process manager is nil",
+			"message": "Scheduled restart skipped - process manager is nil",
+		}, "")
+		return
+	}
+
+	if !c.process.IsRunning() {
+		c.logger.Info("📅 [定时重启] 服务器未运行，跳过重启")
 		c.sendResponse(MsgTypeScheduledRestart, map[string]interface{}{
 			"status":  "skipped",
 			"reason":  "Server is not running",
@@ -1325,15 +1339,19 @@ func (c *Client) handleScheduledRestart(data interface{}) {
 	}
 
 	// 执行重启
+	c.logger.Info("📅 [定时重启] 开始执行重启操作...")
 	if err := c.process.Restart(); err != nil {
+		c.logger.Error("📅 [定时重启] 重启失败: %v", err)
 		c.sendResponse(MsgTypeScheduledRestart, nil, fmt.Sprintf("Failed to restart server: %v", err))
 		return
 	}
 
+	newPID := c.process.GetPID()
+	c.logger.Info("📅 [定时重启] 重启成功，新进程PID: %d", newPID)
 	c.sendResponse(MsgTypeScheduledRestart, map[string]interface{}{
 		"status":  "restarted",
 		"reason":  reason,
-		"pid":     c.process.GetPID(),
+		"pid":     newPID,
 		"message": "Scheduled restart completed successfully",
 	}, "")
 }
