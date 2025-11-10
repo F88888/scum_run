@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"syscall"
 	"time"
-	"unsafe"
 )
 
 var (
