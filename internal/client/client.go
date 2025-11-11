@@ -792,6 +792,12 @@ func (c *Client) updateServerConfig(configData map[string]interface{}) {
 		serverConfig.AdditionalArgs = additionalArgs
 	}
 
+	// 更新SteamCmd路径配置
+	if steamCmdPath, ok := configData["steamcmd_path"].(string); ok && steamCmdPath != "" {
+		c.config.AutoInstall.SteamCmdPath = steamCmdPath
+		c.logger.Info("Updated SteamCmd path from server config: %s", steamCmdPath)
+	}
+
 	// 更新进程管理器配置
 	if c.process != nil {
 		c.process.UpdateConfig(serverConfig)
