@@ -117,7 +117,7 @@ func main() {
 
 	// Start the client
 	logger.Info("Starting SCUM Run client...")
-	if err := scumClient.Start(); err != nil {
+	if err = scumClient.Start(); err != nil {
 		logger.Error("Failed to start client: %v", err)
 		os.Exit(1)
 	}

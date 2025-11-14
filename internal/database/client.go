@@ -110,7 +110,8 @@ func (c *Client) Close() error {
 }
 
 // Query executes a SQL query and returns the results
-func (c *Client) Query(query string) ([]map[string]interface{}, error) {
+// Supports parameterized queries using ? placeholders
+func (c *Client) Query(query string, args ...interface{}) ([]map[string]interface{}, error) {
 	c.logger.Debug("Executing query: %s", query)
 
 	// Use existing connection if available, otherwise create a temporary one
@@ -133,7 +134,7 @@ func (c *Client) Query(query string) ([]map[string]interface{}, error) {
 		defer db.Close()
 	}
 
-	rows, err := db.Query(query)
+	rows, err := db.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to execute query: %w", err)
 	}

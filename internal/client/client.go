@@ -76,6 +76,16 @@ type Client struct {
 	// 通用配置
 	maxLogRate    int           // 每秒最大日志发送数量
 	logRateWindow time.Duration // 日志频率控制窗口
+
+	// 服务器信息
+	serverID    uint // 服务器ID
+	ftpProvider uint // FTP服务商类型（3=自建服务器，4=命令行服务器）
+
+	// 自建服务器数据推送
+	dataPushTicker *time.Ticker // 数据推送定时器
+
+	// 载具类型的 trade_goods 数据（用于匹配 entity.class）
+	vehicleGoodsMap map[string]string // key: entity.class (如 "RIS_ES"), value: trade_goods.name (如 "RIS")
 }
 
 // Message types for WebSocket communication
@@ -109,6 +119,9 @@ const (
 	// System monitoring
 	MsgTypeSystemMonitor = "system_monitor"  // 系统监控数据
 	MsgTypeGetSystemInfo = "get_system_info" // 获取系统信息
+
+	// Self-built server data push
+	MsgTypeSelfBuiltServerData = "self_built_server_data" // 自建服务器数据推送（用户、载具、领地）
 
 	// Backup related
 	MsgTypeBackupStart    = "backup_start"    // 开始备份
@@ -278,6 +291,11 @@ func (c *Client) Stop() {
 		c.processOutputTicker.Stop()
 	}
 
+	// 停止自建服务器数据推送定时器
+	if c.dataPushTicker != nil {
+		c.dataPushTicker.Stop()
+	}
+
 	// 发送剩余的日志文件数据缓冲区
 	c.flushLogFileDataBuffer()
 
@@ -332,6 +350,11 @@ func (c *Client) ForceStop() {
 	// 停止进程输出批量处理定时器
 	if c.processOutputTicker != nil {
 		c.processOutputTicker.Stop()
+	}
+
+	// 停止自建服务器数据推送定时器
+	if c.dataPushTicker != nil {
+		c.dataPushTicker.Stop()
 	}
 
 	// 发送剩余的日志文件数据缓冲区
@@ -759,6 +782,46 @@ func (c *Client) handleConfigUpdate(data interface{}) {
 // updateServerConfig updates the local server configuration
 func (c *Client) updateServerConfig(configData map[string]interface{}) {
 	serverConfig := &model.ServerConfig{}
+
+	// 保存服务器ID和FTP服务商类型
+	if serverID, ok := configData["server_id"].(float64); ok {
+		c.serverID = uint(serverID)
+	}
+	if ftpProvider, ok := configData["ftp_provider"].(float64); ok {
+		c.ftpProvider = uint(ftpProvider)
+		c.logger.Info("Server FTP provider type: %d", c.ftpProvider)
+
+		// 如果是自建服务器（3）或命令行服务器（4），启动数据推送定时器
+		if (c.ftpProvider == 3 || c.ftpProvider == 4) && c.dataPushTicker == nil {
+			c.logger.Info("Starting self-built server data push timer (every 3 seconds)")
+			c.dataPushTicker = time.NewTicker(3 * time.Second)
+			go c.selfBuiltServerDataPusher()
+		}
+	}
+
+	// 保存载具类型的 trade_goods 数据
+	if vehicleGoods, ok := configData["vehicle_goods"].([]interface{}); ok {
+		c.vehicleGoodsMap = make(map[string]string)
+		for _, item := range vehicleGoods {
+			if good, ok := item.(map[string]interface{}); ok {
+				name, _ := good["name"].(string)
+				code, _ := good["code"].(string)
+				if name != "" {
+					// 构建 entity.class 格式：name + "_ES"
+					entityClass := name + "_ES"
+					c.vehicleGoodsMap[entityClass] = name
+					c.logger.Debug("Loaded vehicle good: %s -> %s", entityClass, name)
+				}
+				// 也保存 code 映射（如果 code 包含载具名称）
+				if code != "" && strings.HasPrefix(code, "#spawnvehicle ") {
+					vehicleName := strings.TrimPrefix(code, "#spawnvehicle ")
+					entityClass := vehicleName + "_ES"
+					c.vehicleGoodsMap[entityClass] = vehicleName
+				}
+			}
+		}
+		c.logger.Info("Loaded %d vehicle goods from server config", len(c.vehicleGoodsMap))
+	}
 
 	if installPath, ok := configData["install_path"].(string); ok && installPath != "" {
 		serverConfig.ExecPath = installPath + "\\SCUM\\Binaries\\Win64\\SCUMServer.exe"
@@ -4125,4 +4188,410 @@ func (c *Client) checkSteamUpdate(steamCmdPath string) (bool, error) {
 	}
 
 	return hasUpdate, nil
+}
+
+// selfBuiltServerDataPusher
+// @description: 自建服务器数据推送定时器（每3秒推送一次在线用户、载具、队伍领地数据）
+func (c *Client) selfBuiltServerDataPusher() {
+	c.logger.Info("Self-built server data pusher started")
+	defer c.wg.Done()
+	c.wg.Add(1)
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			c.logger.Info("Self-built server data pusher stopped")
+			return
+		case <-c.dataPushTicker.C:
+			// 只有当服务器正在运行时才推送数据
+			if !c.process.IsRunning() {
+				continue
+			}
+
+			// 检查WebSocket连接是否正常
+			if !c.wsClient.IsConnected() {
+				continue
+			}
+
+			// 查询数据库获取所需数据
+			usersData, vehiclesData, flagsData, groupsData := c.queryServerData()
+
+			// 如果没有数据则跳过
+			if usersData == "" && vehiclesData == "" && flagsData == "" && groupsData == "" {
+				continue
+			}
+
+			// 构建推送消息
+			pushMsg := request.WebSocketMessage{
+				Type: MsgTypeSelfBuiltServerData,
+				Data: map[string]interface{}{
+					"server_id": c.serverID,
+					"users":     usersData,
+					"vehicles":  vehiclesData,
+					"flags":     flagsData,
+					"groups":    groupsData,
+				},
+			}
+
+			// 发送消息
+			if err := c.wsClient.SendMessage(pushMsg); err != nil {
+				c.logger.Error("Failed to push self-built server data: %v", err)
+			} else {
+				c.logger.Debug("Successfully pushed self-built server data")
+			}
+		}
+	}
+}
+
+// queryServerData
+// @description: 查询服务器数据（用户列表、载具列表、队伍领地列表）
+// @return: usersData, vehiclesData, flagsData, groupsData string
+func (c *Client) queryServerData() (string, string, string, string) {
+	var usersData, vehiclesData, flagsData, groupsData string
+
+	// 查询在线玩家列表 - 使用SQL查询
+	usersData = c.queryUsersData()
+
+	// 查询载具列表 - 使用SQL查询
+	vehiclesData = c.queryVehiclesData()
+
+	// 查询队伍领地列表 - 使用SQL查询
+	flagsData = c.queryFlagsData()
+
+	// 查询所有队伍列表 - 使用SQL查询
+	groupsData = c.queryGroupsData()
+
+	return usersData, vehiclesData, flagsData, groupsData
+}
+
+// queryUsersData
+// @description: 查询在线玩家列表数据并格式化为scum_robot期望的格式
+// @return: string 格式化的玩家数据
+func (c *Client) queryUsersData() string {
+	// 计算查询时间窗口：当前时间减去时间窗口
+	logTime := time.Now().Unix() - _const.OnlinePlayerTimeWindow
+
+	// SQL查询：获取在线玩家信息（包括位置、声望、余额等）
+	sqlQuery := `SELECT 
+		up.id AS user_profile_id,
+		up.name AS fake_name,
+		COALESCE(up.fame_points, 0) AS fame_points,
+		COALESCE(e.location_x, 0.0) AS location_x,
+		COALESCE(e.location_y, 0.0) AS location_y,
+		COALESCE(e.location_z, 0.0) AS location_z,
+		COALESCE(SUM(CASE WHEN barc.currency_type = ? THEN barc.account_balance ELSE 0 END), 0) AS money_balance,
+		COALESCE(SUM(CASE WHEN barc.currency_type = ? THEN barc.account_balance ELSE 0 END), 0) AS gold_balance
+	FROM 
+		user_profile up
+	LEFT JOIN 
+		prisoner p ON p.user_profile_id = up.id
+	LEFT JOIN 
+		prisoner_entity pe ON pe.prisoner_id = p.id
+	LEFT JOIN 
+		entity e ON e.id = pe.entity_id
+	LEFT JOIN 
+		bank_account_registry bar ON bar.account_owner_user_profile_id = up.id
+	LEFT JOIN 
+		bank_account_registry_currencies barc ON barc.bank_account_id = bar.id
+	WHERE 
+		up.type != ?
+		AND p.last_save_time > ?
+	GROUP BY 
+		up.id, up.name, up.fame_points, e.location_x, e.location_y, e.location_z`
+
+	results, err := c.db.Query(sqlQuery, _const.CurrencyTypeMoney, _const.CurrencyTypeGold, _const.UserTypeServer, logTime)
+	if err != nil {
+		c.logger.Error("Failed to query users data: %v", err)
+		return ""
+	}
+
+	if len(results) == 0 {
+		return ""
+	}
+
+	// 格式化为 scum_robot 期望的格式
+	// 格式: Steam: (name) (steam_id) Fame: (fame) Account balance: (account) Gold balance: (gold) Location: X=(x) Y=(y) Z=(z)
+	var builder strings.Builder
+	for _, row := range results {
+		userProfileID, _ := getInt64Value(row["user_profile_id"])
+		fakeName, _ := row["fake_name"].(string)
+		famePoints, _ := getFloat64Value(row["fame_points"])
+		locationX, _ := getFloat64Value(row["location_x"])
+		locationY, _ := getFloat64Value(row["location_y"])
+		locationZ, _ := getFloat64Value(row["location_z"])
+		moneyBalance, _ := getFloat64Value(row["money_balance"])
+		goldBalance, _ := getFloat64Value(row["gold_balance"])
+
+		// 格式化输出
+		// 格式: Steam: (name) (steam_id) Fame: (fame) Account balance: (account) Gold balance: (gold) Location: X=(x) Y=(y) Z=(z)
+		fmt.Fprintf(&builder, "Steam: %s (%d) Fame: %.0f Account balance: %.0f Gold balance: %.0f Location: X=%.2f Y=%.2f Z=%.2f \n",
+			fakeName, userProfileID, famePoints, moneyBalance, goldBalance, locationX, locationY, locationZ)
+	}
+
+	return builder.String()
+}
+
+// queryVehiclesData
+// @description: 查询载具列表数据并格式化为scum_robot期望的格式
+// @return: string 格式化的载具数据
+func (c *Client) queryVehiclesData() string {
+	// SQL查询：获取载具列表
+	// 载具类型名称是 trade_goods 表的 name + '_ES'，比如 name=RIS，那么 entity.class=RIS_ES
+	// vehicle_spawner 表的 vehicle_entity_id 就是 entity 表的 id
+	sqlQuery := `SELECT 
+		vs.vehicle_entity_id AS vehicle_id,
+		e.class AS entity_class,
+		COALESCE(vs.vehicle_alias, '') AS vehicle_alias,
+		COALESCE(e.location_x, 0.0) AS location_x,
+		COALESCE(e.location_y, 0.0) AS location_y,
+		COALESCE(e.location_z, 0.0) AS location_z
+	FROM 
+		vehicle_spawner vs
+	INNER JOIN 
+		entity e ON e.id = vs.vehicle_entity_id
+	WHERE 
+		e.location_x IS NOT NULL 
+		AND e.location_y IS NOT NULL 
+		AND e.location_z IS NOT NULL
+		AND e.class LIKE ?`
+
+	results, err := c.db.Query(sqlQuery, "%"+_const.VehicleClassSuffix+"%")
+	if err != nil {
+		c.logger.Error("Failed to query vehicles data: %v", err)
+		return ""
+	}
+
+	if len(results) == 0 {
+		return ""
+	}
+
+	// 格式化为 scum_robot 期望的格式
+	// 格式: #(id): (vehicle_name) YYYY-MM-DDTHH:MM:SS.XXX X=(x) Y=(y) Z=(z)
+	var builder strings.Builder
+	currentTime := time.Now()
+	timeStr := currentTime.Format(_const.VehicleTimeFormat)
+
+	for _, row := range results {
+		vehicleID, _ := getInt64Value(row["vehicle_id"])
+		entityClass, _ := row["entity_class"].(string)
+		vehicleAlias, _ := row["vehicle_alias"].(string)
+		locationX, _ := getFloat64Value(row["location_x"])
+		locationY, _ := getFloat64Value(row["location_y"])
+		locationZ, _ := getFloat64Value(row["location_z"])
+
+		// 确定载具名称：优先使用别名，其次使用 trade_goods 映射，最后从 entity.class 提取
+		vehicleName := c.getVehicleName(entityClass, vehicleAlias)
+
+		// 格式化输出
+		fmt.Fprintf(&builder, "#%d: %s %s X=%.2f Y=%.2f Z=%.2f\n",
+			vehicleID, vehicleName, timeStr, locationX, locationY, locationZ)
+	}
+
+	return builder.String()
+}
+
+// getVehicleName 获取载具名称
+// @description: 根据 entity.class 和 vehicle_alias 确定载具名称
+// @param: entityClass string, vehicleAlias string
+// @return: string 载具名称
+func (c *Client) getVehicleName(entityClass, vehicleAlias string) string {
+	// 优先使用别名
+	if vehicleAlias != "" {
+		return vehicleAlias
+	}
+
+	// 其次使用 trade_goods 映射
+	if c.vehicleGoodsMap != nil {
+		if mappedName, ok := c.vehicleGoodsMap[entityClass]; ok {
+			return mappedName
+		}
+	}
+
+	// 最后从 entity.class 中提取（去掉后缀）
+	if strings.HasSuffix(entityClass, _const.VehicleClassSuffix) {
+		return entityClass[:len(entityClass)-len(_const.VehicleClassSuffix)]
+	}
+
+	return entityClass
+}
+
+// queryFlagsData
+// @description: 查询队伍领地列表数据并格式化为scum_robot期望的格式
+// @return: string 格式化的领地数据
+func (c *Client) queryFlagsData() string {
+	// SQL查询：获取队伍领地列表
+	// base_element 表的 asset 字段包含 '%Flag%' 的是领地数据
+	// 领地所有人是 owner_profile_id，对应 user_profile 表的 id
+	// 该领地属于哪个队伍：通过队长的 user_profile 的 id 查询 squad_member.user_profile_id 且 rank=4，队伍id是 squad_id 对应 squad.id
+	sqlQuery := `SELECT 
+		be.element_id AS flag_id,
+		be.owner_profile_id AS owner_profile_id,
+		COALESCE(up.user_id, '') AS owner_steam_id,
+		COALESCE(up.name, up.fake_name, '') AS owner_name,
+		COALESCE(be.location_x, 0.0) AS location_x,
+		COALESCE(be.location_y, 0.0) AS location_y,
+		COALESCE(be.location_z, 0.0) AS location_z,
+		COALESCE(s.id, 0) AS squad_id
+	FROM 
+		base_element be
+	LEFT JOIN 
+		user_profile up ON up.id = be.owner_profile_id
+	LEFT JOIN 
+		squad_member sm ON sm.user_profile_id = be.owner_profile_id AND sm.rank = ?
+	LEFT JOIN 
+		squad s ON s.id = sm.squad_id
+	WHERE 
+		be.asset LIKE ?`
+
+	results, err := c.db.Query(sqlQuery, _const.SquadLeaderRank, _const.FlagAssetPattern)
+	if err != nil {
+		c.logger.Error("Failed to query flags data: %v", err)
+		return ""
+	}
+
+	if len(results) == 0 {
+		return ""
+	}
+
+	// 格式化为 scum_robot 期望的格式
+	// 格式: Flag ID: (flag_id) | Owner: [(owner_id)] ... (name) (...) | Location: X=(x) Y=(y) Z=(z)
+	var builder strings.Builder
+	for _, row := range results {
+		flagID, _ := getInt64Value(row["flag_id"])
+		ownerID, _ := getInt64Value(row["owner_profile_id"])
+		ownerSteamID, _ := row["owner_steam_id"].(string)
+		ownerName, _ := row["owner_name"].(string)
+		locationX, _ := getFloat64Value(row["location_x"])
+		locationY, _ := getFloat64Value(row["location_y"])
+		locationZ, _ := getFloat64Value(row["location_z"])
+
+		// 格式化输出
+		fmt.Fprintf(&builder, "Flag ID: %d | Owner: [%d] %s (%s) | Location: X=%.2f Y=%.2f Z=%.2f\n",
+			flagID, ownerID, ownerName, ownerSteamID, locationX, locationY, locationZ)
+	}
+
+	return builder.String()
+}
+
+// queryGroupsData
+// @description: 查询所有队伍列表数据并格式化为scum_robot期望的格式
+// @return: string 格式化的队伍数据
+func (c *Client) queryGroupsData() string {
+	// SQL查询：获取所有队伍列表
+	// 从 squad 表查询所有队伍，关联 squad_member 和 user_profile 获取成员信息
+	sqlQuery := `SELECT 
+		s.id AS squad_id,
+		s.name AS squad_name,
+		sm.user_profile_id AS member_user_profile_id,
+		COALESCE(up.user_id, '') AS member_steam_id,
+		COALESCE(up.name, '') AS member_steam_name,
+		COALESCE(up.fake_name, '') AS member_character_name,
+		COALESCE(sm.rank, 0) AS member_rank
+	FROM 
+		squad s
+	LEFT JOIN 
+		squad_member sm ON sm.squad_id = s.id
+	LEFT JOIN 
+		user_profile up ON up.id = sm.user_profile_id
+	ORDER BY 
+		s.id, sm.rank DESC, sm.id`
+
+	results, err := c.db.Query(sqlQuery)
+	if err != nil {
+		c.logger.Error("Failed to query groups data: %v", err)
+		return ""
+	}
+
+	if len(results) == 0 {
+		return ""
+	}
+
+	// 格式化为 scum_robot 期望的格式
+	// 格式: [SquadId: (id) SquadName: (name)]
+	//       SteamId: (steam_id) SteamName: (steam_name) CharacterName: (char_name) MemberRank: (rank)
+	//       ...
+	//
+	var builder strings.Builder
+	var currentSquadID int64 = -1
+	var currentSquadName string
+	var memberList strings.Builder
+
+	for _, row := range results {
+		squadID, _ := getInt64Value(row["squad_id"])
+		squadName, _ := row["squad_name"].(string)
+		memberUserProfileID, _ := getInt64Value(row["member_user_profile_id"])
+		memberSteamID, _ := row["member_steam_id"].(string)
+		memberSteamName, _ := row["member_steam_name"].(string)
+		memberCharacterName, _ := row["member_character_name"].(string)
+		memberRank, _ := getInt64Value(row["member_rank"])
+
+		// 如果切换到新的队伍，先输出上一个队伍的信息
+		if currentSquadID != -1 && currentSquadID != squadID {
+			fmt.Fprintf(&builder, "[SquadId: %d SquadName: %s]\n%s\n\n",
+				currentSquadID, currentSquadName, memberList.String())
+			memberList.Reset()
+		}
+
+		// 如果是新队伍，记录队伍ID和名称
+		if currentSquadID != squadID {
+			currentSquadID = squadID
+			currentSquadName = squadName
+		}
+
+		// 如果有成员信息，添加到成员列表
+		if memberUserProfileID > 0 {
+			fmt.Fprintf(&memberList, "SteamId: %s SteamName: %s CharacterName: %s MemberRank: %d\n",
+				memberSteamID, memberSteamName, memberCharacterName, memberRank)
+		}
+	}
+
+	// 输出最后一个队伍的信息
+	if currentSquadID != -1 {
+		fmt.Fprintf(&builder, "[SquadId: %d SquadName: %s]\n%s\n\n",
+			currentSquadID, currentSquadName, memberList.String())
+	}
+
+	return builder.String()
+}
+
+// getInt64Value 从interface{}中提取int64值
+func getInt64Value(val interface{}) (int64, error) {
+	if val == nil {
+		return 0, nil
+	}
+	switch v := val.(type) {
+	case int64:
+		return v, nil
+	case int:
+		return int64(v), nil
+	case float64:
+		return int64(v), nil
+	case string:
+		var i int64
+		_, err := fmt.Sscanf(v, "%d", &i)
+		return i, err
+	default:
+		return 0, fmt.Errorf("cannot convert %T to int64", val)
+	}
+}
+
+// getFloat64Value 从interface{}中提取float64值
+func getFloat64Value(val interface{}) (float64, error) {
+	if val == nil {
+		return 0, nil
+	}
+	switch v := val.(type) {
+	case float64:
+		return v, nil
+	case int64:
+		return float64(v), nil
+	case int:
+		return float64(v), nil
+	case string:
+		var f float64
+		_, err := fmt.Sscanf(v, "%f", &f)
+		return f, err
+	default:
+		return 0, fmt.Errorf("cannot convert %T to float64", val)
+	}
 }
