@@ -80,6 +80,17 @@ func (m *Manager) GetConfig() *model.ServerConfig {
 func (m *Manager) buildStartArgs() []string {
 	args := []string{}
 
+	// 命令行服务器（GamePort == 0）只使用 AdditionalArgs，不添加 SCUM 特定参数
+	if m.config.GamePort == 0 {
+		// 命令行服务器：AdditionalArgs 是完整的启动命令
+		if m.config.AdditionalArgs != "" {
+			additionalArgs := strings.Fields(m.config.AdditionalArgs)
+			args = append(args, additionalArgs...)
+		}
+		return args
+	}
+
+	// 普通 SCUM 服务器：添加 SCUM 特定参数
 	// 基本参数
 	if m.config.GamePort > 0 {
 		args = append(args, fmt.Sprintf("-port=%d", m.config.GamePort))
@@ -112,44 +123,68 @@ func (m *Manager) Start() error {
 		return fmt.Errorf("server is already running")
 	}
 
-	// Check if executable exists
-	if _, err := os.Stat(m.config.ExecPath); os.IsNotExist(err) {
-		return fmt.Errorf("SCUM server executable not found: %s", m.config.ExecPath)
-	}
-
-	// Check if the configured port is already in use
-	if m.config.GamePort > 0 {
-		portChecker := network.NewPortChecker(_const.DefaultWaitTime + _const.ShortWaitTime)
-		host := m.config.ServerIP
-		if host == "" {
-			host = _const.DefaultServerIP
-		}
-
-		m.logger.Info("Checking if port %d is available on %s...", m.config.GamePort, host)
-
-		portStatus, err := portChecker.CheckPort(host, m.config.GamePort)
-		if err != nil {
-			m.logger.Warn("Failed to check port status: %v", err)
-		} else if portStatus.InUse {
-			m.logger.Warn("Port %d is already in use on %s, skipping SCUM server startup", m.config.GamePort, host)
-			return fmt.Errorf("port %d is already in use on %s", m.config.GamePort, host)
+	// 命令行服务器（GamePort == 0）使用不同的启动逻辑
+	if m.config.GamePort == 0 {
+		// 命令行服务器：ExecPath 是运行目录，AdditionalArgs 是完整的启动命令
+		// 使用 shell 执行命令
+		var cmd *exec.Cmd
+		if runtime.GOOS == "windows" {
+			// Windows: 使用 cmd.exe 执行命令
+			cmd = exec.Command("cmd.exe", "/c", m.config.AdditionalArgs)
 		} else {
-			m.logger.Info("Port %d is available on %s", m.config.GamePort, host)
+			// Linux/Mac: 使用 sh 执行命令
+			cmd = exec.Command("sh", "-c", m.config.AdditionalArgs)
 		}
-	}
 
-	// Build command arguments
-	args := m.buildStartArgs()
+		// 设置工作目录为 ExecPath（运行目录）
+		if m.config.ExecPath != "" {
+			cmd.Dir = m.config.ExecPath
+			m.logger.Info("Setting working directory to: %s", m.config.ExecPath)
+		}
 
-	m.logger.Info("Starting SCUM server: %s %s", m.config.ExecPath, strings.Join(args, " "))
+		m.logger.Info("Starting command line server: %s (in directory: %s)", m.config.AdditionalArgs, m.config.ExecPath)
+		m.cmd = cmd
+	} else {
+		// 普通 SCUM 服务器
+		// Check if executable exists
+		if _, err := os.Stat(m.config.ExecPath); os.IsNotExist(err) {
+			return fmt.Errorf("SCUM server executable not found: %s", m.config.ExecPath)
+		}
 
-	m.cmd = exec.Command(m.config.ExecPath, args...)
+		// Check if the configured port is already in use
+		if m.config.GamePort > 0 {
+			portChecker := network.NewPortChecker(_const.DefaultWaitTime + _const.ShortWaitTime)
+			host := m.config.ServerIP
+			if host == "" {
+				host = _const.DefaultServerIP
+			}
 
-	// Set working directory to the directory containing the executable
-	execDir := strings.TrimSuffix(m.config.ExecPath, "SCUMServer.exe")
-	if execDir != m.config.ExecPath {
-		m.cmd.Dir = execDir
-		m.logger.Info("Setting working directory to: %s", execDir)
+			m.logger.Info("Checking if port %d is available on %s...", m.config.GamePort, host)
+
+			portStatus, err := portChecker.CheckPort(host, m.config.GamePort)
+			if err != nil {
+				m.logger.Warn("Failed to check port status: %v", err)
+			} else if portStatus.InUse {
+				m.logger.Warn("Port %d is already in use on %s, skipping SCUM server startup", m.config.GamePort, host)
+				return fmt.Errorf("port %d is already in use on %s", m.config.GamePort, host)
+			} else {
+				m.logger.Info("Port %d is available on %s", m.config.GamePort, host)
+			}
+		}
+
+		// Build command arguments
+		args := m.buildStartArgs()
+
+		m.logger.Info("Starting SCUM server: %s %s", m.config.ExecPath, strings.Join(args, " "))
+
+		m.cmd = exec.Command(m.config.ExecPath, args...)
+
+		// Set working directory to the directory containing the executable
+		execDir := strings.TrimSuffix(m.config.ExecPath, "SCUMServer.exe")
+		if execDir != m.config.ExecPath {
+			m.cmd.Dir = execDir
+			m.logger.Info("Setting working directory to: %s", execDir)
+		}
 	}
 
 	// On Windows, create the process in a new console so it can receive Ctrl+C

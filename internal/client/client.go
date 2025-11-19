@@ -823,18 +823,30 @@ func (c *Client) updateServerConfig(configData map[string]interface{}) {
 		c.logger.Info("Loaded %d vehicle goods from server config", len(c.vehicleGoodsMap))
 	}
 
-	if installPath, ok := configData["install_path"].(string); ok && installPath != "" {
-		serverConfig.ExecPath = installPath + "\\SCUM\\Binaries\\Win64\\SCUMServer.exe"
+	// 命令行服务器（4）使用不同的配置逻辑
+	if c.ftpProvider == 4 {
+		// 命令行服务器：install_path 是运行目录，additional_args 是完整的启动命令
+		if installPath, ok := configData["install_path"].(string); ok && installPath != "" {
+			// 对于命令行服务器，install_path 就是运行目录，不需要拼接 SCUMServer.exe
+			serverConfig.ExecPath = installPath
+		}
+		// 命令行服务器不需要设置 GamePort
+		serverConfig.GamePort = 0
 	} else {
-		// 如果没有配置路径，使用Steam检测的路径
-		steamDetector := steam.NewDetector(c.logger)
-		serverConfig.ExecPath = steamDetector.GetSCUMServerPath(c.steamDir)
-	}
+		// 普通 SCUM 服务器
+		if installPath, ok := configData["install_path"].(string); ok && installPath != "" {
+			serverConfig.ExecPath = installPath + "\\SCUM\\Binaries\\Win64\\SCUMServer.exe"
+		} else {
+			// 如果没有配置路径，使用Steam检测的路径
+			steamDetector := steam.NewDetector(c.logger)
+			serverConfig.ExecPath = steamDetector.GetSCUMServerPath(c.steamDir)
+		}
 
-	if gamePort, ok := configData["game_port"].(float64); ok {
-		serverConfig.GamePort = int(gamePort)
-	} else {
-		serverConfig.GamePort = _const.DefaultGamePort
+		if gamePort, ok := configData["game_port"].(float64); ok {
+			serverConfig.GamePort = int(gamePort)
+		} else {
+			serverConfig.GamePort = _const.DefaultGamePort
+		}
 	}
 
 	if maxPlayers, ok := configData["max_players"].(float64); ok {
