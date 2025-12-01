@@ -2933,11 +2933,159 @@ func (c *Client) handleBackupStatus(data interface{}) {
 
 // handleBackupList 处理备份列表请求
 func (c *Client) handleBackupList(data interface{}) {
-	// 这里可以实现获取备份列表的逻辑
+	// 解析请求数据
+	requestData, ok := data.(map[string]interface{})
+	if !ok {
+		c.sendBackupResponse(MsgTypeBackupList, map[string]interface{}{
+			"success": false,
+			"message": "Invalid request data format",
+			"list":    []interface{}{},
+		})
+		return
+	}
+
+	// 获取 serverID
+	serverIDFloat, ok := requestData["server_id"].(float64)
+	if !ok {
+		c.sendBackupResponse(MsgTypeBackupList, map[string]interface{}{
+			"success": false,
+			"message": "Server ID is missing or invalid",
+			"list":    []interface{}{},
+		})
+		return
+	}
+	serverID := uint(serverIDFloat)
+
+	// 获取 limit，默认为 50
+	limit := 50
+	if limitFloat, ok := requestData["limit"].(float64); ok {
+		limit = int(limitFloat)
+	} else if limitInt, ok := requestData["limit"].(int); ok {
+		limit = limitInt
+	}
+
+	// 获取备份目录
+	backupDir := filepath.Join(filepath.Dir(os.Args[0]), "backup")
+
+	// 检查备份目录是否存在
+	if _, err := os.Stat(backupDir); os.IsNotExist(err) {
+		c.sendBackupResponse(MsgTypeBackupList, map[string]interface{}{
+			"success": true,
+			"message": "Backup directory does not exist",
+			"list":    []interface{}{},
+		})
+		return
+	}
+
+	// 查找该服务器的所有备份文件
+	pattern := fmt.Sprintf("backup_%d_*.zip", serverID)
+	matches, err := filepath.Glob(filepath.Join(backupDir, pattern))
+	if err != nil {
+		c.logger.Error("Failed to find backup files: %v", err)
+		c.sendBackupResponse(MsgTypeBackupList, map[string]interface{}{
+			"success": false,
+			"message": fmt.Sprintf("Failed to find backup files: %v", err),
+			"list":    []interface{}{},
+		})
+		return
+	}
+
+	// 按修改时间排序（最新的在前）
+	sort.Slice(matches, func(i, j int) bool {
+		info1, err1 := os.Stat(matches[i])
+		info2, err2 := os.Stat(matches[j])
+		if err1 != nil || err2 != nil {
+			return false
+		}
+		return info1.ModTime().After(info2.ModTime())
+	})
+
+	// 限制返回数量
+	if len(matches) > limit {
+		matches = matches[:limit]
+	}
+
+	// 构建备份列表
+	var backupList []interface{}
+	for _, filePath := range matches {
+		fileInfo, err := os.Stat(filePath)
+		if err != nil {
+			c.logger.Warn("Failed to get file info for %s: %v", filePath, err)
+			continue
+		}
+
+		// 从文件名提取备份ID和时间戳
+		fileName := filepath.Base(filePath)
+		// 文件名格式：backup_{serverID}_{timestamp}.zip
+		// 备份ID格式：backup_{serverID}_{timestamp}
+		backupID := strings.TrimSuffix(fileName, ".zip")
+
+		// 尝试从文件名解析时间戳
+		var createdAt time.Time
+		parts := strings.Split(backupID, "_")
+		if len(parts) >= 3 {
+			// 时间戳格式：20060102_150405
+			timestampStr := strings.Join(parts[2:], "_")
+			if t, err := time.Parse("20060102_150405", timestampStr); err == nil {
+				createdAt = t
+			} else {
+				// 如果解析失败，使用文件修改时间
+				createdAt = fileInfo.ModTime()
+			}
+		} else {
+			// 如果无法解析，使用文件修改时间
+			createdAt = fileInfo.ModTime()
+		}
+
+		// 构建备份信息
+		backupInfo := map[string]interface{}{
+			"backup_id":               backupID,
+			"server_id":               serverID,
+			"backup_type":             "full", // 默认为全量备份
+			"backup_size_bytes":       fileInfo.Size(),
+			"backup_duration_seconds": 0,         // 文件系统无法获取，设为0
+			"backup_status":           "success", // 文件存在即认为成功
+			"backup_path":             filePath,
+			"file_count":              0,   // 文件系统无法获取，设为0
+			"compression_ratio":       0.0, // 文件系统无法获取，设为0
+			"error_message":           "",
+
+			// 性能监控数据（文件系统无法获取，设为0）
+			"cpu_usage":         0.0,
+			"memory_usage":      0.0,
+			"disk_usage":        0.0,
+			"network_in_bytes":  int64(0),
+			"network_out_bytes": int64(0),
+			"disk_read_speed":   0.0,
+			"disk_write_speed":  0.0,
+			"process_count":     0,
+			"load_average":      []float64{},
+
+			// 系统资源信息（文件系统无法获取，设为0）
+			"cpu_cores":              0,
+			"total_memory_bytes":     int64(0),
+			"available_memory_bytes": int64(0),
+			"total_disk_space_bytes": int64(0),
+			"free_disk_space_bytes":  int64(0),
+
+			// 备份性能指标（文件系统无法获取，设为0）
+			"files_per_second":         0.0,
+			"data_throughput":          0.0,
+			"compression_time_seconds": 0,
+			"encryption_time_seconds":  0,
+
+			// 创建时间
+			"created_at": createdAt.Format(time.RFC3339),
+		}
+
+		backupList = append(backupList, backupInfo)
+	}
+
+	// 发送响应
 	c.sendBackupResponse(MsgTypeBackupList, map[string]interface{}{
 		"success": true,
-		"list":    []interface{}{},
-		"message": "Backup list retrieved",
+		"message": fmt.Sprintf("Found %d backup files", len(backupList)),
+		"list":    backupList,
 	})
 }
 
