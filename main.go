@@ -27,6 +27,10 @@ func cleanup() {
 }
 
 func main() {
+	// 在程序启动时立即设置信号处理器
+	// Windows 上会忽略 Ctrl+C 和 Ctrl+Break 信号，防止 scum_run 退出
+	initPlatformSignalHandling()
+
 	var (
 		configFile = flag.String("config", "config.json", "Configuration file path")
 		token      = flag.String("token", "", "Server authentication token")
