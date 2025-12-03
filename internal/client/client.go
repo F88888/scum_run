@@ -30,6 +30,7 @@ import (
 	"scum_run/internal/logmonitor"
 	"scum_run/internal/monitor"
 	"scum_run/internal/process"
+	"scum_run/internal/runtime"
 	"scum_run/internal/steam"
 	"scum_run/internal/steamtools"
 	"scum_run/internal/updater"
@@ -512,6 +513,14 @@ func (c *Client) handleServerStart() {
 	steamDetector := steam.NewDetector(c.logger)
 	if !steamDetector.IsSCUMServerInstalled(c.steamDir) {
 		c.sendResponse(MsgTypeServerStart, nil, "SCUM Dedicated Server is not installed. Please install it first.")
+		return
+	}
+
+	// 检查并安装必要的运行时依赖
+	runtimeChecker := runtime.NewChecker(c.logger)
+	if err := runtimeChecker.CheckAndInstallRuntimes(); err != nil {
+		c.logger.Error("运行时依赖检查/安装失败: %v", err)
+		c.sendResponse(MsgTypeServerStart, nil, fmt.Sprintf("运行时依赖检查失败: %v", err))
 		return
 	}
 
@@ -1145,14 +1154,14 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	}
 
 	// 验证安装是否成功
-	scumServerExe := filepath.Join(installPath, "steamapps", "common", "SCUM Dedicated Server", "SCUM", "Binaries", "Win64", "SCUMServer.exe")
+	scumServerExe := filepath.Join(installPath, "SCUM", "Binaries", "Win64", "SCUMServer.exe")
 	c.logger.Info("检查 SCUM 服务器可执行文件: %s", scumServerExe)
 	if _, err := os.Stat(scumServerExe); err != nil {
 		c.logger.Error("SCUM 服务器可执行文件未找到: %s", scumServerExe)
 		c.logger.Error("安装完成但未找到 SCUM 服务器可执行文件")
 
 		// 列出安装目录内容以便调试
-		installDir := filepath.Dir(filepath.Dir(filepath.Dir(scumServerExe)))
+		installDir := filepath.Join(installPath, "SCUM")
 		c.logger.Info("检查安装目录: %s", installDir)
 		if entries, err := os.ReadDir(installDir); err == nil {
 			c.logger.Info("安装目录内容:")

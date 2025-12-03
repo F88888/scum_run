@@ -6,6 +6,7 @@ const (
 	DefaultInstallPath  = "./scumserver"
 	DefaultSteamCmdPath = "./steamcmd/steamcmd.exe"
 	DefaultSteamCmdURL  = "https://scum.npc0.com/steamcmd.zip"
+	DefaultDirectxURL   = "https://scum.npc0.com/directx_Jun2010_redist.exe"
 	DefaultSteamCmdDir  = "./steamcmd"
 
 	// SCUM 服务器相关常量
