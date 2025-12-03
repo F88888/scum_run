@@ -1271,12 +1271,7 @@ func (c *Client) initializeSteamCmd(steamCmdPath string) error {
 
 	c.logger.Info("运行 SteamCmd 进行初始化（首次运行会自动更新）...")
 
-	// 运行一个简单的命令来初始化 SteamCmd（首次运行会自动更新）
-	// 使用 +quit 让 SteamCmd 启动后立即退出，这样它会先更新自己
-	initArgs := []string{"+quit"}
-
-	// 设置超时（120秒应该足够初始化，因为首次运行可能需要下载更新）
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.Background()
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, steamCmdPath, initArgs...)
