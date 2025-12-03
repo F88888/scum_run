@@ -1134,110 +1134,12 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 		c.logger.Info("✅ SteamCmd 初始化完成")
 	}
 
-	// 准备执行 SteamCmd 命令
-	c.logger.Info("准备执行 SteamCmd 安装命令...")
-	commandStr := fmt.Sprintf("%s %s", steamCmdPath, strings.Join(args, " "))
-	c.logger.Info("完整命令: %s", commandStr)
-
 	// 执行SteamCmd安装
-	cmd := exec.Command(steamCmdPath, args...)
-
-	// 设置工作目录为steamcmd的父目录
 	steamCmdDir := filepath.Dir(steamCmdPath)
-	cmd.Dir = steamCmdDir
-
-	// 设置环境变量
-	cmd.Env = os.Environ()
-
-	c.logger.Info("工作目录: %s", cmd.Dir)
-	c.logger.Info("开始执行 SteamCmd 安装命令...")
-
-	// 使用管道获取实时输出
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		c.logger.Error("Failed to create stdout pipe: %v", err)
-		return
-	}
-
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		c.logger.Error("Failed to create stderr pipe: %v", err)
-		return
-	}
-
-	// 启动命令
-	if err := cmd.Start(); err != nil {
-		c.logger.Error("Failed to start SteamCmd: %v", err)
-		return
-	}
-
-	// 读取输出 - 使用 bufio.Scanner 进行逐行读取
-	var lastProgressTime time.Time
-	var outputLines []string
-	var errorLines []string
-
-	go func() {
-		scanner := bufio.NewScanner(stdout)
-		for scanner.Scan() {
-			line := scanner.Text()
-			outputLines = append(outputLines, line)
-
-			// 检查安装进度 - 记录关键信息
-			now := time.Now()
-			if strings.Contains(line, "Update state") && strings.Contains(line, "downloading") {
-				if now.Sub(lastProgressTime) > 10*time.Second {
-					c.logger.Info("SteamCmd: 正在下载 SCUM 服务器文件...")
-					lastProgressTime = now
-				}
-			} else if strings.Contains(line, "Update state") && strings.Contains(line, "verifying") {
-				c.logger.Info("SteamCmd: 正在验证 SCUM 服务器文件...")
-				lastProgressTime = now
-			} else if strings.Contains(line, "Success") || strings.Contains(line, "fully installed") {
-				c.logger.Info("SteamCmd: 操作成功完成")
-			} else if strings.Contains(line, "Error") || strings.Contains(line, "Failed") || strings.Contains(line, "ERROR") {
-				c.logger.Error("SteamCmd 错误: %s", line)
-				errorLines = append(errorLines, line)
-			} else if strings.Contains(line, "Progress") || strings.Contains(line, "progress") {
-				// 每10秒记录一次进度
-				if now.Sub(lastProgressTime) > 10*time.Second {
-					c.logger.Info("SteamCmd 进度: %s", line)
-					lastProgressTime = now
-				}
-			}
-		}
-		if err := scanner.Err(); err != nil {
-			c.logger.Error("读取 SteamCmd stdout 时出错: %v", err)
-		}
-	}()
-
-	go func() {
-		scanner := bufio.NewScanner(stderr)
-		for scanner.Scan() {
-			line := scanner.Text()
-			c.logger.Warn("SteamCmd stderr: %s", line)
-			errorLines = append(errorLines, line)
-		}
-		if err := scanner.Err(); err != nil {
-			c.logger.Error("读取 SteamCmd stderr 时出错: %v", err)
-		}
-	}()
-
-	// 等待命令完成
-	c.logger.Info("等待 SteamCmd 安装完成（这可能需要较长时间，请耐心等待）...")
-	err = cmd.Wait()
-
-	if err != nil {
+	c.logger.Info("工作目录: %s", steamCmdDir)
+	c.logger.Info("开始执行 SteamCmd 安装命令（这可能需要较长时间，请耐心等待）...")
+	if err := c.runSteamCmdWithRealtimeOutput(steamCmdPath, args); err != nil {
 		c.logger.Error("SteamCmd 安装失败: %v", err)
-		if len(errorLines) > 0 {
-			c.logger.Error("SteamCmd 错误输出（最后10行）:")
-			start := len(errorLines) - 10
-			if start < 0 {
-				start = 0
-			}
-			for _, line := range errorLines[start:] {
-				c.logger.Error("  %s", line)
-			}
-		}
 		return
 	}
 
@@ -1265,105 +1167,51 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	c.logger.Info("✅ SCUM 服务器安装成功: %s", scumServerExe)
 }
 
-// initializeSteamCmd initializes SteamCmd by running it once to download updates
-func (c *Client) initializeSteamCmd(steamCmdPath string) error {
+// runSteamCmdWithRealtimeOutput 执行SteamCmd命令并实时打印输出
+func (c *Client) runSteamCmdWithRealtimeOutput(steamCmdPath string, args []string) error {
 	steamCmdDir := filepath.Dir(steamCmdPath)
-
-	c.logger.Info("运行 SteamCmd 进行初始化（首次运行会自动更新）...")
-
-	ctx := context.Background()
-
-	// SteamCmd 初始化不需要参数，直接运行即可
-	cmd := exec.CommandContext(ctx, steamCmdPath)
+	cmd := exec.Command(steamCmdPath, args...)
 	cmd.Dir = steamCmdDir
 	cmd.Env = os.Environ()
 
-	// 使用管道获取实时输出
-	stdoutPipe, err := cmd.StdoutPipe()
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		c.logger.Error("Failed to create stdout pipe: %v", err)
-		return err
+		return fmt.Errorf("创建stdout管道失败: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("创建stderr管道失败: %w", err)
 	}
 
-	stderrPipe, err := cmd.StderrPipe()
-	if err != nil {
-		c.logger.Error("Failed to create stderr pipe: %v", err)
-		return err
-	}
-
-	// 同时捕获输出到缓冲区以便后续检查
-	var stdoutBuf, stderrBuf bytes.Buffer
-	stdoutMulti := io.MultiWriter(&stdoutBuf, os.Stdout)
-	stderrMulti := io.MultiWriter(&stderrBuf, os.Stderr)
-
-	// 启动命令
-	c.logger.Info("执行 SteamCmd 初始化命令: %s", steamCmdPath)
 	if err := cmd.Start(); err != nil {
-		c.logger.Error("Failed to start SteamCmd: %v", err)
-		return err
+		return fmt.Errorf("启动命令失败: %w", err)
 	}
 
-	// 实时读取并打印输出
+	// 实时打印输出
 	go func() {
-		scanner := bufio.NewScanner(stdoutPipe)
+		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
-			line := scanner.Text()
-			// 实时打印到标准输出
-			fmt.Fprintln(stdoutMulti, line)
-			// 同时记录到日志
-			c.logger.Info("SteamCmd: %s", line)
-		}
-		if err := scanner.Err(); err != nil {
-			c.logger.Error("读取 SteamCmd stdout 时出错: %v", err)
+			c.logger.Info("SteamCmd: %s", scanner.Text())
 		}
 	}()
 
 	go func() {
-		scanner := bufio.NewScanner(stderrPipe)
+		scanner := bufio.NewScanner(stderr)
 		for scanner.Scan() {
-			line := scanner.Text()
-			// 实时打印到标准错误输出
-			fmt.Fprintln(stderrMulti, line)
-			// 同时记录到日志
-			c.logger.Warn("SteamCmd stderr: %s", line)
-		}
-		if err := scanner.Err(); err != nil {
-			c.logger.Error("读取 SteamCmd stderr 时出错: %v", err)
+			c.logger.Info("SteamCmd: %s", scanner.Text())
 		}
 	}()
 
-	// 等待命令完成
-	err = cmd.Wait()
+	return cmd.Wait()
+}
 
-	// 检查输出
-	output := stdoutBuf.String() + stderrBuf.String()
-
-	if err != nil {
-		// 检查是否是超时错误
-		if ctx.Err() == context.DeadlineExceeded {
-			c.logger.Warn("SteamCmd 初始化超时（可能正在更新，这是正常的）")
-			// 超时不一定意味着失败，可能正在更新
-			return nil
-		}
-		// 检查输出中是否有更新信息（即使有错误，如果正在更新也是正常的）
-		if strings.Contains(strings.ToLower(output), "update") ||
-			strings.Contains(strings.ToLower(output), "downloading") ||
-			strings.Contains(strings.ToLower(output), "updating") {
-			c.logger.Info("SteamCmd 正在更新（这是正常的）")
-			return nil
-		}
+// initializeSteamCmd initializes SteamCmd by running it once to download updates
+func (c *Client) initializeSteamCmd(steamCmdPath string) error {
+	c.logger.Info("运行 SteamCmd 进行初始化（首次运行会自动更新）...")
+	initArgs := []string{"+quit"}
+	if err := c.runSteamCmdWithRealtimeOutput(steamCmdPath, initArgs); err != nil {
 		c.logger.Debug("SteamCmd 初始化完成（可能已初始化）: %v", err)
-	} else {
-		c.logger.Info("✅ SteamCmd 初始化完成")
 	}
-
-	// 检查输出中是否有更新信息
-	if strings.Contains(strings.ToLower(output), "update") ||
-		strings.Contains(strings.ToLower(output), "downloading") ||
-		strings.Contains(strings.ToLower(output), "updating") {
-		c.logger.Info("SteamCmd 正在更新...")
-	}
-
 	return nil
 }
 
