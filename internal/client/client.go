@@ -1107,11 +1107,11 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	}
 	c.logger.Info("✅ 安装目录创建成功")
 
-	// 构建SteamCmd命令（使用 +quit 而不是 +exit）
+	// 构建SteamCmd命令
 	args := []string{
 		"+force_install_dir", installPath,
 		"+login", "anonymous",
-		"+app_update", _const.SCUMServerAppID, "validate",
+		"+app_update", _const.SCUMServerAppID,
 		"+quit",
 	}
 
@@ -1136,12 +1136,13 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	steamCmdDir := filepath.Dir(steamCmdPath)
 	c.logger.Info("工作目录: %s", steamCmdDir)
 	c.logger.Info("开始执行 SteamCmd 安装命令（这可能需要较长时间，请耐心等待）...")
-	if err := c.runSteamCmdWithRealtimeOutput(steamCmdPath, args); err != nil {
-		c.logger.Error("SteamCmd 安装失败: %v", err)
-		return
-	}
+	err = c.runSteamCmdWithRealtimeOutput(steamCmdPath, args)
 
+	// 即使命令返回错误，也检查实际安装结果（SteamCmd有时会返回非零退出码但文件已下载）
 	c.logger.Info("SteamCmd 命令执行完成，正在验证安装结果...")
+	if err != nil {
+		c.logger.Warn("SteamCmd 命令返回错误: %v，但将继续检查安装结果", err)
+	}
 
 	// 验证安装是否成功
 	scumServerExe := filepath.Join(installPath, "steamapps", "common", "SCUM Dedicated Server", "SCUM", "Binaries", "Win64", "SCUMServer.exe")
