@@ -65,7 +65,8 @@ func (m *Manager) sendCtrlCViaHelperProcess(pid int) error {
 			}
 "@
 		
-		$type = Add-Type -TypeDefinition $signature -Name Win32Utils -Namespace Console -PassThru
+		# 使用 -TypeDefinition 时不需要 -Name 参数，因为类名已经在类型定义中
+		$type = Add-Type -TypeDefinition $signature -PassThru
 		
 		try {
 			# 附加到目标进程的控制台
