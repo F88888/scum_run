@@ -946,7 +946,7 @@ func (c *Client) performAutoInstall() {
 	c.installMux.Lock()
 	if c.installing {
 		c.installMux.Unlock()
-		c.logger.Info("Installation already in progress, skipping auto-install")
+		c.logger.Info("安装已在进行中，跳过自动安装")
 		return
 	}
 	c.installing = true
@@ -958,24 +958,34 @@ func (c *Client) performAutoInstall() {
 		c.installMux.Unlock()
 	}()
 
+	c.logger.Info("🚀 开始自动安装 SCUM 服务器...")
+
 	// 获取配置参数
 	installPath := c.config.AutoInstall.InstallPath
 	if installPath == "" {
 		installPath = _const.DefaultInstallPath
 	}
+	c.logger.Info("安装路径: %s", installPath)
 
 	steamCmdPath := c.config.AutoInstall.SteamCmdPath
 	if steamCmdPath == "" {
 		steamCmdPath = _const.DefaultSteamCmdPath
 	}
+	c.logger.Info("SteamCmd 路径: %s", steamCmdPath)
 
 	forceReinstall := c.config.AutoInstall.ForceReinstall
+	if forceReinstall {
+		c.logger.Info("强制重新安装已启用")
+	}
 
 	// 执行安装
+	c.logger.Info("开始执行 SCUM 服务器安装...")
 	c.performServerInstallation(installPath, steamCmdPath, forceReinstall)
 
 	// 安装完成后，重新初始化组件
+	c.logger.Info("安装流程完成，正在初始化组件...")
 	c.initializeComponentsAfterInstall()
+	c.logger.Info("✅ 自动安装流程完成")
 }
 
 // initializeComponentsAfterInstall initializes components after server installation
@@ -1031,22 +1041,22 @@ func (c *Client) initializeComponentsAfterInstall() {
 
 // performServerInstallation performs the actual server installation
 func (c *Client) performServerInstallation(installPath, steamCmdPath string, forceReinstall bool) {
-	// 开始安装 - 不再发送状态消息
+	c.logger.Info("📦 开始执行 SCUM 服务器安装流程...")
 
 	// 设置默认SteamCmd路径（如果为空）
 	if steamCmdPath == "" {
 		steamCmdPath = _const.DefaultSteamCmdPath
-		c.logger.Info("Using default SteamCmd path: %s", steamCmdPath)
+		c.logger.Info("使用默认 SteamCmd 路径: %s", steamCmdPath)
 	}
 
 	// 将相对路径转换为绝对路径
 	absPath, err := filepath.Abs(steamCmdPath)
 	if err != nil {
-		c.logger.Warn("Failed to get absolute path for SteamCmd, using original path: %v", err)
+		c.logger.Warn("无法获取 SteamCmd 绝对路径，使用原始路径: %v", err)
 		absPath = steamCmdPath
 	} else {
 		steamCmdPath = absPath
-		c.logger.Info("SteamCmd absolute path: %s", steamCmdPath)
+		c.logger.Info("SteamCmd 绝对路径: %s", steamCmdPath)
 	}
 
 	// 确保路径使用正确的分隔符
@@ -1054,21 +1064,23 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 
 	// 检查SteamCmd是否存在
 	if _, err = os.Stat(steamCmdPath); os.IsNotExist(err) {
-		c.logger.Info("SteamCmd not found at path: %s, downloading...", steamCmdPath)
+		c.logger.Info("SteamCmd 未找到，路径: %s，开始下载...", steamCmdPath)
 		if err = c.downloadSteamCmd(); err != nil {
-			c.logger.Error("Failed to download SteamCmd: %v", err)
+			c.logger.Error("❌ SteamCmd 下载失败: %v", err)
 			return
 		}
 
 		// 再次检查SteamCmd是否存在，使用绝对路径
 		absDownloadPath, _ := filepath.Abs(_const.DefaultSteamCmdPath)
 		if _, err = os.Stat(absDownloadPath); os.IsNotExist(err) {
-			c.logger.Error("SteamCmd still not found after download at path: %s", absDownloadPath)
+			c.logger.Error("❌ SteamCmd 下载后仍未找到，路径: %s", absDownloadPath)
 			return
 		}
 		// 更新steamCmdPath为下载后的绝对路径
 		steamCmdPath = absDownloadPath
-		c.logger.Info("Updated SteamCmd path after download: %s", steamCmdPath)
+		c.logger.Info("✅ SteamCmd 下载完成，路径已更新: %s", steamCmdPath)
+	} else {
+		c.logger.Info("✅ SteamCmd 已存在: %s", steamCmdPath)
 	}
 
 	// 设置安装路径
@@ -1079,7 +1091,7 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	// 将安装路径转换为绝对路径
 	absInstallPath, err := filepath.Abs(installPath)
 	if err != nil {
-		c.logger.Warn("Failed to get absolute path for install directory, using original path: %v", err)
+		c.logger.Warn("无法获取安装目录绝对路径，使用原始路径: %v", err)
 		absInstallPath = installPath
 	} else {
 		installPath = absInstallPath
@@ -1087,12 +1099,15 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 
 	// 确保安装路径使用正确的分隔符
 	installPath = filepath.Clean(installPath)
+	c.logger.Info("SCUM 服务器安装路径: %s", installPath)
 
 	// 创建安装目录
+	c.logger.Info("创建安装目录: %s", installPath)
 	if err = os.MkdirAll(installPath, 0755); err != nil {
-		c.logger.Error("Failed to create install directory: %v", err)
+		c.logger.Error("❌ 创建安装目录失败: %v", err)
 		return
 	}
+	c.logger.Info("✅ 安装目录创建成功")
 
 	// 构建SteamCmd命令
 	args := []string{
@@ -1102,13 +1117,16 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 		"+exit",
 	}
 
-	c.logger.Info("Executing SteamCmd with command: %s %v", steamCmdPath, args)
+	c.logger.Info("准备执行 SteamCmd 命令")
+	c.logger.Info("命令: %s %v", steamCmdPath, args)
 
 	// 再次验证SteamCmd文件是否存在且可执行
+	c.logger.Info("验证 SteamCmd 可执行文件...")
 	if err := c.validateSteamCmdExecutable(steamCmdPath); err != nil {
-		c.logger.Error("SteamCmd validation failed: %v", err)
+		c.logger.Error("❌ SteamCmd 验证失败: %v", err)
 		return
 	}
+	c.logger.Info("✅ SteamCmd 验证通过")
 
 	// 执行SteamCmd安装
 	cmd := exec.Command(steamCmdPath, args...)
@@ -1143,23 +1161,41 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	}
 
 	// 读取输出 - 使用 bufio.Scanner 进行逐行读取
+	var lastProgressTime time.Time
+	var outputLines []string
+	var errorLines []string
+
 	go func() {
 		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
 			line := scanner.Text()
-			// 检查安装进度 - 仅记录日志，不发送状态消息
+			outputLines = append(outputLines, line)
+
+			// 检查安装进度 - 记录关键信息
+			now := time.Now()
 			if strings.Contains(line, "Update state") && strings.Contains(line, "downloading") {
-				c.logger.Info("SteamCmd: Downloading SCUM server files...")
+				if now.Sub(lastProgressTime) > 10*time.Second {
+					c.logger.Info("SteamCmd: 正在下载 SCUM 服务器文件...")
+					lastProgressTime = now
+				}
 			} else if strings.Contains(line, "Update state") && strings.Contains(line, "verifying") {
-				c.logger.Info("SteamCmd: Verifying SCUM server files...")
-			} else if strings.Contains(line, "Success") {
-				c.logger.Info("SteamCmd operation completed successfully")
-			} else if strings.Contains(line, "Error") || strings.Contains(line, "Failed") {
-				c.logger.Error("SteamCmd error detected: %s", line)
+				c.logger.Info("SteamCmd: 正在验证 SCUM 服务器文件...")
+				lastProgressTime = now
+			} else if strings.Contains(line, "Success") || strings.Contains(line, "fully installed") {
+				c.logger.Info("SteamCmd: 操作成功完成")
+			} else if strings.Contains(line, "Error") || strings.Contains(line, "Failed") || strings.Contains(line, "ERROR") {
+				c.logger.Error("SteamCmd 错误: %s", line)
+				errorLines = append(errorLines, line)
+			} else if strings.Contains(line, "Progress") || strings.Contains(line, "progress") {
+				// 每10秒记录一次进度
+				if now.Sub(lastProgressTime) > 10*time.Second {
+					c.logger.Info("SteamCmd 进度: %s", line)
+					lastProgressTime = now
+				}
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			c.logger.Error("Error reading SteamCmd stdout: %v", err)
+			c.logger.Error("读取 SteamCmd stdout 时出错: %v", err)
 		}
 	}()
 
@@ -1168,27 +1204,54 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 		for scanner.Scan() {
 			line := scanner.Text()
 			c.logger.Warn("SteamCmd stderr: %s", line)
+			errorLines = append(errorLines, line)
 		}
 		if err := scanner.Err(); err != nil {
-			c.logger.Error("Error reading SteamCmd stderr: %v", err)
+			c.logger.Error("读取 SteamCmd stderr 时出错: %v", err)
 		}
 	}()
 
 	// 等待命令完成
+	c.logger.Info("等待 SteamCmd 安装完成（这可能需要较长时间，请耐心等待）...")
 	err = cmd.Wait()
 
 	if err != nil {
-		c.logger.Error("SteamCmd installation failed: %v", err)
+		c.logger.Error("SteamCmd 安装失败: %v", err)
+		if len(errorLines) > 0 {
+			c.logger.Error("SteamCmd 错误输出（最后10行）:")
+			start := len(errorLines) - 10
+			if start < 0 {
+				start = 0
+			}
+			for _, line := range errorLines[start:] {
+				c.logger.Error("  %s", line)
+			}
+		}
 		return
 	}
 
+	c.logger.Info("SteamCmd 命令执行完成，正在验证安装结果...")
+
 	// 验证安装是否成功
 	scumServerExe := filepath.Join(installPath, "steamapps", "common", "SCUM Dedicated Server", "SCUM", "Binaries", "Win64", "SCUMServer.exe")
+	c.logger.Info("检查 SCUM 服务器可执行文件: %s", scumServerExe)
 	if _, err := os.Stat(scumServerExe); err != nil {
-		c.logger.Error("SCUM server executable not found after installation: %s", scumServerExe)
-		c.logger.Error("Installation completed but SCUM server executable not found")
+		c.logger.Error("SCUM 服务器可执行文件未找到: %s", scumServerExe)
+		c.logger.Error("安装完成但未找到 SCUM 服务器可执行文件")
+
+		// 列出安装目录内容以便调试
+		installDir := filepath.Dir(filepath.Dir(filepath.Dir(scumServerExe)))
+		c.logger.Info("检查安装目录: %s", installDir)
+		if entries, err := os.ReadDir(installDir); err == nil {
+			c.logger.Info("安装目录内容:")
+			for _, entry := range entries {
+				c.logger.Info("  - %s", entry.Name())
+			}
+		}
 		return
 	}
+
+	c.logger.Info("✅ SCUM 服务器安装成功: %s", scumServerExe)
 }
 
 // checkServerInstallation checks if SCUM server is installed in multiple possible locations
@@ -1481,12 +1544,17 @@ func (c *Client) performSteamCmdDownload() {
 func (c *Client) downloadSteamCmd() error {
 	steamCmdURL := _const.DefaultSteamCmdURL
 	steamCmdDir := _const.DefaultSteamCmdDir
+
+	c.logger.Info("开始下载 SteamCmd，URL: %s", steamCmdURL)
+	c.logger.Info("SteamCmd 目标目录: %s", steamCmdDir)
+
 	// 创建目录
 	if err := os.MkdirAll(steamCmdDir, 0755); err != nil {
 		return fmt.Errorf("failed to create steamcmd directory: %w", err)
 	}
 
 	// 下载文件
+	c.logger.Info("正在下载 SteamCmd...")
 	response, err := http.Get(steamCmdURL)
 	if err != nil {
 		return fmt.Errorf("failed to download steamcmd: %w", err)
@@ -1497,39 +1565,70 @@ func (c *Client) downloadSteamCmd() error {
 		}
 	}()
 
+	// 检查响应状态码
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to download steamcmd: HTTP %d", response.StatusCode)
+	}
+
 	// 创建临时文件
 	tempFile := filepath.Join(steamCmdDir, "steamcmd.zip")
 	out, err := os.Create(tempFile)
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %w", err)
 	}
-	defer func() {
-		if err := out.Close(); err != nil {
-			c.logger.Warn("Failed to close temp file: %v", err)
-		}
-	}()
 
 	// 写入文件
+	c.logger.Info("正在保存 SteamCmd 到临时文件: %s", tempFile)
 	_, err = io.Copy(out, response.Body)
 	if err != nil {
+		out.Close()
 		return fmt.Errorf("failed to write steamcmd.zip: %w", err)
 	}
 
+	// 关闭文件句柄，确保数据写入磁盘
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("failed to close temp file: %w", err)
+	}
+
+	// 获取文件大小
+	var fileSize int64
+	if info, err := os.Stat(tempFile); err == nil {
+		fileSize = info.Size()
+	}
+	c.logger.Info("SteamCmd 下载完成，文件大小: %d bytes", fileSize)
+
 	// 解压文件
+	c.logger.Info("正在解压 SteamCmd...")
 	if err := c.extractZip(tempFile, steamCmdDir); err != nil {
 		return fmt.Errorf("failed to extract steamcmd.zip: %w", err)
 	}
+	c.logger.Info("SteamCmd 解压完成")
+
+	// 等待一小段时间，确保所有文件句柄都已关闭
+	time.Sleep(500 * time.Millisecond)
 
 	// 删除临时文件
 	if err := os.Remove(tempFile); err != nil {
-		c.logger.Warn("Failed to remove temp file %s: %v", tempFile, err)
+		c.logger.Warn("Failed to remove temp file %s: %v (this is not critical)", tempFile, err)
+		// 尝试延迟删除
+		go func() {
+			time.Sleep(2 * time.Second)
+			if err := os.Remove(tempFile); err != nil {
+				c.logger.Debug("Failed to remove temp file after delay: %v", err)
+			}
+		}()
+	} else {
+		c.logger.Info("临时文件已删除: %s", tempFile)
 	}
 
 	// 验证SteamCmd是否成功解压
 	expectedPath := _const.DefaultSteamCmdPath
+	c.logger.Info("验证 SteamCmd 可执行文件: %s", expectedPath)
 	if _, err := os.Stat(expectedPath); err != nil {
 		return fmt.Errorf("steamcmd.exe not found after extraction at %s: %w", expectedPath, err)
 	}
+
+	c.logger.Info("SteamCmd 下载和安装成功: %s", expectedPath)
 	return nil
 }
 
