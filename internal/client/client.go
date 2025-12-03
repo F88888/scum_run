@@ -30,7 +30,7 @@ import (
 	"scum_run/internal/logmonitor"
 	"scum_run/internal/monitor"
 	"scum_run/internal/process"
-	"scum_run/internal/runtime"
+	runtimeMode "scum_run/internal/runtime"
 	"scum_run/internal/steam"
 	"scum_run/internal/steamtools"
 	"scum_run/internal/updater"
@@ -517,7 +517,7 @@ func (c *Client) handleServerStart() {
 	}
 
 	// 检查并安装必要的运行时依赖
-	runtimeChecker := runtime.NewChecker(c.logger)
+	runtimeChecker := runtimeMode.NewChecker(c.logger)
 	if err := runtimeChecker.CheckAndInstallRuntimes(); err != nil {
 		c.logger.Error("运行时依赖检查/安装失败: %v", err)
 		c.sendResponse(MsgTypeServerStart, nil, fmt.Sprintf("运行时依赖检查失败: %v", err))
