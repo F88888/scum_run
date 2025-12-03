@@ -1119,7 +1119,7 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 
 	// 再次验证SteamCmd文件是否存在且可执行
 	c.logger.Info("验证 SteamCmd 可执行文件...")
-	if err := c.validateSteamCmdExecutable(steamCmdPath); err != nil {
+	if err = c.validateSteamCmdExecutable(steamCmdPath); err != nil {
 		c.logger.Error("❌ SteamCmd 验证失败: %v", err)
 		return
 	}
@@ -1127,7 +1127,7 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 
 	// 先初始化 SteamCmd（第一次运行时会自动更新）
 	c.logger.Info("🔧 初始化 SteamCmd（首次运行会自动更新依赖）...")
-	if err := c.initializeSteamCmd(steamCmdPath); err != nil {
+	if err = c.initializeSteamCmd(steamCmdPath); err != nil {
 		c.logger.Warn("SteamCmd 初始化警告（可能已初始化）: %v", err)
 		// 继续执行，因为可能已经初始化过了
 	} else {
@@ -1271,10 +1271,9 @@ func (c *Client) initializeSteamCmd(steamCmdPath string) error {
 
 	c.logger.Info("运行 SteamCmd 进行初始化（首次运行会自动更新）...")
 
-	ctx, cancel := context.Background()
-	defer cancel()
+	ctx := context.Background()
 
-	cmd := exec.CommandContext(ctx, steamCmdPath, initArgs...)
+	cmd := exec.CommandContext(ctx, steamCmdPath)
 	cmd.Dir = steamCmdDir
 	cmd.Env = os.Environ()
 
@@ -1283,7 +1282,7 @@ func (c *Client) initializeSteamCmd(steamCmdPath string) error {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	c.logger.Info("执行 SteamCmd 初始化命令: %s %v", steamCmdPath, initArgs)
+	c.logger.Info("执行 SteamCmd 初始化命令: %s %v", steamCmdPath)
 	err := cmd.Run()
 
 	// 检查输出
