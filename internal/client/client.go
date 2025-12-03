@@ -1117,9 +1117,6 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 		"+quit",
 	}
 
-	c.logger.Info("准备执行 SteamCmd 命令")
-	c.logger.Info("命令: %s %v", steamCmdPath, args)
-
 	// 再次验证SteamCmd文件是否存在且可执行
 	c.logger.Info("验证 SteamCmd 可执行文件...")
 	if err := c.validateSteamCmdExecutable(steamCmdPath); err != nil {
@@ -1129,13 +1126,18 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	c.logger.Info("✅ SteamCmd 验证通过")
 
 	// 先初始化 SteamCmd（第一次运行时会自动更新）
-	c.logger.Info("初始化 SteamCmd（首次运行会自动更新）...")
+	c.logger.Info("🔧 初始化 SteamCmd（首次运行会自动更新依赖）...")
 	if err := c.initializeSteamCmd(steamCmdPath); err != nil {
 		c.logger.Warn("SteamCmd 初始化警告（可能已初始化）: %v", err)
 		// 继续执行，因为可能已经初始化过了
 	} else {
 		c.logger.Info("✅ SteamCmd 初始化完成")
 	}
+
+	// 准备执行 SteamCmd 命令
+	c.logger.Info("准备执行 SteamCmd 安装命令...")
+	commandStr := fmt.Sprintf("%s %s", steamCmdPath, strings.Join(args, " "))
+	c.logger.Info("完整命令: %s", commandStr)
 
 	// 执行SteamCmd安装
 	cmd := exec.Command(steamCmdPath, args...)
@@ -1147,8 +1149,8 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	// 设置环境变量
 	cmd.Env = os.Environ()
 
-	c.logger.Info("Working directory: %s", cmd.Dir)
-	c.logger.Info("Full command: %s %v", steamCmdPath, args)
+	c.logger.Info("工作目录: %s", cmd.Dir)
+	c.logger.Info("开始执行 SteamCmd 安装命令...")
 
 	// 使用管道获取实时输出
 	stdout, err := cmd.StdoutPipe()
