@@ -53,8 +53,10 @@ func (m *Manager) sendCtrlC(pid int) error {
 	time.Sleep(100 * time.Millisecond)
 
 	// 发送Ctrl+C事件
-	// 参数：CTRL_C_EVENT, 0 表示发送给所有共享此控制台的进程
-	ret, _, err = procGenerateConsoleCtrlEvent.Call(CTRL_C_EVENT, 0)
+	// 重要：第二个参数使用进程ID（PID）而不是0
+	// 使用0会发送给所有共享控制台的进程组，可能导致scum_run也收到信号
+	// 使用PID确保只发送给目标进程组
+	ret, _, err = procGenerateConsoleCtrlEvent.Call(CTRL_C_EVENT, uintptr(pid))
 
 	// 立即释放控制台，防止影响主程序
 	procFreeConsole.Call()
