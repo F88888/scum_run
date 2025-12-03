@@ -14,7 +14,6 @@ var (
 	procGenerateConsoleCtrlEvent = kernel32.NewProc("GenerateConsoleCtrlEvent")
 	procAttachConsole            = kernel32.NewProc("AttachConsole")
 	procFreeConsole              = kernel32.NewProc("FreeConsole")
-	procSetConsoleCtrlHandler    = kernel32.NewProc("SetConsoleCtrlHandler")
 )
 
 const (
@@ -24,20 +23,31 @@ const (
 )
 
 // sendCtrlC 向指定进程发送Ctrl+C信号
-// @description: 使用Windows API发送CTRL_C_EVENT信号，这是SCUM服务器优雅关闭的正确方式
+// @description: 使用Windows API发送CTRL_C_EVENT或CTRL_BREAK_EVENT信号
+//
+//	scum_run 在启动时已经通过 SetConsoleCtrlHandler(NULL, TRUE) 禁用了 Ctrl+C 处理
+//	所以即使发送 Ctrl+C，scum_run 也不会退出
+//
 // @param: pid int 目标进程ID
 // @return: error 错误信息
 func (m *Manager) sendCtrlC(pid int) error {
 	m.logger.Info("Sending Ctrl+C to process (PID: %d)", pid)
 
-	// 注意：scum_run 主程序已经在启动时通过 SetConsoleCtrlHandler(NULL, TRUE) 禁用了 Ctrl+C
-	// 所以这里不需要再临时禁用，直接发送信号即可
-	// 即使 scum_run 收到信号，也会被忽略
+	// 方法1：优先使用 CTRL_BREAK_EVENT
+	// CTRL_BREAK_EVENT 可以直接发送给特定进程组，不需要附加控制台
+	// 使用 CREATE_NEW_PROCESS_GROUP 启动的进程，其进程组ID等于PID
+	m.logger.Info("Attempting to send CTRL_BREAK_EVENT to process group (PID: %d)", pid)
+	ret, _, err := procGenerateConsoleCtrlEvent.Call(CTRL_BREAK_EVENT, uintptr(pid))
+	if ret != 0 {
+		m.logger.Info("Successfully sent CTRL_BREAK_EVENT to process (PID: %d)", pid)
+		return nil
+	}
+	m.logger.Warn("Failed to send CTRL_BREAK_EVENT: %v, trying CTRL_C_EVENT with AttachConsole", err)
 
-	// 尝试附加到目标进程的控制台
-	ret, _, err := procAttachConsole.Call(uintptr(pid))
+	// 方法2：如果 CTRL_BREAK_EVENT 失败，使用 AttachConsole + CTRL_C_EVENT
+	// 由于 scum_run 已经在启动时禁用了 Ctrl+C 处理，即使附加到同一控制台也不会退出
+	ret, _, err = procAttachConsole.Call(uintptr(pid))
 	if ret == 0 {
-		// 如果无法附加（进程可能没有控制台），尝试其他方法
 		m.logger.Warn("Failed to attach to console of PID %d: %v", pid, err)
 		return fmt.Errorf("cannot attach to process console: %v", err)
 	}
@@ -45,32 +55,19 @@ func (m *Manager) sendCtrlC(pid int) error {
 	// 等待一小段时间确保附加完成
 	time.Sleep(100 * time.Millisecond)
 
-	// 发送Ctrl+C事件
-	// 重要：第二个参数使用进程ID（PID）而不是0
-	// 使用0会发送给所有共享控制台的进程组，可能导致scum_run也收到信号
-	// 使用PID确保只发送给目标进程组
-	// 即使 scum_run 收到信号，主程序已经禁用了 Ctrl+C 处理，所以不会退出
-	ret, _, err = procGenerateConsoleCtrlEvent.Call(CTRL_C_EVENT, uintptr(pid))
+	// 发送 CTRL_C_EVENT
+	// 第二个参数使用 0 发送给当前控制台的所有进程
+	// 但由于 scum_run 已经禁用了 Ctrl+C 处理，它不会退出
+	ret, _, err = procGenerateConsoleCtrlEvent.Call(CTRL_C_EVENT, 0)
 
-	// 立即释放控制台，防止影响主程序
+	// 立即释放控制台
 	procFreeConsole.Call()
 
 	if ret == 0 {
-		m.logger.Error("Failed to send Ctrl+C event: %v", err)
-		return fmt.Errorf("failed to generate Ctrl+C event: %v", err)
+		m.logger.Error("Failed to send CTRL_C event: %v", err)
+		return fmt.Errorf("failed to generate CTRL_C event: %v", err)
 	}
 
-	m.logger.Info("Successfully sent Ctrl+C to process (PID: %d)", pid)
+	m.logger.Info("Successfully sent CTRL_C to process (PID: %d)", pid)
 	return nil
-}
-
-// sendCtrlCViaCreateProcess 使用helper进程发送Ctrl+C (备用方案)
-// @description: 如果直接发送失败，使用辅助进程的方式发送Ctrl+C
-// @param: pid int 目标进程ID
-// @return: error 错误信息
-func (m *Manager) sendCtrlCViaCreateProcess(pid int) error {
-	// 这是一个备用方案，使用外部工具
-	// 可以考虑使用 windows-kill 等工具或者编写一个简单的C helper
-	m.logger.Warn("Alternative Ctrl+C sending method not implemented yet")
-	return fmt.Errorf("alternative method not available")
 }

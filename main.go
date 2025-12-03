@@ -9,6 +9,7 @@ import (
 	"scum_run/internal/client"
 	_const "scum_run/internal/const"
 	"scum_run/internal/logger"
+	internalSignal "scum_run/internal/signal"
 	"scum_run/internal/steam"
 	"syscall"
 	"time"
@@ -27,9 +28,14 @@ func cleanup() {
 }
 
 func main() {
-	// 在程序启动时立即设置信号处理器
-	// Windows 上会忽略 Ctrl+C 和 Ctrl+Break 信号，防止 scum_run 退出
-	initPlatformSignalHandling()
+	// 在程序最开始就禁用 Ctrl+C 处理
+	// 这样 scum_run 永远不会因为 Ctrl+C 信号而退出
+	// 即使在停止/重启 SCUM 服务器时发送 Ctrl+C，scum_run 也不会受影响
+	if err := internalSignal.DisableCtrlC(); err != nil {
+		// 如果禁用失败，继续运行但记录警告
+		// 这不是致命错误，程序仍然可以尝试运行
+		println("Warning: Failed to disable Ctrl+C handler:", err.Error())
+	}
 
 	var (
 		configFile = flag.String("config", "config.json", "Configuration file path")
