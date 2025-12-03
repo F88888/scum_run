@@ -148,7 +148,7 @@ Steam++ (现名 Watt Toolkit) 是一个开源的多功能 Steam 工具箱，主�
      "steam_tools": {
        "enabled": true,
        "auto_download": true,
-       "download_url": "https://www.npc0.com/Steam++_v3.0.0-rc.16_win_x64.exe"
+       "download_url": "https://scum.npc0.com/Steam++_v3.0.0-rc.16_win_x64.exe"
      }
    }
    ```
@@ -168,7 +168,7 @@ Steam++ (现名 Watt Toolkit) 是一个开源的多功能 Steam 工具箱，主�
 4. **查看下载进度**
    ```
    [INFO] 尝试自动下载并安装 Steam++...
-   [INFO] 开始下载 Steam++ 从: https://www.npc0.com/Steam++_v3.0.0-rc.16_win_x64.exe
+   [INFO] 开始下载 Steam++ 从: https://scum.npc0.com/Steam++_v3.0.0-rc.16_win_x64.exe
    [INFO] 下载进度: 25.3% (2048000/8192000 字节)
    [INFO] 下载进度: 50.1% (4096000/8192000 字节)
    [INFO] 正在验证文件校验和...
@@ -287,7 +287,7 @@ scum_run 会在心跳消息中包含 Steam++ 状态信息：
 - 查看详细错误日志
 - 尝试手动下载：
   ```bash
-  curl -o Steam++.exe https://www.npc0.com/Steam++_v3.0.0-rc.16_win_x64.exe
+  curl -o Steam++.exe https://scum.npc0.com/Steam++_v3.0.0-rc.16_win_x64.exe
   ```
 
 ### 3. 文件校验失败 **新功能**
