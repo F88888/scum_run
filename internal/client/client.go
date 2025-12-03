@@ -1119,7 +1119,7 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 
 	// 再次验证SteamCmd文件是否存在且可执行
 	c.logger.Info("验证 SteamCmd 可执行文件...")
-	if err = c.validateSteamCmdExecutable(steamCmdPath); err != nil {
+	if err := c.validateSteamCmdExecutable(steamCmdPath); err != nil {
 		c.logger.Error("❌ SteamCmd 验证失败: %v", err)
 		return
 	}
@@ -1127,7 +1127,7 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 
 	// 先初始化 SteamCmd（第一次运行时会自动更新）
 	c.logger.Info("🔧 初始化 SteamCmd（首次运行会自动更新依赖）...")
-	if err = c.initializeSteamCmd(steamCmdPath); err != nil {
+	if err := c.initializeSteamCmd(steamCmdPath); err != nil {
 		c.logger.Warn("SteamCmd 初始化警告（可能已初始化）: %v", err)
 		// 继续执行，因为可能已经初始化过了
 	} else {
@@ -1273,20 +1273,70 @@ func (c *Client) initializeSteamCmd(steamCmdPath string) error {
 
 	ctx := context.Background()
 
+	// SteamCmd 初始化不需要参数，直接运行即可
 	cmd := exec.CommandContext(ctx, steamCmdPath)
 	cmd.Dir = steamCmdDir
 	cmd.Env = os.Environ()
 
-	// 捕获输出
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	// 使用管道获取实时输出
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		c.logger.Error("Failed to create stdout pipe: %v", err)
+		return err
+	}
 
-	c.logger.Info("执行 SteamCmd 初始化命令: %s %v", steamCmdPath)
-	err := cmd.Run()
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		c.logger.Error("Failed to create stderr pipe: %v", err)
+		return err
+	}
+
+	// 同时捕获输出到缓冲区以便后续检查
+	var stdoutBuf, stderrBuf bytes.Buffer
+	stdoutMulti := io.MultiWriter(&stdoutBuf, os.Stdout)
+	stderrMulti := io.MultiWriter(&stderrBuf, os.Stderr)
+
+	// 启动命令
+	c.logger.Info("执行 SteamCmd 初始化命令: %s", steamCmdPath)
+	if err := cmd.Start(); err != nil {
+		c.logger.Error("Failed to start SteamCmd: %v", err)
+		return err
+	}
+
+	// 实时读取并打印输出
+	go func() {
+		scanner := bufio.NewScanner(stdoutPipe)
+		for scanner.Scan() {
+			line := scanner.Text()
+			// 实时打印到标准输出
+			fmt.Fprintln(stdoutMulti, line)
+			// 同时记录到日志
+			c.logger.Info("SteamCmd: %s", line)
+		}
+		if err := scanner.Err(); err != nil {
+			c.logger.Error("读取 SteamCmd stdout 时出错: %v", err)
+		}
+	}()
+
+	go func() {
+		scanner := bufio.NewScanner(stderrPipe)
+		for scanner.Scan() {
+			line := scanner.Text()
+			// 实时打印到标准错误输出
+			fmt.Fprintln(stderrMulti, line)
+			// 同时记录到日志
+			c.logger.Warn("SteamCmd stderr: %s", line)
+		}
+		if err := scanner.Err(); err != nil {
+			c.logger.Error("读取 SteamCmd stderr 时出错: %v", err)
+		}
+	}()
+
+	// 等待命令完成
+	err = cmd.Wait()
 
 	// 检查输出
-	output := stdout.String() + stderr.String()
+	output := stdoutBuf.String() + stderrBuf.String()
 
 	if err != nil {
 		// 检查是否是超时错误
