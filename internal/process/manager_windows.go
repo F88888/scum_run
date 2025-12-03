@@ -30,19 +30,12 @@ const (
 func (m *Manager) sendCtrlC(pid int) error {
 	m.logger.Info("Sending Ctrl+C to process (PID: %d)", pid)
 
-	// 临时禁用scum_run主程序的Ctrl+C处理器，避免自己收到信号
-	// 设置为true表示忽略Ctrl+C事件
-	ret, _, err := procSetConsoleCtrlHandler.Call(0, 1)
-	if ret == 0 {
-		m.logger.Warn("Failed to disable Ctrl+C handler: %v", err)
-	}
-	defer func() {
-		// 恢复Ctrl+C处理器
-		procSetConsoleCtrlHandler.Call(0, 0)
-	}()
+	// 注意：scum_run 主程序已经在启动时通过 SetConsoleCtrlHandler(NULL, TRUE) 禁用了 Ctrl+C
+	// 所以这里不需要再临时禁用，直接发送信号即可
+	// 即使 scum_run 收到信号，也会被忽略
 
 	// 尝试附加到目标进程的控制台
-	ret, _, err = procAttachConsole.Call(uintptr(pid))
+	ret, _, err := procAttachConsole.Call(uintptr(pid))
 	if ret == 0 {
 		// 如果无法附加（进程可能没有控制台），尝试其他方法
 		m.logger.Warn("Failed to attach to console of PID %d: %v", pid, err)
@@ -56,6 +49,7 @@ func (m *Manager) sendCtrlC(pid int) error {
 	// 重要：第二个参数使用进程ID（PID）而不是0
 	// 使用0会发送给所有共享控制台的进程组，可能导致scum_run也收到信号
 	// 使用PID确保只发送给目标进程组
+	// 即使 scum_run 收到信号，主程序已经禁用了 Ctrl+C 处理，所以不会退出
 	ret, _, err = procGenerateConsoleCtrlEvent.Call(CTRL_C_EVENT, uintptr(pid))
 
 	// 立即释放控制台，防止影响主程序
