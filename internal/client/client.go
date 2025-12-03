@@ -430,8 +430,6 @@ func (c *Client) handleMessages() {
 
 // handleMessage handles a single WebSocket message
 func (c *Client) handleMessage(msg request.WebSocketMessage) {
-	c.logger.Info("🔍 [DEBUG] 接收到WebSocket消息: type=%s, data=%+v", msg.Type, msg.Data)
-
 	switch msg.Type {
 	case MsgTypeServerStart:
 		c.handleServerStart()
