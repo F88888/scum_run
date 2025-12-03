@@ -45,63 +45,36 @@ func (c *Checker) CheckAndInstallRuntimes() error {
 	return nil
 }
 
-// checkAndInstallVCRedist 检查并安装 Visual C++ Redistributables
+// checkAndInstallVCRedist 检查并安装 Visual C++ Redistributables v14 (适用于 Visual Studio 2017-2026)
 func (c *Checker) checkAndInstallVCRedist() error {
-	c.logger.Info("检查 Visual C++ Redistributables...")
+	c.logger.Info("检查 Visual C++ Redistributables v14 (适用于 Visual Studio 2017-2026)...")
 
-	// 需要检查的版本：2012, 2013, 2015-2022
-	versions := []struct {
-		name     string
-		registry []string // 多个注册表路径用于检查
-		url      string
-		filename string
-	}{
-		{
-			"Visual C++ 2012",
-			[]string{`SOFTWARE\Microsoft\VisualStudio\11.0\VC\Runtimes\x64`, `SOFTWARE\Wow6432Node\Microsoft\VisualStudio\11.0\VC\Runtimes\x64`},
-			"https://download.microsoft.com/download/1/6/5/165255E7-1014-4D0A-B094-69A1F4EDE47D/vcredist_x64.exe",
-			"vcredist_2012_x64.exe",
-		},
-		{
-			"Visual C++ 2013",
-			[]string{`SOFTWARE\Microsoft\VisualStudio\12.0\VC\Runtimes\x64`, `SOFTWARE\Wow6432Node\Microsoft\VisualStudio\12.0\VC\Runtimes\x64`},
-			"https://download.microsoft.com/download/2/E/6/2E61CFA4-993B-4DD4-91DA-3737CD5CD6E3/vcredist_x64.exe",
-			"vcredist_2013_x64.exe",
-		},
-		{
-			"Visual C++ 2015-2022",
-			[]string{`SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64`, `SOFTWARE\Wow6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\x64`},
-			"https://aka.ms/vs/17/release/vc_redist.x64.exe",
-			"vc_redist.x64.exe",
-		},
+	// Visual C++ Redistributable v14 的注册表路径
+	registryPaths := []string{
+		_const.VCRedistRegistryPath1,
+		_const.VCRedistRegistryPath2,
 	}
 
-	allInstalled := true
-	for _, v := range versions {
-		installed := false
-		for _, regPath := range v.registry {
-			if ok, _ := c.checkVCRedistInstalled(regPath); ok {
-				installed = true
-				break
-			}
-		}
-
-		if !installed {
-			c.logger.Warn("❌ %s 未安装", v.name)
-			allInstalled = false
-
-			// 下载并安装
-			if err := c.downloadAndInstallVCRedist(v.url, v.filename, v.name); err != nil {
-				c.logger.Error("安装 %s 失败: %v", v.name, err)
-				return err
-			}
-		} else {
-			c.logger.Info("✅ %s 已安装", v.name)
+	// 检查是否已安装
+	installed := false
+	for _, regPath := range registryPaths {
+		if ok, _ := c.checkVCRedistInstalled(regPath); ok {
+			installed = true
+			break
 		}
 	}
 
-	if allInstalled {
-		c.logger.Info("✅ 所有 Visual C++ Redistributables 已安装")
+	if !installed {
+		c.logger.Warn("❌ Visual C++ Redistributables v14 未安装")
+
+		// 下载并安装
+		name := "Visual C++ Redistributables v14 (适用于 Visual Studio 2017-2026)"
+		if err := c.downloadAndInstallVCRedist(_const.DefaultVisualCURL, _const.VCRedistFilename, name); err != nil {
+			c.logger.Error("安装 %s 失败: %v", name, err)
+			return err
+		}
+	} else {
+		c.logger.Info("✅ Visual C++ Redistributables v14 已安装")
 	}
 
 	return nil
@@ -110,7 +83,7 @@ func (c *Checker) checkAndInstallVCRedist() error {
 // checkVCRedistInstalled 检查 Visual C++ Redistributable 是否已安装
 func (c *Checker) checkVCRedistInstalled(registryPath string) (bool, error) {
 	// 使用 reg query 命令检查注册表
-	cmd := exec.Command("reg", "query", fmt.Sprintf("HKLM\\%s", registryPath), "/v", "Version")
+	cmd := exec.Command("reg", "query", fmt.Sprintf("%s%s", _const.RegistryHKLMPrefix, registryPath), _const.RegistryQueryV, _const.RegistryVersionKey)
 	output, err := cmd.Output()
 	if err != nil {
 		// 如果命令失败，可能表示未安装
@@ -118,7 +91,7 @@ func (c *Checker) checkVCRedistInstalled(registryPath string) (bool, error) {
 	}
 
 	// 检查输出中是否包含 Version
-	return strings.Contains(strings.ToLower(string(output)), "version"), nil
+	return strings.Contains(strings.ToLower(string(output)), strings.ToLower(_const.RegistryVersionKey)), nil
 }
 
 // downloadAndInstallVCRedist 下载并安装 Visual C++ Redistributable
@@ -126,7 +99,7 @@ func (c *Checker) downloadAndInstallVCRedist(url, filename, name string) error {
 	c.logger.Info("📥 开始下载 %s...", name)
 
 	// 创建临时目录
-	tempDir := filepath.Join(os.TempDir(), "scum_runtime")
+	tempDir := filepath.Join(os.TempDir(), _const.RuntimeTempDir)
 	if err := os.MkdirAll(tempDir, 0755); err != nil {
 		return fmt.Errorf("创建临时目录失败: %w", err)
 	}
@@ -139,16 +112,8 @@ func (c *Checker) downloadAndInstallVCRedist(url, filename, name string) error {
 
 	c.logger.Info("📦 开始安装 %s...", name)
 
-	// 静默安装（不同版本参数可能不同，使用通用参数）
-	var installArgs []string
-	if strings.Contains(name, "2015-2022") {
-		// 2015-2022 版本使用 /install /quiet /norestart
-		installArgs = []string{"/install", "/quiet", "/norestart"}
-	} else {
-		// 2012/2013 版本使用 /q /norestart
-		installArgs = []string{"/q", "/norestart"}
-	}
-
+	// Visual C++ Redistributable v14 使用 /install /quiet /norestart 参数
+	installArgs := []string{_const.VCInstallArgInstall, _const.VCInstallArgQuiet, _const.VCInstallArgNoRestart}
 	cmd := exec.Command(filePath, installArgs...)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("安装失败: %w", err)
@@ -157,7 +122,7 @@ func (c *Checker) downloadAndInstallVCRedist(url, filename, name string) error {
 	c.logger.Info("✅ %s 安装完成", name)
 
 	// 等待安装完成
-	time.Sleep(2 * time.Second)
+	time.Sleep(time.Duration(_const.VCRedistWaitTime) * time.Second)
 
 	// 清理临时文件
 	os.Remove(filePath)
@@ -170,7 +135,7 @@ func (c *Checker) checkAndInstallDirectX() error {
 	c.logger.Info("检查 DirectX End-User Runtimes...")
 
 	// 检查 d3dx9_43.dll 是否存在（DirectX 9 的典型文件）
-	directX9Path := filepath.Join(os.Getenv("WINDIR"), "System32", "d3dx9_43.dll")
+	directX9Path := filepath.Join(os.Getenv("WINDIR"), _const.WindowsSystem32, _const.DirectXCheckDll)
 	if _, err := os.Stat(directX9Path); err == nil {
 		c.logger.Info("✅ DirectX 已安装")
 		return nil
@@ -178,11 +143,8 @@ func (c *Checker) checkAndInstallDirectX() error {
 
 	c.logger.Warn("❌ DirectX 未安装，开始下载安装...")
 
-	// DirectX End-User Runtimes 下载链接 (eugamehost.com)
-	directXFile := "directx_redist.exe"
-
 	// 下载并安装
-	if err := c.downloadAndInstallDirectX(_const.DefaultDirectxURL, directXFile); err != nil {
+	if err := c.downloadAndInstallDirectX(_const.DefaultDirectxURL, _const.DirectXRedistFile); err != nil {
 		return err
 	}
 
@@ -194,7 +156,7 @@ func (c *Checker) downloadAndInstallDirectX(url, filename string) error {
 	c.logger.Info("📥 开始下载 DirectX End-User Runtimes...")
 
 	// 创建临时目录
-	tempDir := filepath.Join(os.TempDir(), "scum_runtime")
+	tempDir := filepath.Join(os.TempDir(), _const.RuntimeTempDir)
 	if err := os.MkdirAll(tempDir, 0755); err != nil {
 		return fmt.Errorf("创建临时目录失败: %w", err)
 	}
@@ -208,20 +170,20 @@ func (c *Checker) downloadAndInstallDirectX(url, filename string) error {
 	c.logger.Info("📦 开始安装 DirectX...")
 
 	// 解压并安装 DirectX（DirectX 安装程序需要先解压）
-	extractDir := filepath.Join(tempDir, "directx_extract")
+	extractDir := filepath.Join(tempDir, _const.DirectXExtractDir)
 	if err := os.MkdirAll(extractDir, 0755); err != nil {
 		return fmt.Errorf("创建解压目录失败: %w", err)
 	}
 
 	// DirectX 安装程序需要 /Q 参数进行静默安装
-	cmd := exec.Command(filePath, "/Q", "/T:"+extractDir)
+	cmd := exec.Command(filePath, _const.DirectXExtractArgQ, _const.DirectXExtractArgT+extractDir)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("解压失败: %w", err)
 	}
 
 	// 运行解压后的安装程序
-	installerPath := filepath.Join(extractDir, "DXSETUP.exe")
-	installCmd := exec.Command(installerPath, "/silent")
+	installerPath := filepath.Join(extractDir, _const.DirectXSetupExe)
+	installCmd := exec.Command(installerPath, _const.DirectXInstallArgSilent)
 	if err := installCmd.Run(); err != nil {
 		return fmt.Errorf("安装失败: %w", err)
 	}
@@ -229,7 +191,7 @@ func (c *Checker) downloadAndInstallDirectX(url, filename string) error {
 	c.logger.Info("✅ DirectX 安装完成")
 
 	// 等待安装完成
-	time.Sleep(3 * time.Second)
+	time.Sleep(time.Duration(_const.DirectXWaitTime) * time.Second)
 
 	// 清理临时文件
 	os.RemoveAll(tempDir)
