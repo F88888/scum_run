@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os/exec"
 	"syscall"
-	"time"
 )
 
 var (
