@@ -91,6 +91,12 @@ func main() {
 	// Initialize SCUM client
 	scumClient = client.New(cfg, steamDir, logger)
 
+	// 设置关闭回调，当控制台关闭时优雅停止 SCUM 服务器
+	internalSignal.SetShutdownCallback(func() {
+		logger.Info("Console closing, gracefully stopping SCUM server...")
+		cleanup()
+	})
+
 	// Register cleanup function to run on exit
 	runtime.SetFinalizer(scumClient, func(*client.Client) {
 		cleanup()
