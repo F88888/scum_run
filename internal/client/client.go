@@ -1109,12 +1109,12 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	}
 	c.logger.Info("✅ 安装目录创建成功")
 
-	// 构建SteamCmd命令
+	// 构建SteamCmd命令（使用 +quit 而不是 +exit）
 	args := []string{
 		"+force_install_dir", installPath,
 		"+login", "anonymous",
 		"+app_update", _const.SCUMServerAppID, "validate",
-		"+exit",
+		"+quit",
 	}
 
 	c.logger.Info("准备执行 SteamCmd 命令")
@@ -1127,6 +1127,15 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 		return
 	}
 	c.logger.Info("✅ SteamCmd 验证通过")
+
+	// 先初始化 SteamCmd（第一次运行时会自动更新）
+	c.logger.Info("初始化 SteamCmd（首次运行会自动更新）...")
+	if err := c.initializeSteamCmd(steamCmdPath); err != nil {
+		c.logger.Warn("SteamCmd 初始化警告（可能已初始化）: %v", err)
+		// 继续执行，因为可能已经初始化过了
+	} else {
+		c.logger.Info("✅ SteamCmd 初始化完成")
+	}
 
 	// 执行SteamCmd安装
 	cmd := exec.Command(steamCmdPath, args...)
@@ -1252,6 +1261,64 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 	}
 
 	c.logger.Info("✅ SCUM 服务器安装成功: %s", scumServerExe)
+}
+
+// initializeSteamCmd initializes SteamCmd by running it once to download updates
+func (c *Client) initializeSteamCmd(steamCmdPath string) error {
+	steamCmdDir := filepath.Dir(steamCmdPath)
+
+	c.logger.Info("运行 SteamCmd 进行初始化（首次运行会自动更新）...")
+
+	// 运行一个简单的命令来初始化 SteamCmd（首次运行会自动更新）
+	// 使用 +quit 让 SteamCmd 启动后立即退出，这样它会先更新自己
+	initArgs := []string{"+quit"}
+
+	// 设置超时（120秒应该足够初始化，因为首次运行可能需要下载更新）
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, steamCmdPath, initArgs...)
+	cmd.Dir = steamCmdDir
+	cmd.Env = os.Environ()
+
+	// 捕获输出
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	c.logger.Info("执行 SteamCmd 初始化命令: %s %v", steamCmdPath, initArgs)
+	err := cmd.Run()
+
+	// 检查输出
+	output := stdout.String() + stderr.String()
+
+	if err != nil {
+		// 检查是否是超时错误
+		if ctx.Err() == context.DeadlineExceeded {
+			c.logger.Warn("SteamCmd 初始化超时（可能正在更新，这是正常的）")
+			// 超时不一定意味着失败，可能正在更新
+			return nil
+		}
+		// 检查输出中是否有更新信息（即使有错误，如果正在更新也是正常的）
+		if strings.Contains(strings.ToLower(output), "update") ||
+			strings.Contains(strings.ToLower(output), "downloading") ||
+			strings.Contains(strings.ToLower(output), "updating") {
+			c.logger.Info("SteamCmd 正在更新（这是正常的）")
+			return nil
+		}
+		c.logger.Debug("SteamCmd 初始化完成（可能已初始化）: %v", err)
+	} else {
+		c.logger.Info("✅ SteamCmd 初始化完成")
+	}
+
+	// 检查输出中是否有更新信息
+	if strings.Contains(strings.ToLower(output), "update") ||
+		strings.Contains(strings.ToLower(output), "downloading") ||
+		strings.Contains(strings.ToLower(output), "updating") {
+		c.logger.Info("SteamCmd 正在更新...")
+	}
+
+	return nil
 }
 
 // checkServerInstallation checks if SCUM server is installed in multiple possible locations
