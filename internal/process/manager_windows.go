@@ -43,9 +43,10 @@ func (m *Manager) sendCtrlC(pid int) error {
 func (m *Manager) sendCtrlCViaHelperProcess(pid int) error {
 	// 使用 PowerShell 脚本作为辅助进程发送 Ctrl+C
 	// 这个脚本会在独立的进程中执行，不会影响 scum_run
+	// 注意：不能使用 $pid 作为变量名，因为它是 PowerShell 的内置只读变量
 	psScript := fmt.Sprintf(`
 		$ErrorActionPreference = "Stop"
-		$pid = %d
+		$targetPid = %d
 		
 		# 加载 Windows API
 		$signature = @"
@@ -66,7 +67,7 @@ func (m *Manager) sendCtrlCViaHelperProcess(pid int) error {
 		
 		try {
 			# 附加到目标进程的控制台
-			if (-not $type::AttachConsole($pid)) {
+			if (-not $type::AttachConsole($targetPid)) {
 				$errorCode = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
 				throw "Failed to attach to console: $errorCode"
 			}
@@ -74,8 +75,8 @@ func (m *Manager) sendCtrlCViaHelperProcess(pid int) error {
 			# 等待一小段时间确保附加完成
 			Start-Sleep -Milliseconds 100
 			
-			# 发送 Ctrl+C 事件到指定的进程组（PID）
-			if (-not $type::GenerateConsoleCtrlEvent(0, $pid)) {
+			# 发送 Ctrl+C 事件到指定的进程组（使用 targetPid 作为进程组ID）
+			if (-not $type::GenerateConsoleCtrlEvent(0, $targetPid)) {
 				$errorCode = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
 				$type::FreeConsole()
 				throw "Failed to send Ctrl+C: $errorCode"
@@ -84,7 +85,7 @@ func (m *Manager) sendCtrlCViaHelperProcess(pid int) error {
 			# 释放控制台
 			$type::FreeConsole()
 			
-			Write-Host "Successfully sent Ctrl+C to process $pid"
+			Write-Host "Successfully sent Ctrl+C to process $targetPid"
 			exit 0
 		} catch {
 			Write-Error $_.Exception.Message
