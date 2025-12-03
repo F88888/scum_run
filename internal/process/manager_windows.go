@@ -48,22 +48,24 @@ func (m *Manager) sendCtrlCViaHelperProcess(pid int) error {
 		$ErrorActionPreference = "Stop"
 		$targetPid = %d
 		
-		# 加载 Windows API
+		# 加载 Windows API（只需要发送 Ctrl+C 所需的 API）
 		$signature = @"
-			[DllImport("kernel32.dll", SetLastError=true)]
-			public static extern bool AttachConsole(uint dwProcessId);
+			using System;
+			using System.Runtime.InteropServices;
 			
-			[DllImport("kernel32.dll", SetLastError=true)]
-			public static extern bool FreeConsole();
-			
-			[DllImport("kernel32.dll", SetLastError=true)]
-			public static extern bool GenerateConsoleCtrlEvent(uint dwCtrlEvent, uint dwProcessGroupId);
-			
-			[DllImport("kernel32.dll", SetLastError=true)]
-			public static extern bool SetConsoleCtrlHandler([IntPtr] HandlerRoutine, bool Add);
+			public class Win32Utils {
+				[DllImport("kernel32.dll", SetLastError=true)]
+				public static extern bool AttachConsole(uint dwProcessId);
+				
+				[DllImport("kernel32.dll", SetLastError=true)]
+				public static extern bool FreeConsole();
+				
+				[DllImport("kernel32.dll", SetLastError=true)]
+				public static extern bool GenerateConsoleCtrlEvent(uint dwCtrlEvent, uint dwProcessGroupId);
+			}
 "@
 		
-		$type = Add-Type -MemberDefinition $signature -Name Win32Utils -Namespace Console -PassThru
+		$type = Add-Type -TypeDefinition $signature -Name Win32Utils -Namespace Console -PassThru
 		
 		try {
 			# 附加到目标进程的控制台
@@ -89,8 +91,10 @@ func (m *Manager) sendCtrlCViaHelperProcess(pid int) error {
 			exit 0
 		} catch {
 			Write-Error $_.Exception.Message
-			if ($type::FreeConsole) {
+			try {
 				$type::FreeConsole()
+			} catch {
+				# 忽略释放控制台时的错误
 			}
 			exit 1
 		}
