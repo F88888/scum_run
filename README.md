@@ -2,7 +2,7 @@
 
 `scum_run` 当前同时保留两种运行模式：
 
-1. 旧兼容模式：连接旧 `scum_robot` WebSocket。
+1. 旧兼容模式：连接旧 `scum_robot` WebSocket。（已放弃）
 2. 新 host-agent 模式：连接 `scum_server`，通过 Host Agent 注册、心跳和数据库操作轮询执行受控能力。
 
 ## Features
