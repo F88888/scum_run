@@ -3,12 +3,13 @@ package _const
 // 配置相关常量
 const (
 	// 默认配置值
-	DefaultInstallPath  = "./scumserver"
-	DefaultSteamCmdPath = "./steamcmd/steamcmd.exe"
-	DefaultSteamCmdURL  = "https://scum.npc0.com/steamcmd.zip"
-	DefaultDirectxURL   = "https://scum.npc0.com/directx_Jun2010_redist.exe"
-	DefaultVisualCURL   = "https://scum.npc0.com/VC_redist.x64.exe"
-	DefaultSteamCmdDir  = "./steamcmd"
+	DefaultInstallPath     = "./scumserver"
+	DefaultSteamCmdPath    = "./steamcmd/steamcmd.exe"
+	SteamCmdExecutableName = "steamcmd.exe"
+	DefaultSteamCmdURL     = "https://scum.npc0.com/steamcmd.zip"
+	DefaultDirectxURL      = "https://scum.npc0.com/directx_Jun2010_redist.exe"
+	DefaultVisualCURL      = "https://scum.npc0.com/VC_redist.x64.exe"
+	DefaultSteamCmdDir     = "./steamcmd"
 
 	// 运行时依赖相关常量
 	RuntimeTempDir    = "scum_runtime"       // 运行时临时目录名

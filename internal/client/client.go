@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"github.com/saintfish/chardet"
 	"github.com/shirou/gopsutil/v3/cpu"
@@ -87,6 +88,9 @@ type Client struct {
 
 	// 载具类型的 trade_goods 数据（用于匹配 entity.class）
 	vehicleGoodsMap map[string]string // key: entity.class (如 "RIS_ES"), value: trade_goods.name (如 "RIS")
+
+	fileTransferSem chan struct{}
+	operationSem    chan struct{}
 }
 
 // Message types for WebSocket communication
@@ -141,6 +145,14 @@ const (
 	MsgTypeCloudDownload = "cloud_download" // 云存储下载
 )
 
+const (
+	wsFileChunkSize         = 256 * 1024
+	maxConcurrentFileOps    = 2
+	maxConcurrentControlOps = 1
+	operationBusyError      = "Too many concurrent operations; please retry later"
+	pathOutsideAllowedError = "Access denied: path outside allowed directory"
+)
+
 // New creates a new SCUM Run client
 func New(cfg *config.Config, steamDir string, logger *logger.Logger) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -161,6 +173,8 @@ func New(cfg *config.Config, steamDir string, logger *logger.Logger) *Client {
 		processOutputBuffer: make([]string, 0, 100),                                 // 预分配100条进程输出的缓冲区
 		maxLogRate:          _const.LogMaxRatePerSecond,                             // 每秒最多发送日志数量
 		logRateWindow:       time.Duration(_const.LogRateWindow) * time.Millisecond, // 频率控制窗口
+		fileTransferSem:     make(chan struct{}, maxConcurrentFileOps),
+		operationSem:        make(chan struct{}, maxConcurrentControlOps),
 	}
 
 	// 设置进程输出回调函数
@@ -435,9 +449,9 @@ func (c *Client) handleMessage(msg request.WebSocketMessage) {
 	case MsgTypeServerStart:
 		c.handleServerStart()
 	case MsgTypeServerStop:
-		c.handleServerStop()
+		go c.runLimited(c.operationSem, MsgTypeServerStop, msg.Data, func() { c.handleServerStop() })
 	case MsgTypeServerRestart:
-		c.handleServerRestart()
+		go c.runLimited(c.operationSem, MsgTypeServerRestart, msg.Data, func() { c.handleServerRestart() })
 	case MsgTypeServerStatus:
 		c.handleServerStatus()
 	case MsgTypeDBQuery:
@@ -461,22 +475,22 @@ func (c *Client) handleMessage(msg request.WebSocketMessage) {
 	case MsgTypeClientUpdate:
 		c.handleClientUpdate(msg.Data)
 	case MsgTypeFileBrowse:
-		c.handleFileBrowse(msg.Data)
+		go c.runLimited(c.fileTransferSem, MsgTypeFileBrowse, msg.Data, func() { c.handleFileBrowse(msg.Data) })
 	case MsgTypeFileList:
 		c.handleFileList(msg.Data)
 	case MsgTypeFileRead:
-		c.handleFileRead(msg.Data)
+		go c.runLimited(c.fileTransferSem, MsgTypeFileRead, msg.Data, func() { c.handleFileRead(msg.Data) })
 	case MsgTypeFileWrite:
-		c.handleFileWrite(msg.Data)
+		go c.runLimited(c.fileTransferSem, MsgTypeFileWrite, msg.Data, func() { c.handleFileWrite(msg.Data) })
 	case MsgTypeHeartbeat:
 		// Heartbeat messages from server are handled silently
 	case MsgTypeAuth:
 		// Handle authentication response from server
 		c.handleAuthResponse(msg)
 	case MsgTypeBackupStart:
-		c.handleBackupStart(msg.Data)
+		go c.runLimited(c.operationSem, MsgTypeBackupStart, msg.Data, func() { c.handleBackupStart(msg.Data) })
 	case MsgTypeBackupStop:
-		c.handleBackupStop(msg.Data)
+		go c.runLimited(c.operationSem, MsgTypeBackupStop, msg.Data, func() { c.handleBackupStop(msg.Data) })
 	case MsgTypeBackupStatus:
 		c.handleBackupStatus(msg.Data)
 	case MsgTypeBackupList:
@@ -484,17 +498,17 @@ func (c *Client) handleMessage(msg request.WebSocketMessage) {
 	case MsgTypeBackupDelete:
 		c.handleBackupDelete(msg.Data)
 	case MsgTypeFileTransfer:
-		c.handleFileTransfer(msg.Data)
+		go c.runLimited(c.fileTransferSem, MsgTypeFileTransfer, msg.Data, func() { c.handleFileTransfer(msg.Data) })
 	case MsgTypeFileUpload:
-		c.handleFileUpload(msg.Data)
+		go c.runLimited(c.fileTransferSem, MsgTypeFileUpload, msg.Data, func() { c.handleFileUpload(msg.Data) })
 	case MsgTypeFileDownload:
-		c.handleFileDownload(msg.Data)
+		go c.runLimited(c.fileTransferSem, MsgTypeFileDownload, msg.Data, func() { c.handleFileDownload(msg.Data) })
 	case MsgTypeFileDelete:
-		c.handleFileDelete(msg.Data)
+		go c.runLimited(c.fileTransferSem, MsgTypeFileDelete, msg.Data, func() { c.handleFileDelete(msg.Data) })
 	case MsgTypeCloudUpload:
-		c.handleCloudUpload(msg.Data)
+		go c.runLimited(c.fileTransferSem, MsgTypeCloudUpload, msg.Data, func() { c.handleCloudUpload(msg.Data) })
 	case MsgTypeCloudDownload:
-		c.handleCloudDownload(msg.Data)
+		go c.runLimited(c.fileTransferSem, MsgTypeCloudDownload, msg.Data, func() { c.handleCloudDownload(msg.Data) })
 	case MsgTypeSystemMonitor:
 		c.handleSystemMonitor(msg.Data)
 	case MsgTypeGetSystemInfo:
@@ -504,7 +518,9 @@ func (c *Client) handleMessage(msg request.WebSocketMessage) {
 	}
 }
 
-// handleServerStart handles server start request
+// handleServerStart handles a server start request.
+// It uses the local process manager and runtime checks to start SCUM, and it sends progress or final status responses over WebSocket.
+// It returns no values; startup failures are reported to the server through response messages.
 func (c *Client) handleServerStart() {
 	c.logger.Info("🔍 [DEBUG] 接收到服务器启动请求")
 	c.logger.Info("Starting SCUM server...")
@@ -551,10 +567,7 @@ func (c *Client) handleServerStart() {
 		}
 
 		// Send success response after process starts
-		c.sendResponse(MsgTypeServerStart, map[string]interface{}{
-			"status": "started",
-			"pid":    c.process.GetPID(),
-		}, "")
+		c.sendResponse(MsgTypeServerStart, c.process.GetStatus(), "")
 
 		// After server starts, try to initialize database connection
 		// This is done after server start because the database file is created by SCUM server
@@ -579,7 +592,9 @@ func (c *Client) handleServerStart() {
 	}()
 }
 
-// handleServerStop handles server stop request
+// handleServerStop handles a server stop request.
+// It asks the local process manager to stop SCUM gracefully, and it sends the resulting safe process status over WebSocket.
+// It returns no values; stop failures are reported to the server through response messages.
 func (c *Client) handleServerStop() {
 	c.logger.Info("🔍 [DEBUG] 接收到服务器停止请求")
 	if err := c.process.Stop(); err != nil {
@@ -587,12 +602,12 @@ func (c *Client) handleServerStop() {
 		return
 	}
 
-	c.sendResponse(MsgTypeServerStop, map[string]interface{}{
-		"status": "stopped",
-	}, "")
+	c.sendResponse(MsgTypeServerStop, c.process.GetStatus(), "")
 }
 
-// handleServerRestart handles server restart request
+// handleServerRestart handles a server restart request.
+// It stops and then starts the local SCUM process, and it sends the resulting safe process status over WebSocket.
+// It returns no values; restart failures are reported to the server through response messages.
 func (c *Client) handleServerRestart() {
 	c.logger.Info("🔍 [DEBUG] 接收到服务器重启请求")
 	// Stop first
@@ -609,20 +624,14 @@ func (c *Client) handleServerRestart() {
 		return
 	}
 
-	c.sendResponse(MsgTypeServerRestart, map[string]interface{}{
-		"status": "restarted",
-		"pid":    c.process.GetPID(),
-	}, "")
+	c.sendResponse(MsgTypeServerRestart, c.process.GetStatus(), "")
 }
 
-// handleServerStatus handles server status request
+// handleServerStatus handles a server status request.
+// It reads the local process manager state, and it sends a safe status payload without command line or host path details.
+// It returns no values; send failures are handled by the WebSocket client layer.
 func (c *Client) handleServerStatus() {
-	status := map[string]interface{}{
-		"running": c.process.IsRunning(),
-		"pid":     c.process.GetPID(),
-	}
-
-	c.sendResponse(MsgTypeServerStatus, status, "")
+	c.sendResponse(MsgTypeServerStatus, c.process.GetStatus(), "")
 }
 
 // handleSteamToolsStatus handles Steam++ status request
@@ -631,7 +640,9 @@ func (c *Client) handleSteamToolsStatus() {
 	c.sendResponse(MsgTypeSteamToolsStatus, status, "")
 }
 
-// handleDBQuery handles database query request
+// handleDBQuery handles a forwarded SCUM database request.
+// data contains query, optional query_id, args and limit fields from the server, and the method sends a bounded read or write response back over WebSocket.
+// It returns no values; validation or execution failures are sent as structured error responses.
 func (c *Client) handleDBQuery(data interface{}) {
 	queryData, ok := data.(map[string]interface{})
 	if !ok {
@@ -639,69 +650,134 @@ func (c *Client) handleDBQuery(data interface{}) {
 		return
 	}
 
-	query, ok := queryData["query"].(string)
-	if !ok {
+	query := stringFromMessageKeys(queryData, "query", "sql")
+	if query == "" {
 		c.sendResponse(MsgTypeDBQuery, nil, "Missing or invalid query")
 		return
 	}
 
-	// 获取query_id用于响应
-	queryID, _ := queryData["query_id"].(string)
-
-	// 智能判断是查询还是命令
-	queryUpper := strings.ToUpper(strings.TrimSpace(query))
-	isCommand := strings.HasPrefix(queryUpper, "INSERT") ||
-		strings.HasPrefix(queryUpper, "UPDATE") ||
-		strings.HasPrefix(queryUpper, "DELETE") ||
-		strings.HasPrefix(queryUpper, "CREATE") ||
-		strings.HasPrefix(queryUpper, "DROP") ||
-		strings.HasPrefix(queryUpper, "ALTER")
-
-	if isCommand {
-		// 执行命令
-		rowsAffected, err := c.db.Execute(query)
-		if err != nil {
-			// 在错误响应中包含query_id
-			errorData := map[string]interface{}{}
-			if queryID != "" {
-				errorData["query_id"] = queryID
-			}
-			c.sendResponse(MsgTypeDBQuery, errorData, fmt.Sprintf("Command failed: %v", err))
-			return
-		}
-
-		// 在成功响应中包含query_id和rows_affected
-		responseData := map[string]interface{}{
-			"rows_affected": rowsAffected,
-		}
-		if queryID != "" {
-			responseData["query_id"] = queryID
-		}
-
-		c.sendResponse(MsgTypeDBQuery, responseData, "")
-	} else {
-		// 执行查询
-		result, err := c.db.Query(query)
-		if err != nil {
-			// 在错误响应中包含query_id
-			errorData := map[string]interface{}{}
-			if queryID != "" {
-				errorData["query_id"] = queryID
-			}
-			c.sendResponse(MsgTypeDBQuery, errorData, fmt.Sprintf("Query failed: %v", err))
-			return
-		}
-
-		// 在成功响应中包含query_id和result
-		responseData := map[string]interface{}{
-			"result": result,
-		}
-		if queryID != "" {
-			responseData["query_id"] = queryID
-		}
-
-		c.sendResponse(MsgTypeDBQuery, responseData, "")
+	queryID := stringFromMessageKeys(queryData, "query_id", "queryId")
+	operationID := stringFromMessageKeys(queryData, "operation_id", "operationId", "id")
+	options := database.QueryOptions{
+		QueryID:  queryID,
+		Args:     databaseArgsFromMessage(queryData["args"]),
+		Timeout:  durationFromMilliseconds(firstMessageValue(queryData, "timeout_ms", "timeoutMs")),
+		MaxRows:  intFromMessage(firstMessageValue(queryData, "max_rows", "maxRows")),
+		MaxBytes: intFromMessage(firstMessageValue(queryData, "max_bytes", "maxBytes")),
 	}
+	readOnly := boolFromMessageKeys(queryData, "read_only", "readOnly")
+	var result database.QueryResult
+	var err error
+	if readOnly {
+		result, err = c.db.ExecuteReadOnlyCapability(query, options)
+	} else {
+		result, err = c.db.ExecuteCapability(query, options)
+	}
+	if err != nil {
+		errorData := map[string]interface{}{
+			"operation_id": operationID,
+			"operationId":  operationID,
+			"query_id":     queryID,
+			"queryId":      queryID,
+			"error":        database.SanitizeError(err),
+		}
+		c.sendResponse(MsgTypeDBQuery, errorData, database.SanitizeError(err))
+		return
+	}
+	responseData := map[string]interface{}{
+		"operation_id":  operationID,
+		"operationId":   operationID,
+		"query_id":      result.QueryID,
+		"queryId":       result.QueryID,
+		"action":        result.Action,
+		"columns":       result.Columns,
+		"result":        result.Rows,
+		"rows":          result.Rows,
+		"row_count":     len(result.Rows),
+		"rowCount":      len(result.Rows),
+		"rows_affected": result.RowsAffected,
+		"truncated":     result.Truncated,
+		"truncated_by":  result.TruncatedBy,
+		"truncatedBy":   result.TruncatedBy,
+		"duration_ms":   result.DurationMS,
+		"durationMs":    result.DurationMS,
+	}
+	c.sendResponse(MsgTypeDBQuery, responseData, "")
+}
+
+// firstMessageValue returns the first present value for a set of decoded JSON keys.
+// data is a WebSocket payload map, keys are candidate snake_case or camelCase names, and the function returns nil when no key exists.
+func firstMessageValue(data map[string]interface{}, keys ...string) interface{} {
+	for _, key := range keys {
+		if value, ok := data[key]; ok {
+			return value
+		}
+	}
+	return nil
+}
+
+// stringFromMessageKeys reads the first non-empty string value from a decoded WebSocket payload.
+// data is a JSON object map, keys are candidate field names, and the function returns an empty string when none contain a string.
+func stringFromMessageKeys(data map[string]interface{}, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := data[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+// boolFromMessageKeys reads the first boolean value from a decoded WebSocket payload.
+// data is a JSON object map, keys are candidate field names, and the function returns false when none contain a boolean.
+func boolFromMessageKeys(data map[string]interface{}, keys ...string) bool {
+	for _, key := range keys {
+		if value, ok := data[key].(bool); ok {
+			return value
+		}
+	}
+	return false
+}
+
+// databaseArgsFromMessage converts WebSocket database args into SQL driver args.
+// value is the decoded JSON value for args, and the function returns positional arguments or nil when args are absent or invalid.
+func databaseArgsFromMessage(value interface{}) []interface{} {
+	rawArgs, ok := value.([]interface{})
+	if !ok {
+		return nil
+	}
+	return rawArgs
+}
+
+// durationFromMilliseconds converts a decoded millisecond value into a duration.
+// value is usually a JSON number, and the function returns zero when the field is absent or invalid so database defaults apply.
+func durationFromMilliseconds(value interface{}) time.Duration {
+	switch typed := value.(type) {
+	case float64:
+		if typed > 0 {
+			return time.Duration(typed) * time.Millisecond
+		}
+	case int:
+		if typed > 0 {
+			return time.Duration(typed) * time.Millisecond
+		}
+	}
+	return 0
+}
+
+// intFromMessage converts a decoded numeric JSON field into an int.
+// value is usually a JSON number, and the function returns zero when the field is absent, non-numeric, or not positive.
+func intFromMessage(value interface{}) int {
+	switch typed := value.(type) {
+	case float64:
+		if typed > 0 {
+			return int(typed)
+		}
+	case int:
+		if typed > 0 {
+			return typed
+		}
+	}
+	return 0
 }
 
 // onLogUpdate 处理SCUM日志文件更新，只发送日志文件数据给processLogLine处理
@@ -751,6 +827,31 @@ func (c *Client) sendResponse(msgType string, data interface{}, errorMsg string)
 	if err := c.wsClient.SendMessage(response); err != nil {
 		c.logger.Error("❌ 发送 %s 响应失败: %v", msgType, err)
 	}
+}
+
+func (c *Client) runLimited(sem chan struct{}, msgType string, data interface{}, fn func()) {
+	select {
+	case sem <- struct{}{}:
+		defer func() { <-sem }()
+		fn()
+	default:
+		c.sendResponse(msgType, responseIDs(data), operationBusyError)
+	}
+}
+
+func responseIDs(data interface{}) map[string]interface{} {
+	ids := map[string]interface{}{}
+	dataMap, ok := data.(map[string]interface{})
+	if !ok {
+		return ids
+	}
+	if requestID, ok := dataMap["request_id"].(string); ok && requestID != "" {
+		ids["request_id"] = requestID
+	}
+	if transferID, ok := dataMap["transfer_id"].(string); ok && transferID != "" {
+		ids["transfer_id"] = transferID
+	}
+	return ids
 }
 
 // requestConfigSync requests configuration sync from server
@@ -1090,6 +1191,17 @@ func (c *Client) performServerInstallation(installPath, steamCmdPath string, for
 		c.logger.Info("✅ SteamCmd 已存在: %s", steamCmdPath)
 	}
 
+	// 如果传入的是目录，自动解析到 steamcmd.exe
+	resolvedSteamCmdPath, err := c.ensureSteamCmdExecutablePath(steamCmdPath)
+	if err != nil {
+		c.logger.Error("❌ SteamCmd 路径无效: %v", err)
+		return
+	}
+	if resolvedSteamCmdPath != steamCmdPath {
+		c.logger.Info("自动使用 SteamCmd 可执行文件路径: %s", resolvedSteamCmdPath)
+	}
+	steamCmdPath = resolvedSteamCmdPath
+
 	// 设置安装路径
 	if installPath == "" {
 		installPath = _const.DefaultInstallPath
@@ -1302,6 +1414,18 @@ func (c *Client) handleServerUpdateCheck() {
 		steamCmdPath = _const.DefaultSteamCmdPath
 	}
 
+	resolvedSteamCmdPath, err := c.ensureSteamCmdExecutablePath(steamCmdPath)
+	if err != nil {
+		c.logger.Error("SteamCmd path invalid: %v", err)
+		c.sendResponse(MsgTypeServerUpdate, map[string]interface{}{
+			"type":    "check",
+			"status":  "failed",
+			"message": "SteamCmd not available: " + err.Error(),
+		}, "")
+		return
+	}
+	steamCmdPath = resolvedSteamCmdPath
+
 	// 验证SteamCmd是否存在
 	if err := c.validateSteamCmdExecutable(steamCmdPath); err != nil {
 		c.logger.Error("SteamCmd validation failed: %v", err)
@@ -1469,6 +1593,37 @@ func (c *Client) handleScheduledRestart(data interface{}) {
 	}, "")
 }
 
+// ensureSteamCmdExecutablePath resolves directories to the actual steamcmd executable path
+func (c *Client) ensureSteamCmdExecutablePath(steamCmdPath string) (string, error) {
+	fileInfo, err := os.Stat(steamCmdPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// 保持原路径，由后续逻辑决定是否下载或报错
+			return steamCmdPath, nil
+		}
+		return "", fmt.Errorf("cannot access SteamCmd path: %w", err)
+	}
+
+	if fileInfo.IsDir() {
+		candidate := filepath.Join(steamCmdPath, _const.SteamCmdExecutableName)
+		candidateInfo, err := os.Stat(candidate)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return "", fmt.Errorf("SteamCmd executable not found in directory: %s", candidate)
+			}
+			return "", fmt.Errorf("cannot access SteamCmd executable in directory: %w", err)
+		}
+
+		if candidateInfo.IsDir() {
+			return "", fmt.Errorf("SteamCmd executable path is a directory: %s", candidate)
+		}
+
+		return candidate, nil
+	}
+
+	return steamCmdPath, nil
+}
+
 // validateSteamCmdExecutable validates that the SteamCmd executable is valid and accessible
 func (c *Client) validateSteamCmdExecutable(steamCmdPath string) error {
 	// 检查文件是否存在
@@ -1619,7 +1774,7 @@ func (c *Client) extractZip(src, dest string) error {
 	for _, f := range r.File {
 		// Clean the file path to prevent directory traversal
 		path := filepath.Join(dest, f.Name)
-		if !strings.HasPrefix(path, filepath.Clean(dest)+string(os.PathSeparator)) {
+		if err := validatePathInside(dest, path); err != nil {
 			return fmt.Errorf("invalid file path: %s", f.Name)
 		}
 
@@ -2058,6 +2213,135 @@ func (c *Client) handleFileList(_ interface{}) {
 	// 文件列表响应通常不会在客户端收到
 }
 
+func (c *Client) resolveSteamPath(path string) (string, error) {
+	cleanSteamDir, err := filepath.Abs(c.steamDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve steam directory: %w", err)
+	}
+
+	var fullPath string
+	if strings.HasPrefix(path, "/") || strings.HasPrefix(path, "\\") {
+		fullPath = filepath.Join(cleanSteamDir, strings.TrimLeft(path, `/\`))
+	} else if filepath.IsAbs(path) {
+		fullPath = filepath.Clean(path)
+	} else {
+		fullPath = filepath.Join(cleanSteamDir, path)
+	}
+
+	cleanFullPath, err := filepath.Abs(fullPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve path: %w", err)
+	}
+
+	if err := validatePathInside(cleanSteamDir, cleanFullPath); err != nil {
+		return "", err
+	}
+	return cleanFullPath, nil
+}
+
+func validatePathInside(basePath, targetPath string) error {
+	cleanBase, err := filepath.Abs(basePath)
+	if err != nil {
+		return fmt.Errorf("failed to resolve base path: %w", err)
+	}
+	cleanTarget, err := filepath.Abs(targetPath)
+	if err != nil {
+		return fmt.Errorf("failed to resolve target path: %w", err)
+	}
+
+	rel, err := filepath.Rel(cleanBase, cleanTarget)
+	if err != nil {
+		return fmt.Errorf("path outside allowed directory")
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) || filepath.IsAbs(rel) {
+		return fmt.Errorf("path outside allowed directory")
+	}
+	return nil
+}
+
+func (c *Client) sendFileChunks(msgType, filePath, idKey, idValue string, extra map[string]interface{}) error {
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		return err
+	}
+
+	file, err := os.Open(filePath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			c.logger.Warn("Failed to close file %s: %v", filePath, closeErr)
+		}
+	}()
+
+	totalSize := fileInfo.Size()
+	chunkCount := int((totalSize + int64(wsFileChunkSize) - 1) / int64(wsFileChunkSize))
+	if chunkCount == 0 {
+		chunkCount = 1
+	}
+
+	buf := make([]byte, wsFileChunkSize)
+	for chunkIndex := 0; chunkIndex < chunkCount; chunkIndex++ {
+		n, readErr := io.ReadFull(file, buf)
+		if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+			return readErr
+		}
+
+		responseData := map[string]interface{}{
+			idKey:              idValue,
+			"content":          base64.StdEncoding.EncodeToString(buf[:n]),
+			"content_encoding": "base64",
+			"chunked":          true,
+			"chunk_index":      chunkIndex,
+			"chunk_count":      chunkCount,
+			"chunk_size":       n,
+			"size":             totalSize,
+			"done":             chunkIndex == chunkCount-1,
+		}
+		for key, value := range extra {
+			responseData[key] = value
+		}
+
+		c.sendResponse(msgType, responseData, "")
+		if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
+			break
+		}
+	}
+	return nil
+}
+
+func (c *Client) sendStringChunks(msgType, content, idKey, idValue string, extra map[string]interface{}) {
+	chunkCount := (len(content) + wsFileChunkSize - 1) / wsFileChunkSize
+	if chunkCount == 0 {
+		chunkCount = 1
+	}
+
+	for chunkIndex := 0; chunkIndex < chunkCount; chunkIndex++ {
+		start := chunkIndex * wsFileChunkSize
+		end := start + wsFileChunkSize
+		if end > len(content) {
+			end = len(content)
+		}
+
+		responseData := map[string]interface{}{
+			idKey:              idValue,
+			"content":          base64.StdEncoding.EncodeToString([]byte(content[start:end])),
+			"content_encoding": "base64",
+			"chunked":          true,
+			"chunk_index":      chunkIndex,
+			"chunk_count":      chunkCount,
+			"chunk_size":       end - start,
+			"size":             len(content),
+			"done":             chunkIndex == chunkCount-1,
+		}
+		for key, value := range extra {
+			responseData[key] = value
+		}
+		c.sendResponse(msgType, responseData, "")
+	}
+}
+
 // handleFileRead 处理文件内容读取请求 - 只传输文件，不进行转码
 func (c *Client) handleFileRead(data interface{}) {
 	dataMap, ok := data.(map[string]interface{})
@@ -2080,27 +2364,13 @@ func (c *Client) handleFileRead(data interface{}) {
 		return
 	}
 
-	// 构建完整文件路径
-	var fullPath string
-	if strings.HasPrefix(path, "/") {
-		// 绝对路径，将其视为相对于steamDir的路径
-		// 移除开头的斜杠，然后基于steamDir构建完整路径
-		relativePath := strings.TrimPrefix(path, "/")
-		fullPath = filepath.Join(c.steamDir, relativePath)
-	} else {
-		// 相对路径，基于Steam目录
-		fullPath = filepath.Join(c.steamDir, path)
-	}
-
-	// 验证最终路径是否在允许的目录内
-	cleanFullPath := filepath.Clean(fullPath)
-	cleanSteamDir := filepath.Clean(c.steamDir)
-	if !strings.HasPrefix(cleanFullPath, cleanSteamDir) {
+	fullPath, err := c.resolveSteamPath(path)
+	if err != nil {
 		errorData := map[string]interface{}{}
 		if requestID != "" {
 			errorData["request_id"] = requestID
 		}
-		c.sendResponse(MsgTypeFileRead, errorData, "Access denied: path outside allowed directory")
+		c.sendResponse(MsgTypeFileRead, errorData, pathOutsideAllowedError)
 		return
 	}
 
@@ -2115,10 +2385,7 @@ func (c *Client) handleFileRead(data interface{}) {
 		return
 	}
 
-	// 直接读取文件原始字节，不进行任何转码
-	// 转码工作交由前端处理
-	fileData, err := os.ReadFile(fullPath)
-	if err != nil {
+	if err := c.sendFileChunks(MsgTypeFileRead, fullPath, "request_id", requestID, nil); err != nil {
 		c.logger.Error("Failed to read file %s: %v", fullPath, err)
 		errorData := map[string]interface{}{}
 		if requestID != "" {
@@ -2128,19 +2395,7 @@ func (c *Client) handleFileRead(data interface{}) {
 		return
 	}
 
-	// 发送文件内容响应 - 返回原始字节数据
-	responseData := map[string]interface{}{
-		"content": string(fileData), // 直接返回原始字节数据
-		"size":    len(fileData),
-	}
-
-	// 在响应中包含请求ID
-	if requestID != "" {
-		responseData["request_id"] = requestID
-	}
-
-	c.logger.Info("Successfully read file: %s (size: %d bytes)", path, len(fileData))
-	c.sendResponse(MsgTypeFileRead, responseData, "")
+	c.logger.Info("Successfully read file: %s", path)
 }
 
 // handleFileWrite 处理文件内容写入请求
@@ -2175,27 +2430,13 @@ func (c *Client) handleFileWrite(data interface{}) {
 		encoding = "utf-8"
 	}
 
-	// 构建完整文件路径
-	var fullPath string
-	if strings.HasPrefix(path, "/") {
-		// 绝对路径，将其视为相对于steamDir的路径
-		// 移除开头的斜杠，然后基于steamDir构建完整路径
-		relativePath := strings.TrimPrefix(path, "/")
-		fullPath = filepath.Join(c.steamDir, relativePath)
-	} else {
-		// 相对路径，基于Steam目录
-		fullPath = filepath.Join(c.steamDir, path)
-	}
-
-	// 验证最终路径是否在允许的目录内
-	cleanFullPath := filepath.Clean(fullPath)
-	cleanSteamDir := filepath.Clean(c.steamDir)
-	if !strings.HasPrefix(cleanFullPath, cleanSteamDir) {
+	fullPath, err := c.resolveSteamPath(path)
+	if err != nil {
 		errorData := map[string]interface{}{}
 		if requestID != "" {
 			errorData["request_id"] = requestID
 		}
-		c.sendResponse(MsgTypeFileWrite, errorData, "Access denied: path outside allowed directory")
+		c.sendResponse(MsgTypeFileWrite, errorData, pathOutsideAllowedError)
 		return
 	}
 
@@ -2212,8 +2453,7 @@ func (c *Client) handleFileWrite(data interface{}) {
 	}
 
 	// 写入文件内容
-	err := c.writeFileWithEncoding(fullPath, content, encoding)
-	if err != nil {
+	if err := c.writeFileWithEncoding(fullPath, content, encoding); err != nil {
 		errorData := map[string]interface{}{}
 		if requestID != "" {
 			errorData["request_id"] = requestID
@@ -2976,8 +3216,7 @@ func (c *Client) handleBackupStart(data interface{}) {
 		description = "手动备份"
 	}
 
-	// 异步执行备份
-	go c.executeBackup(uint(serverID), backupPath, description)
+	c.executeBackup(uint(serverID), backupPath, description)
 }
 
 // handleBackupStop 处理停止备份请求
@@ -3536,7 +3775,7 @@ func (c *Client) validateBackupPath(path string, installPath string) error {
 	}
 
 	// 检查备份路径是否在安装目录内
-	if !strings.HasPrefix(absPath, absInstallPath) {
+	if err := validatePathInside(absInstallPath, absPath); err != nil {
 		return fmt.Errorf("备份路径必须在安装目录内")
 	}
 
@@ -3604,26 +3843,12 @@ func (c *Client) handleFileUpload(data interface{}) {
 		encoding = "utf-8"
 	}
 
-	// 构建完整文件路径
-	var fullPath string
-	if strings.HasPrefix(filePath, "/") {
-		// 绝对路径，将其视为相对于steamDir的路径
-		// 移除开头的斜杠，然后基于steamDir构建完整路径
-		relativePath := strings.TrimPrefix(filePath, "/")
-		fullPath = filepath.Join(c.steamDir, relativePath)
-	} else {
-		// 相对路径，基于Steam目录
-		fullPath = filepath.Join(c.steamDir, filePath)
-	}
-
-	// 验证最终路径是否在允许的目录内
-	cleanFullPath := filepath.Clean(fullPath)
-	cleanSteamDir := filepath.Clean(c.steamDir)
-	if !strings.HasPrefix(cleanFullPath, cleanSteamDir) {
-		c.logger.Error("Access denied: path outside Steam directory: %s (resolved to %s, steamDir: %s)", filePath, cleanFullPath, cleanSteamDir)
+	fullPath, err := c.resolveSteamPath(filePath)
+	if err != nil {
+		c.logger.Error("Access denied: path outside Steam directory: %s", filePath)
 		c.sendResponse(MsgTypeFileUpload, map[string]interface{}{
 			"transfer_id": transferID,
-		}, "Access denied: path outside allowed directory")
+		}, pathOutsideAllowedError)
 		return
 	}
 
@@ -3638,8 +3863,7 @@ func (c *Client) handleFileUpload(data interface{}) {
 	}
 
 	// 写入文件内容
-	err := c.writeFileWithEncoding(fullPath, content, encoding)
-	if err != nil {
+	if err := c.writeFileWithEncoding(fullPath, content, encoding); err != nil {
 		c.logger.Error("Failed to write file %s: %v", fullPath, err)
 		c.sendResponse(MsgTypeFileUpload, map[string]interface{}{
 			"transfer_id": transferID,
@@ -3681,26 +3905,12 @@ func (c *Client) handleFileDownload(data interface{}) {
 		encoding = "binary"
 	}
 
-	// 构建完整文件路径
-	var fullPath string
-	if strings.HasPrefix(filePath, "/") {
-		// 绝对路径，将其视为相对于steamDir的路径
-		// 移除开头的斜杠，然后基于steamDir构建完整路径
-		relativePath := strings.TrimPrefix(filePath, "/")
-		fullPath = filepath.Join(c.steamDir, relativePath)
-	} else {
-		// 相对路径，基于Steam目录
-		fullPath = filepath.Join(c.steamDir, filePath)
-	}
-
-	// 验证最终路径是否在允许的目录内
-	cleanFullPath := filepath.Clean(fullPath)
-	cleanSteamDir := filepath.Clean(c.steamDir)
-	if !strings.HasPrefix(cleanFullPath, cleanSteamDir) {
-		c.logger.Error("Access denied: path outside Steam directory: %s (resolved to %s, steamDir: %s)", filePath, cleanFullPath, cleanSteamDir)
+	fullPath, err := c.resolveSteamPath(filePath)
+	if err != nil {
+		c.logger.Error("Access denied: path outside Steam directory: %s", filePath)
 		c.sendResponse(MsgTypeFileDownload, map[string]interface{}{
 			"transfer_id": transferID,
-		}, "Access denied: path outside allowed directory")
+		}, pathOutsideAllowedError)
 		return
 	}
 
@@ -3713,7 +3923,18 @@ func (c *Client) handleFileDownload(data interface{}) {
 		return
 	}
 
-	// 读取文件内容
+	if encoding == "binary" || strings.EqualFold(encoding, "utf-8") || strings.EqualFold(encoding, "utf8") {
+		if err := c.sendFileChunks(MsgTypeFileDownload, fullPath, "transfer_id", transferID, map[string]interface{}{
+			"encoding": encoding,
+		}); err != nil {
+			c.logger.Error("Failed to read file %s: %v", fullPath, err)
+			c.sendResponse(MsgTypeFileDownload, map[string]interface{}{
+				"transfer_id": transferID,
+			}, fmt.Sprintf("Failed to read file: %v", err))
+		}
+		return
+	}
+
 	content, err := c.readFileWithEncoding(fullPath, encoding)
 	if err != nil {
 		c.logger.Error("Failed to read file %s: %v", fullPath, err)
@@ -3723,15 +3944,9 @@ func (c *Client) handleFileDownload(data interface{}) {
 		return
 	}
 
-	// 发送文件内容响应
-	responseData := map[string]interface{}{
-		"transfer_id": transferID,
-		"content":     content,
-		"encoding":    encoding,
-		"size":        len(content),
-	}
-
-	c.sendResponse(MsgTypeFileDownload, responseData, "")
+	c.sendStringChunks(MsgTypeFileDownload, content, "transfer_id", transferID, map[string]interface{}{
+		"encoding": encoding,
+	})
 }
 
 // handleFileDelete 处理文件删除请求
@@ -3752,24 +3967,10 @@ func (c *Client) handleFileDelete(data interface{}) {
 		return
 	}
 
-	// 构建完整文件路径
-	var fullPath string
-	if strings.HasPrefix(filePath, "/") {
-		// 绝对路径，将其视为相对于steamDir的路径
-		// 移除开头的斜杠，然后基于steamDir构建完整路径
-		relativePath := strings.TrimPrefix(filePath, "/")
-		fullPath = filepath.Join(c.steamDir, relativePath)
-	} else {
-		// 相对路径，基于Steam目录
-		fullPath = filepath.Join(c.steamDir, filePath)
-	}
-
-	// 验证最终路径是否在允许的目录内
-	cleanFullPath := filepath.Clean(fullPath)
-	cleanSteamDir := filepath.Clean(c.steamDir)
-	if !strings.HasPrefix(cleanFullPath, cleanSteamDir) {
-		c.logger.Error("Access denied: path outside Steam directory: %s (resolved to %s, steamDir: %s)", filePath, cleanFullPath, cleanSteamDir)
-		c.sendResponse(MsgTypeFileDelete, nil, "Access denied: path outside allowed directory")
+	fullPath, err := c.resolveSteamPath(filePath)
+	if err != nil {
+		c.logger.Error("Access denied: path outside Steam directory: %s", filePath)
+		c.sendResponse(MsgTypeFileDelete, nil, pathOutsideAllowedError)
 		return
 	}
 
@@ -3781,8 +3982,7 @@ func (c *Client) handleFileDelete(data interface{}) {
 	}
 
 	// 删除文件
-	err := os.Remove(fullPath)
-	if err != nil {
+	if err := os.Remove(fullPath); err != nil {
 		c.logger.Error("Failed to delete file %s: %v", fullPath, err)
 		c.sendResponse(MsgTypeFileDelete, nil, fmt.Sprintf("Failed to delete file: %v", err))
 		return
@@ -3820,26 +4020,12 @@ func (c *Client) handleCloudUpload(data interface{}) {
 		return
 	}
 
-	// 构建完整文件路径
-	var fullPath string
-	if strings.HasPrefix(filePath, "/") {
-		// 绝对路径，将其视为相对于steamDir的路径
-		// 移除开头的斜杠，然后基于steamDir构建完整路径
-		relativePath := strings.TrimPrefix(filePath, "/")
-		fullPath = filepath.Join(c.steamDir, relativePath)
-	} else {
-		// 相对路径，基于Steam目录
-		fullPath = filepath.Join(c.steamDir, filePath)
-	}
-
-	// 验证最终路径是否在允许的目录内
-	cleanFullPath := filepath.Clean(fullPath)
-	cleanSteamDir := filepath.Clean(c.steamDir)
-	if !strings.HasPrefix(cleanFullPath, cleanSteamDir) {
-		c.logger.Error("Access denied: path outside Steam directory: %s (resolved to %s, steamDir: %s)", filePath, cleanFullPath, cleanSteamDir)
+	fullPath, err := c.resolveSteamPath(filePath)
+	if err != nil {
+		c.logger.Error("Access denied: path outside Steam directory: %s", filePath)
 		c.sendResponse(MsgTypeCloudUpload, map[string]interface{}{
 			"transfer_id": transferID,
-		}, "Access denied: path outside allowed directory")
+		}, pathOutsideAllowedError)
 		return
 	}
 
@@ -3853,8 +4039,7 @@ func (c *Client) handleCloudUpload(data interface{}) {
 	}
 
 	// 实现云存储上传逻辑
-	err := c.uploadFileToCloud(fullPath, cloudPath, transferID, uploadSignature)
-	if err != nil {
+	if err := c.uploadFileToCloud(fullPath, cloudPath, transferID, uploadSignature); err != nil {
 		c.logger.Error("Failed to upload file to cloud: %v", err)
 		c.sendResponse(MsgTypeCloudUpload, map[string]interface{}{
 			"transfer_id": transferID,
@@ -3882,12 +4067,6 @@ func (c *Client) uploadFileToCloud(filePath, cloudPath, transferID string, uploa
 		return fmt.Errorf("upload signature cannot be nil")
 	}
 
-	// 读取文件内容
-	fileData, err := os.ReadFile(filePath)
-	if err != nil {
-		return fmt.Errorf("failed to read file %s: %w", filePath, err)
-	}
-
 	// 检测云存储提供商
 	provider := c.detectCloudProvider(uploadSignature)
 	if provider == "" {
@@ -3897,9 +4076,9 @@ func (c *Client) uploadFileToCloud(filePath, cloudPath, transferID string, uploa
 	// 根据提供商选择上传方法
 	switch provider {
 	case "qiniu":
-		return c.uploadToQiniu(fileData, cloudPath, uploadSignature)
+		return c.uploadToQiniu(filePath, cloudPath, uploadSignature)
 	case "aliyun":
-		return c.uploadToAliyun(fileData, cloudPath, uploadSignature)
+		return c.uploadToAliyun(filePath, cloudPath, uploadSignature)
 	default:
 		return fmt.Errorf("unsupported cloud storage provider: %s", provider)
 	}
@@ -3925,7 +4104,7 @@ func (c *Client) detectCloudProvider(uploadSignature map[string]interface{}) str
 }
 
 // uploadToQiniu 上传文件到七牛云
-func (c *Client) uploadToQiniu(fileData []byte, cloudPath string, uploadSignature map[string]interface{}) error {
+func (c *Client) uploadToQiniu(filePath, cloudPath string, uploadSignature map[string]interface{}) error {
 	// 验证必需参数
 	token, ok := uploadSignature["token"].(string)
 	if !ok || token == "" {
@@ -3940,11 +4119,11 @@ func (c *Client) uploadToQiniu(fileData []byte, cloudPath string, uploadSignatur
 	region, _ := uploadSignature["region"].(string)
 
 	// 尝试上传到七牛云，支持区域域名自动切换
-	return c.uploadToQiniuWithRetry(fileData, cloudPath, token, key, region)
+	return c.uploadToQiniuWithRetry(filePath, cloudPath, token, key, region)
 }
 
 // uploadToQiniuWithRetry 带重试的七牛云上传
-func (c *Client) uploadToQiniuWithRetry(fileData []byte, cloudPath, token, key, region string) error {
+func (c *Client) uploadToQiniuWithRetry(filePath, cloudPath, token, key, region string) error {
 	// 如果没有提供区域信息，使用默认值
 	if region == "" {
 		region = "z0" // 默认华东-浙江区域
@@ -3954,7 +4133,7 @@ func (c *Client) uploadToQiniuWithRetry(fileData []byte, cloudPath, token, key, 
 	uploadURL := c.buildQiniuUploadURL(region)
 
 	// 尝试上传
-	err := c.uploadToQiniuURL(fileData, cloudPath, token, key, uploadURL)
+	err := c.uploadToQiniuURL(filePath, cloudPath, token, key, uploadURL)
 	if err == nil {
 		// 上传成功
 		return nil
@@ -3965,9 +4144,9 @@ func (c *Client) uploadToQiniuWithRetry(fileData []byte, cloudPath, token, key, 
 		correctRegion := c.parseRegionFromError(err.Error())
 		if correctRegion != "" && correctRegion != region {
 			correctURL := c.buildQiniuUploadURL(correctRegion)
-			err = c.uploadToQiniuURL(fileData, cloudPath, token, key, correctURL)
+			err = c.uploadToQiniuURL(filePath, cloudPath, token, key, correctURL)
 			if err == nil {
-				c.logger.Info("Successfully uploaded file to Qiniu with corrected region: %s (%d bytes)", cloudPath, len(fileData))
+				c.logger.Info("Successfully uploaded file to Qiniu with corrected region: %s", cloudPath)
 				return nil
 			}
 		}
@@ -4023,47 +4202,78 @@ func (c *Client) parseRegionFromError(errorMsg string) string {
 	return ""
 }
 
-// uploadToQiniuURL 使用指定URL上传到七牛云
-func (c *Client) uploadToQiniuURL(fileData []byte, cloudPath, token, key, uploadURL string) error {
-	// 创建multipart form data
-	var buf bytes.Buffer
-	writer := multipart.NewWriter(&buf)
+func (c *Client) newStreamingMultipartBody(filePath, fileName string, fields map[string]string) (*io.PipeReader, string, error) {
+	pipeReader, pipeWriter := io.Pipe()
+	writer := multipart.NewWriter(pipeWriter)
+	contentType := writer.FormDataContentType()
 
-	// 添加必需字段
+	go func() {
+		var err error
+		defer func() {
+			if err != nil {
+				_ = pipeWriter.CloseWithError(err)
+				return
+			}
+			_ = pipeWriter.Close()
+		}()
+
+		for fieldName, fieldValue := range fields {
+			if err = writer.WriteField(fieldName, fieldValue); err != nil {
+				err = fmt.Errorf("failed to write field %s: %w", fieldName, err)
+				return
+			}
+		}
+
+		file, openErr := os.Open(filePath)
+		if openErr != nil {
+			err = fmt.Errorf("failed to open file %s: %w", filePath, openErr)
+			return
+		}
+		defer func() {
+			if closeErr := file.Close(); closeErr != nil {
+				c.logger.Warn("Failed to close upload file %s: %v", filePath, closeErr)
+			}
+		}()
+
+		fileWriter, createErr := writer.CreateFormFile("file", fileName)
+		if createErr != nil {
+			err = fmt.Errorf("failed to create form file: %w", createErr)
+			return
+		}
+
+		if _, copyErr := io.Copy(fileWriter, file); copyErr != nil {
+			err = fmt.Errorf("failed to stream file data: %w", copyErr)
+			return
+		}
+
+		if closeErr := writer.Close(); closeErr != nil {
+			err = fmt.Errorf("failed to close multipart writer: %w", closeErr)
+			return
+		}
+	}()
+
+	return pipeReader, contentType, nil
+}
+
+// uploadToQiniuURL 使用指定URL上传到七牛云
+func (c *Client) uploadToQiniuURL(filePath, cloudPath, token, key, uploadURL string) error {
 	fields := map[string]string{
 		"token": token,
 		"key":   key,
 	}
 
-	for fieldName, fieldValue := range fields {
-		if err := writer.WriteField(fieldName, fieldValue); err != nil {
-			return fmt.Errorf("failed to write field %s: %w", fieldName, err)
-		}
-	}
-
-	// 添加文件字段
-	fileName := filepath.Base(cloudPath)
-	fileWriter, err := writer.CreateFormFile("file", fileName)
+	body, contentType, err := c.newStreamingMultipartBody(filePath, filepath.Base(cloudPath), fields)
 	if err != nil {
-		return fmt.Errorf("failed to create form file: %w", err)
-	}
-
-	if _, err := fileWriter.Write(fileData); err != nil {
-		return fmt.Errorf("failed to write file data: %w", err)
-	}
-
-	// 关闭writer
-	if err := writer.Close(); err != nil {
-		return fmt.Errorf("failed to close multipart writer: %w", err)
+		return err
 	}
 
 	// 创建HTTP请求
-	req, err := http.NewRequest("POST", uploadURL, &buf)
+	req, err := http.NewRequest("POST", uploadURL, body)
 	if err != nil {
 		return fmt.Errorf("failed to create HTTP request: %w", err)
 	}
 
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("User-Agent", "SCUM-Run-Client/1.0")
 
 	// 发送请求
@@ -4096,7 +4306,7 @@ func (c *Client) uploadToQiniuURL(fileData []byte, cloudPath, token, key, upload
 }
 
 // uploadToAliyun 上传文件到阿里云OSS
-func (c *Client) uploadToAliyun(fileData []byte, cloudPath string, uploadSignature map[string]interface{}) error {
+func (c *Client) uploadToAliyun(filePath, cloudPath string, uploadSignature map[string]interface{}) error {
 	// 验证必需参数
 	policy, ok := uploadSignature["policy"].(string)
 	if !ok || policy == "" {
@@ -4131,11 +4341,6 @@ func (c *Client) uploadToAliyun(fileData []byte, cloudPath string, uploadSignatu
 	// 构建上传URL
 	uploadURL := fmt.Sprintf("https://%s", endpoint)
 
-	// 创建multipart form data
-	var buf bytes.Buffer
-	writer := multipart.NewWriter(&buf)
-
-	// 添加必需字段
 	fields := map[string]string{
 		"key":                   key,
 		"policy":                policy,
@@ -4144,35 +4349,18 @@ func (c *Client) uploadToAliyun(fileData []byte, cloudPath string, uploadSignatu
 		"success_action_status": "200",
 	}
 
-	for fieldName, fieldValue := range fields {
-		if err := writer.WriteField(fieldName, fieldValue); err != nil {
-			return fmt.Errorf("failed to write field %s: %w", fieldName, err)
-		}
-	}
-
-	// 添加文件字段
-	fileName := filepath.Base(cloudPath)
-	fileWriter, err := writer.CreateFormFile("file", fileName)
+	body, contentType, err := c.newStreamingMultipartBody(filePath, filepath.Base(cloudPath), fields)
 	if err != nil {
-		return fmt.Errorf("failed to create form file: %w", err)
-	}
-
-	if _, err := fileWriter.Write(fileData); err != nil {
-		return fmt.Errorf("failed to write file data: %w", err)
-	}
-
-	// 关闭writer
-	if err := writer.Close(); err != nil {
-		return fmt.Errorf("failed to close multipart writer: %w", err)
+		return err
 	}
 
 	// 创建HTTP请求
-	req, err := http.NewRequest("POST", uploadURL, &buf)
+	req, err := http.NewRequest("POST", uploadURL, body)
 	if err != nil {
 		return fmt.Errorf("failed to create HTTP request: %w", err)
 	}
 
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("User-Agent", "SCUM-Run-Client/1.0")
 
 	// 发送请求
@@ -4233,23 +4421,10 @@ func (c *Client) handleCloudDownload(data interface{}) {
 		return
 	}
 
-	// 构建完整文件路径
-	var fullPath string
-	if strings.HasPrefix(targetPath, "/") {
-		// 绝对路径，将其视为相对于steamDir的路径
-		relativePath := strings.TrimPrefix(targetPath, "/")
-		fullPath = filepath.Join(c.steamDir, relativePath)
-	} else {
-		// 相对路径，基于Steam目录
-		fullPath = filepath.Join(c.steamDir, targetPath)
-	}
-
-	// 验证最终路径是否在允许的目录内
-	cleanFullPath := filepath.Clean(fullPath)
-	cleanSteamDir := filepath.Clean(c.steamDir)
-	if !strings.HasPrefix(cleanFullPath, cleanSteamDir) {
-		c.logger.Error("Access denied: path outside Steam directory: %s (resolved to %s, steamDir: %s)", targetPath, cleanFullPath, cleanSteamDir)
-		c.sendResponse(MsgTypeCloudDownload, nil, "Access denied: path outside allowed directory")
+	fullPath, err := c.resolveSteamPath(targetPath)
+	if err != nil {
+		c.logger.Error("Access denied: path outside Steam directory: %s", targetPath)
+		c.sendResponse(MsgTypeCloudDownload, nil, pathOutsideAllowedError)
 		return
 	}
 
@@ -4264,8 +4439,7 @@ func (c *Client) handleCloudDownload(data interface{}) {
 	c.logger.Info("开始从云存储下载文件: %s -> %s", cloudPath, fullPath)
 
 	// 下载文件
-	err := c.downloadFileFromURL(downloadURL, fullPath)
-	if err != nil {
+	if err := c.downloadFileFromURL(downloadURL, fullPath); err != nil {
 		c.logger.Error("Failed to download file from cloud: %v", err)
 		c.sendResponse(MsgTypeCloudDownload, map[string]interface{}{
 			"target_path": targetPath,

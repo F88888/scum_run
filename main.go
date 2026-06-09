@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 	"os/signal"
@@ -8,6 +9,7 @@ import (
 	"scum_run/config"
 	"scum_run/internal/client"
 	_const "scum_run/internal/const"
+	"scum_run/internal/hostagent"
 	"scum_run/internal/logger"
 	internalSignal "scum_run/internal/signal"
 	"scum_run/internal/steam"
@@ -28,6 +30,11 @@ func cleanup() {
 }
 
 func main() {
+	if hostagent.ModeEnabled() {
+		runHostAgentMode()
+		return
+	}
+
 	// 在程序最开始就禁用 Ctrl+C 处理
 	// 这样 scum_run 永远不会因为 Ctrl+C 信号而退出
 	// 即使在停止/重启 SCUM 服务器时发送 Ctrl+C，scum_run 也不会受影响
@@ -140,4 +147,27 @@ func main() {
 
 	// Keep the application running
 	select {}
+}
+
+// runHostAgentMode starts scum_run as the new OpenSpec host-agent execution worker.
+// It reads configuration from environment variables, keeps the process alive until an external signal arrives, and exits non-zero when registration or polling cannot start.
+func runHostAgentMode() {
+	log := logger.New()
+	cfg, err := hostagent.LoadConfigFromEnv()
+	if err != nil {
+		log.Error("Failed to load host-agent config: %v", err)
+		os.Exit(1)
+	}
+	agent, err := hostagent.New(cfg, log)
+	if err != nil {
+		log.Error("Failed to build host-agent runtime: %v", err)
+		os.Exit(1)
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	defer cancel()
+	log.Info("Starting SCUM Run host-agent mode...")
+	if err := agent.Run(ctx); err != nil && err != context.Canceled {
+		log.Error("Host-agent runtime stopped with error: %v", err)
+		os.Exit(1)
+	}
 }

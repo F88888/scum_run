@@ -27,8 +27,22 @@ type Manager struct {
 	logger         *logger.Logger
 	cmd            *exec.Cmd
 	stdin          io.WriteCloser
+	waitDone       chan error
+	startedAt      time.Time // startedAt 是当前 SCUM 进程启动时间，空值表示未运行或未知。
 	mutex          sync.Mutex
 	outputCallback OutputCallback
+}
+
+// Status 是对外返回的安全进程状态。
+type Status struct {
+	// Running 表示 SCUM 服务进程当前是否仍在运行。
+	Running bool `json:"running"`
+	// PID 是当前进程 ID；未运行时为 0。
+	PID int `json:"pid"`
+	// StartedAt 是当前进程启动时间；未运行或未知时为空。
+	StartedAt *time.Time `json:"started_at,omitempty"`
+	// UptimeSeconds 是当前进程已运行秒数；未运行时为 0。
+	UptimeSeconds int64 `json:"uptime_seconds"`
 }
 
 // New creates a new process manager
@@ -114,7 +128,8 @@ func (m *Manager) buildStartArgs() []string {
 	return args
 }
 
-// Start starts the SCUM server process
+// Start launches the configured SCUM server process.
+// It does not take parameters because configuration is stored on the manager, and it returns an error when validation, process setup, pipe creation, or process start fails.
 func (m *Manager) Start() error {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
@@ -187,13 +202,7 @@ func (m *Manager) Start() error {
 		}
 	}
 
-	// On Windows, create the process in a new console so it can receive Ctrl+C
-	if runtime.GOOS == "windows" {
-		m.cmd.SysProcAttr = &syscall.SysProcAttr{
-			CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
-		}
-		m.logger.Info("Process will be created in new process group for Ctrl+C handling")
-	}
+	m.configureProcessGroup(m.cmd)
 
 	// Set up stdin, stdout and stderr pipes
 	stdin, err := m.cmd.StdinPipe()
@@ -216,6 +225,7 @@ func (m *Manager) Start() error {
 	if err := m.cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start SCUM server: %w", err)
 	}
+	m.startedAt = time.Now().UTC()
 
 	// On Windows, create a new process group to manage child processes
 	if runtime.GOOS == "windows" {
@@ -233,7 +243,8 @@ func (m *Manager) Start() error {
 	go m.readOutput(stderr, "STDERR")
 
 	// Start goroutine to wait for process completion
-	go m.waitForCompletion()
+	m.waitDone = make(chan error, 1)
+	go m.waitForCompletion(m.cmd, m.waitDone)
 
 	return nil
 }
@@ -241,13 +252,14 @@ func (m *Manager) Start() error {
 // Stop stops the SCUM server process
 func (m *Manager) Stop() error {
 	m.mutex.Lock()
-	defer m.mutex.Unlock()
-
 	if m.cmd == nil || m.cmd.Process == nil {
+		m.mutex.Unlock()
 		return fmt.Errorf("server is not running")
 	}
 
-	pid := m.cmd.Process.Pid
+	cmd := m.cmd
+	waitDone := m.waitDone
+	pid := cmd.Process.Pid
 	m.logger.Info("Stopping SCUM server (PID: %d)", pid)
 
 	// Try graceful shutdown first
@@ -268,16 +280,17 @@ func (m *Manager) Stop() error {
 				m.stdin.Close()
 				m.stdin = nil
 			}
+			m.mutex.Unlock()
 
 			// 等待一段时间看进程是否自然退出
 			time.Sleep(2 * time.Second)
 
 			// 如果进程还在运行，使用taskkill作为最后手段
 			// 但这可能导致数据丢失
-			if m.cmd.Process != nil {
+			if isProcessRunning(cmd.Process) {
 				m.logger.Warn("Process still running, using taskkill as last resort (may cause data loss)")
-				cmd := exec.Command("taskkill", "/PID", fmt.Sprintf("%d", pid))
-				output, err := cmd.CombinedOutput()
+				killCmd := exec.Command("taskkill", "/PID", fmt.Sprintf("%d", pid))
+				output, err := killCmd.CombinedOutput()
 				if err != nil {
 					m.logger.Warn("taskkill command failed: %v, output: %s", err, string(output))
 				} else {
@@ -290,52 +303,46 @@ func (m *Manager) Stop() error {
 				m.stdin.Close()
 				m.stdin = nil
 			}
+			m.mutex.Unlock()
 		}
 	} else {
 		// Unix系统下使用SIGTERM，但只发送给子进程
 		// 注意：这里需要确保信号只发送给SCUM进程，不影响scum_run主程序
-		if err := m.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
 			m.logger.Warn("Failed to send SIGTERM: %v", err)
 		}
+		m.mutex.Unlock()
 	}
 
-	// Wait for graceful shutdown
-	done := make(chan error, 1)
-	go func() {
-		done <- m.cmd.Wait()
-	}()
+	if waitDone == nil {
+		return nil
+	}
 
 	select {
-	case <-done:
+	case <-waitDone:
 		m.logger.Info("SCUM server stopped gracefully")
 	case <-time.After(10 * time.Second):
 		m.logger.Warn("Graceful shutdown timeout, forcing kill")
-		if err := m.cmd.Process.Kill(); err != nil {
+		if err := cmd.Process.Kill(); err != nil {
 			m.logger.Error("Failed to kill process: %v", err)
 		}
-		<-done // Wait for the process to actually exit
+		<-waitDone // Wait for the process to actually exit
 	}
 
-	// Close stdin pipe
-	if m.stdin != nil {
-		m.stdin.Close()
-		m.stdin = nil
-	}
-
-	m.cmd = nil
 	return nil
 }
 
 // ForceStop forcefully stops the SCUM server process and all child processes
 func (m *Manager) ForceStop() error {
 	m.mutex.Lock()
-	defer m.mutex.Unlock()
-
 	if m.cmd == nil || m.cmd.Process == nil {
+		m.mutex.Unlock()
 		return nil // Already stopped
 	}
 
-	pid := m.cmd.Process.Pid
+	cmd := m.cmd
+	waitDone := m.waitDone
+	pid := cmd.Process.Pid
 	m.logger.Info("Force stopping SCUM server and child processes (PID: %d)", pid)
 
 	// Close stdin pipe first
@@ -343,6 +350,7 @@ func (m *Manager) ForceStop() error {
 		m.stdin.Close()
 		m.stdin = nil
 	}
+	m.mutex.Unlock()
 
 	// On Windows, use enhanced process tree killing
 	if runtime.GOOS == "windows" {
@@ -358,19 +366,17 @@ func (m *Manager) ForceStop() error {
 		time.Sleep(_const.DefaultWaitTime)
 
 		// Force kill if still running
-		if err := m.cmd.Process.Kill(); err != nil {
+		if err := cmd.Process.Kill(); err != nil {
 			m.logger.Warn("Failed to kill main process: %v", err)
 		}
 	}
 
-	// Wait for process to exit
-	done := make(chan error, 1)
-	go func() {
-		done <- m.cmd.Wait()
-	}()
+	if waitDone == nil {
+		return nil
+	}
 
 	select {
-	case <-done:
+	case <-waitDone:
 		m.logger.Info("SCUM server force stopped")
 	case <-time.After(10 * time.Second):
 		m.logger.Warn("Force stop timeout, process may still be running")
@@ -380,7 +386,6 @@ func (m *Manager) ForceStop() error {
 		}
 	}
 
-	m.cmd = nil
 	return nil
 }
 
@@ -533,7 +538,8 @@ func (m *Manager) Restart() error {
 	return m.Start()
 }
 
-// IsRunning returns whether the SCUM server is running
+// IsRunning reports whether the SCUM server process is alive.
+// It does not take parameters, and it returns true only when a tracked process exists and accepts signal checks.
 func (m *Manager) IsRunning() bool {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
@@ -558,7 +564,8 @@ func (m *Manager) IsRunning() bool {
 	return true
 }
 
-// GetPID returns the process ID of the running server
+// GetPID returns the process ID of the running server.
+// It does not take parameters, and it returns 0 when no process is currently tracked.
 func (m *Manager) GetPID() int {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
@@ -567,6 +574,29 @@ func (m *Manager) GetPID() int {
 		return m.cmd.Process.Pid
 	}
 	return 0
+}
+
+// GetStatus returns a safe status snapshot for the SCUM server process.
+// It does not take parameters, and it returns running state, PID and uptime without exposing command lines or host paths.
+func (m *Manager) GetStatus() Status {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	status := Status{}
+	if m.cmd == nil || m.cmd.Process == nil {
+		return status
+	}
+	if err := m.cmd.Process.Signal(syscall.Signal(0)); err != nil {
+		return status
+	}
+	status.Running = true
+	status.PID = m.cmd.Process.Pid
+	if !m.startedAt.IsZero() {
+		startedAt := m.startedAt
+		status.StartedAt = &startedAt
+		status.UptimeSeconds = int64(time.Since(startedAt).Seconds())
+	}
+	return status
 }
 
 // readOutput reads output from stdout or stderr and logs it
@@ -617,27 +647,35 @@ func (m *Manager) SendCommand(command string) error {
 	return nil
 }
 
-// waitForCompletion waits for the process to complete
-func (m *Manager) waitForCompletion() {
-	if m.cmd != nil {
-		err := m.cmd.Wait()
-		m.mutex.Lock()
-		pid := 0
-		if m.cmd.Process != nil {
-			pid = m.cmd.Process.Pid
-		}
+// waitForCompletion waits for the tracked process to complete.
+// cmd is the process command and waitDone receives the wait result; the function returns no values and clears tracked process state when the command exits.
+func (m *Manager) waitForCompletion(cmd *exec.Cmd, waitDone chan error) {
+	pid := 0
+	if cmd != nil && cmd.Process != nil {
+		pid = cmd.Process.Pid
+	}
+
+	err := cmd.Wait()
+
+	m.mutex.Lock()
+	if m.cmd == cmd {
 		// Close stdin pipe when process completes
 		if m.stdin != nil {
 			m.stdin.Close()
 			m.stdin = nil
 		}
 		m.cmd = nil
-		m.mutex.Unlock()
+		m.waitDone = nil
+		m.startedAt = time.Time{}
+	}
+	m.mutex.Unlock()
 
-		if err != nil {
-			m.logger.Error("SCUM server (PID: %d) exited with error: %v", pid, err)
-		} else {
-			m.logger.Info("SCUM server (PID: %d) exited normally", pid)
-		}
+	waitDone <- err
+	close(waitDone)
+
+	if err != nil {
+		m.logger.Error("SCUM server (PID: %d) exited with error: %v", pid, err)
+	} else {
+		m.logger.Info("SCUM server (PID: %d) exited normally", pid)
 	}
 }

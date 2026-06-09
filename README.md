@@ -1,12 +1,9 @@
 # SCUM Run Client
 
-The SCUM Run client is a Go application that connects to the scum_robot server and provides the following functionality:
+`scum_run` 当前同时保留两种运行模式：
 
-1. **Steam Directory Detection**: Automatically detects the Steam installation directory
-2. **SCUM Server Management**: Starts, stops, and restarts the SCUM server executable
-3. **Database Access**: Reads from the SCUM SQLite database (SCUM.db)
-4. **Log Monitoring**: Monitors SCUM server log files and pushes new lines to the server
-5. **WebSocket Communication**: Maintains a connection with the scum_robot server for remote control
+1. 旧兼容模式：连接旧 `scum_robot` WebSocket。
+2. 新 host-agent 模式：连接 `scum_server`，通过 Host Agent 注册、心跳和数据库操作轮询执行受控能力。
 
 ## Features
 
@@ -16,6 +13,34 @@ The SCUM Run client is a Go application that connects to the scum_robot server a
 - **Database Queries**: Execute SQL queries on the SCUM database
 - **Token Authentication**: Secure authentication with the server
 - **Heartbeat Monitoring**: Maintains connection health
+
+## Host-Agent Mode
+
+新平台下推荐使用 host-agent 模式，它不再连接旧 `scum_robot` WebSocket，而是直接对接 `scum_server`：
+
+```bash
+export SCUM_RUN_MODE=host-agent
+export SCUM_HOST_AGENT_SERVER_URL=http://127.0.0.1:18080
+export SCUM_HOST_AGENT_REGISTRATION_TOKEN=<token>
+export SCUM_HOST_AGENT_ID=scum-run-dev
+export SCUM_HOST_AGENT_DISPLAY_NAME="SCUM Run Dev"
+export SCUM_HOST_AGENT_VERSION=dev
+export SCUM_HOST_AGENT_ADDRESS=127.0.0.1
+export SCUM_RUN_DATABASE_PATH=/path/to/SCUM.db
+
+./scum_run
+```
+
+如果没有显式设置 `SCUM_RUN_DATABASE_PATH`，也可以提供 `SCUM_RUN_STEAM_DIR` 让 `scum_run` 推导 `SCUM.db` 路径。
+
+当前 host-agent 模式已经闭合以下链路：
+
+- `POST /api/v1/host-agents/hello`
+- `POST /api/v1/host-agents/heartbeat`
+- `GET /api/v1/host-agents/database-operations/next`
+- `POST /api/v1/host-agents/database-operations/{id}/result`
+
+插件来源的 SCUM 数据库请求会通过只读模式执行，并拒绝写入、多语句、事务、schema 变更和其他危险 SQL。
 
 ## Installation
 
@@ -33,7 +58,7 @@ The SCUM Run client is a Go application that connects to the scum_robot server a
    go build -o scum_run main.go
    ```
 
-## Configuration
+## Legacy WebSocket Configuration
 
 1. Copy the example configuration file:
    ```bash
@@ -48,7 +73,7 @@ The SCUM Run client is a Go application that connects to the scum_robot server a
    }
    ```
 
-## Usage
+## Legacy WebSocket Usage
 
 ### Basic Usage
 
@@ -79,15 +104,24 @@ The client responds to the following WebSocket message types:
 - `server_status`: Get server status (running/stopped, PID)
 
 ### Database Operations
-- `db_query`: Execute SQL queries on the SCUM database
+- `db_query`: Execute a single SQL statement on the SCUM database. Both reads and authorized writes are supported because operator workflows may need to repair user data.
   ```json
   {
     "type": "db_query",
     "data": {
-      "query": "SELECT * FROM ScumUser LIMIT 10"
+      "query_id": "repair-001",
+      "query": "UPDATE users SET name = ? WHERE id = ?",
+      "args": ["new-name", 123],
+      "timeout_ms": 10000,
+      "max_rows": 500,
+      "max_bytes": 1048576
     }
   }
   ```
+
+  Read responses include `action`, `columns`, `result`, `truncated`, `truncated_by`, and `duration_ms`.
+  Write responses include `action`, `rows_affected`, and `duration_ms`.
+  Multi-statement payloads are rejected by default; send one SQL statement per request.
 
 ### Log Monitoring
 - The client automatically sends `log_update` messages when new log lines are detected:
@@ -115,7 +149,7 @@ The client automatically detects the following paths:
 - Go 1.21 or later
 - Steam installed with SCUM Server
 - SQLite3 support (CGO enabled)
-- Network access to the scum_robot server
+- Network access to the target control plane (`scum_robot` legacy mode or `scum_server` host-agent mode)
 
 ## Troubleshooting
 
