@@ -19,6 +19,11 @@ import (
 
 var scumClient *client.Client
 
+var (
+	version = "dev"
+	commit  = ""
+)
+
 // cleanup ensures all processes are properly cleaned up on exit
 func cleanup() {
 	if scumClient != nil {

@@ -33,7 +33,6 @@ import (
 	"scum_run/internal/process"
 	runtimeMode "scum_run/internal/runtime"
 	"scum_run/internal/steam"
-	"scum_run/internal/steamtools"
 	"scum_run/internal/updater"
 	"scum_run/internal/utils"
 	"scum_run/internal/websocket_client"
@@ -55,7 +54,6 @@ type Client struct {
 	db         *database.Client
 	logMonitor *logmonitor.Monitor
 	process    *process.Manager
-	steamTools *steamtools.Manager
 	sysMonitor *monitor.SystemMonitor
 	ctx        context.Context
 	cancel     context.CancelFunc
@@ -104,7 +102,6 @@ const (
 	MsgTypeLogFileData      = "log_file_data"  // SCUM日志文件数据（用于processLogLine处理）
 	MsgTypeProcessOutput    = "process_output" // 服务器进程输出（用于终端显示）
 	MsgTypeHeartbeat        = "heartbeat"
-	MsgTypeSteamToolsStatus = "steamtools_status"
 	MsgTypeConfigSync       = "config_sync"       // 配置同步
 	MsgTypeConfigUpdate     = "config_update"     // 配置更新
 	MsgTypeInstallServer    = "install_server"    // 安装服务器
@@ -153,7 +150,9 @@ const (
 	pathOutsideAllowedError = "Access denied: path outside allowed directory"
 )
 
-// New creates a new SCUM Run client
+// New creates a SCUM Run client with local process, database, log and monitor managers.
+// cfg contains client configuration, steamDir is the SCUM server root, and logger records runtime events.
+// It returns an initialized client instance; construction does not start network connections or server processes.
 func New(cfg *config.Config, steamDir string, logger *logger.Logger) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -167,7 +166,6 @@ func New(cfg *config.Config, steamDir string, logger *logger.Logger) *Client {
 		cancel:              cancel,
 		db:                  database.New(steamDetector.GetSCUMDatabasePath(steamDir), logger),
 		process:             process.New(steamDetector.GetSCUMServerPath(steamDir), logger),
-		steamTools:          steamtools.New(&cfg.SteamTools, logger),
 		sysMonitor:          monitor.New(logger, 10*time.Second),                    // 每10秒监控一次
 		logFileDataBuffer:   make([]string, 0, 100),                                 // 预分配100条日志文件数据的缓冲区
 		processOutputBuffer: make([]string, 0, 100),                                 // 预分配100条进程输出的缓冲区
@@ -194,18 +192,10 @@ func New(cfg *config.Config, steamDir string, logger *logger.Logger) *Client {
 	return client
 }
 
-// Start starts the client
+// Start connects the client to the server and initializes local monitoring and SCUM components.
+// It does not accept parameters and uses the configuration stored on the client.
+// It returns nil on successful startup, or an error when the server address is invalid or WebSocket connection fails.
 func (c *Client) Start() error {
-	// Start Steam++ first for network acceleration
-	if c.config.SteamTools.Enabled {
-		c.logger.Info("正在启动 Steam++ 网络加速...")
-		if err := c.steamTools.Start(); err != nil {
-			c.logger.Warn("Steam++ 启动失败，继续运行但可能影响 Steam 服务访问: %v", err)
-		} else {
-			c.logger.Info("Steam++ 启动成功，网络加速已启用")
-		}
-	}
-
 	// Connect to WebSocket server
 	u, err := url.Parse(c.config.ServerAddr)
 	if err != nil {
@@ -290,7 +280,9 @@ func (c *Client) Start() error {
 	return nil
 }
 
-// Stop stops the client
+// Stop gracefully stops the client and releases local monitors, processes, database and WebSocket resources.
+// It does not accept parameters and operates on the receiver's active resources.
+// It returns no values; cleanup failures are logged and shutdown continues.
 func (c *Client) Stop() {
 	c.logger.Info("Stopping SCUM Run client...")
 
@@ -343,17 +335,12 @@ func (c *Client) Stop() {
 		}
 	}
 
-	// Stop Steam++ last
-	if c.steamTools != nil {
-		if err := c.steamTools.Stop(); err != nil {
-			c.logger.Warn("Failed to stop Steam++: %v", err)
-		}
-	}
-
 	c.wg.Wait()
 }
 
-// ForceStop forcefully stops the client and all associated processes
+// ForceStop forcefully stops the client and all associated local processes.
+// It does not accept parameters and uses the receiver's process manager for cleanup.
+// It returns no values; cleanup failures are logged and shutdown continues.
 func (c *Client) ForceStop() {
 	c.cancel()
 
@@ -399,13 +386,6 @@ func (c *Client) ForceStop() {
 		}
 	}
 
-	// Stop Steam++ last
-	if c.steamTools != nil {
-		if err := c.steamTools.Stop(); err != nil {
-			c.logger.Warn("Failed to stop Steam++: %v", err)
-		}
-	}
-
 	c.wg.Wait()
 	c.logger.Info("SCUM Run client force stopped")
 }
@@ -443,7 +423,9 @@ func (c *Client) handleMessages() {
 	}
 }
 
-// handleMessage handles a single WebSocket message
+// handleMessage dispatches a single WebSocket message to the matching local handler.
+// msg contains the message type and payload received from the server.
+// It returns no values; handler responses and validation failures are sent back over the WebSocket when needed.
 func (c *Client) handleMessage(msg request.WebSocketMessage) {
 	switch msg.Type {
 	case MsgTypeServerStart:
@@ -456,8 +438,6 @@ func (c *Client) handleMessage(msg request.WebSocketMessage) {
 		c.handleServerStatus()
 	case MsgTypeDBQuery:
 		c.handleDBQuery(msg.Data)
-	case MsgTypeSteamToolsStatus:
-		c.handleSteamToolsStatus()
 	case MsgTypeConfigSync:
 		c.handleConfigSync(msg.Data)
 	case MsgTypeConfigUpdate:
@@ -632,12 +612,6 @@ func (c *Client) handleServerRestart() {
 // It returns no values; send failures are handled by the WebSocket client layer.
 func (c *Client) handleServerStatus() {
 	c.sendResponse(MsgTypeServerStatus, c.process.GetStatus(), "")
-}
-
-// handleSteamToolsStatus handles Steam++ status request
-func (c *Client) handleSteamToolsStatus() {
-	status := c.steamTools.GetStatus()
-	c.sendResponse(MsgTypeSteamToolsStatus, status, "")
 }
 
 // handleDBQuery handles a forwarded SCUM database request.

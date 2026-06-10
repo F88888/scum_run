@@ -14,6 +14,13 @@ const (
 	defaultRequestTimeout    = 15 * time.Second
 )
 
+var (
+	compiledServerURL         string
+	compiledRegistrationToken string
+	compiledAgentID           string
+	compiledVersion           string
+)
+
 // Config 表示 scum_run host agent 模式的运行配置。
 type Config struct {
 	// ServerURL 是 scum_server 控制面的基础地址。
@@ -41,21 +48,22 @@ type Config struct {
 }
 
 // ModeEnabled reports whether scum_run should start in host-agent mode.
-// It takes no parameters and returns true when explicit host-agent environment variables are present.
+// It takes no parameters, compiled defaults are considered alongside environment variables, and it returns true when host-agent startup information is available.
 func ModeEnabled() bool {
 	return strings.EqualFold(strings.TrimSpace(os.Getenv("SCUM_RUN_MODE")), "host-agent") ||
-		strings.TrimSpace(os.Getenv("SCUM_HOST_AGENT_SERVER_URL")) != ""
+		strings.TrimSpace(os.Getenv("SCUM_HOST_AGENT_SERVER_URL")) != "" ||
+		strings.TrimSpace(compiledServerURL) != ""
 }
 
-// LoadConfigFromEnv loads host-agent mode configuration from environment variables.
-// It takes no parameters and returns the parsed config or a validation error when required values are missing.
+// LoadConfigFromEnv loads host-agent mode configuration from environment variables and compiled defaults.
+// It takes no parameters, environment variables override compiled-in values when both exist, and it returns the parsed config or a validation error when required values are still missing.
 func LoadConfigFromEnv() (Config, error) {
 	cfg := Config{
-		ServerURL:         strings.TrimRight(strings.TrimSpace(os.Getenv("SCUM_HOST_AGENT_SERVER_URL")), "/"),
-		RegistrationToken: strings.TrimSpace(os.Getenv("SCUM_HOST_AGENT_REGISTRATION_TOKEN")),
-		AgentID:           strings.TrimSpace(os.Getenv("SCUM_HOST_AGENT_ID")),
+		ServerURL:         strings.TrimRight(firstNonEmpty(strings.TrimSpace(os.Getenv("SCUM_HOST_AGENT_SERVER_URL")), compiledServerURL), "/"),
+		RegistrationToken: firstNonEmpty(strings.TrimSpace(os.Getenv("SCUM_HOST_AGENT_REGISTRATION_TOKEN")), compiledRegistrationToken),
+		AgentID:           firstNonEmpty(strings.TrimSpace(os.Getenv("SCUM_HOST_AGENT_ID")), compiledAgentID),
 		DisplayName:       strings.TrimSpace(os.Getenv("SCUM_HOST_AGENT_DISPLAY_NAME")),
-		Version:           strings.TrimSpace(os.Getenv("SCUM_HOST_AGENT_VERSION")),
+		Version:           firstNonEmpty(strings.TrimSpace(os.Getenv("SCUM_HOST_AGENT_VERSION")), compiledVersion),
 		Address:           strings.TrimSpace(os.Getenv("SCUM_HOST_AGENT_ADDRESS")),
 		DatabasePath:      strings.TrimSpace(os.Getenv("SCUM_RUN_DATABASE_PATH")),
 		SteamDir:          strings.TrimSpace(os.Getenv("SCUM_RUN_STEAM_DIR")),
@@ -104,6 +112,17 @@ func (c Config) Validate() error {
 		errs = append(errs, errors.New("SCUM_HOST_AGENT_REQUEST_TIMEOUT must be positive"))
 	}
 	return errors.Join(errs...)
+}
+
+// firstNonEmpty returns the first non-empty trimmed string from the provided candidates.
+// values is the candidate string list, it does not take additional parameters, and the function returns the first usable value or an empty string when every candidate is blank.
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 // envDuration parses one duration environment variable with a fallback value.
