@@ -1,5 +1,7 @@
 package request
 
+import "scum_run/model"
+
 // ScumServerConfigData SCUM服务器配置数据
 type ScumServerConfigData struct {
 	// ServiceName 是服务实例名称，用于和端口一起识别本地游戏服务。
@@ -20,6 +22,8 @@ type ScumServerConfigData struct {
 	ServerIP string `json:"server_ip"`
 	// AdditionalArgs 是旧兼容模式下的附加参数或旧命令行服完整命令。
 	AdditionalArgs string `json:"additional_args"`
+	// LaunchProfile 是 scum_server 下发的通用启动配置。
+	LaunchProfile *model.LaunchProfile `json:"launch_profile,omitempty"`
 	// SteamCmdPath 是 SteamCMD 可执行文件路径。
 	SteamCmdPath string `json:"steamcmd_path"`
 	// AutoUpdate 表示是否允许自动更新服务器。

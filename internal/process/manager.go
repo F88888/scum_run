@@ -267,6 +267,9 @@ func (m *Manager) Start() error {
 // buildCommand creates the OS command used to start the configured server.
 // It reads service configuration from the manager, and it returns the command or an error when required legacy executable settings are invalid.
 func (m *Manager) buildCommand() (*exec.Cmd, error) {
+	if m.config != nil && m.config.LaunchProfile != nil {
+		return m.buildLaunchProfileCommand()
+	}
 	if strings.TrimSpace(m.config.StartCommand) != "" {
 		shell, args := shellCommand(m.config.StartCommand)
 		cmd := exec.Command(shell, args...)
@@ -306,10 +309,168 @@ func (m *Manager) buildCommand() (*exec.Cmd, error) {
 	return cmd, nil
 }
 
+// buildLaunchProfileCommand creates an OS command from a generic launch profile.
+// It reads the current manager config, resolves workDir and relative executables under the instance scope, and returns the command or an error when mode, path containment, or executable availability is invalid.
+func (m *Manager) buildLaunchProfileCommand() (*exec.Cmd, error) {
+	profile := m.config.LaunchProfile
+	if profile == nil {
+		return nil, fmt.Errorf("launch profile is required")
+	}
+	workDir, err := m.resolveScopedPath(profile.WorkDir, true)
+	if err != nil {
+		return nil, fmt.Errorf("resolve launch workDir: %w", err)
+	}
+	mode := strings.ToLower(strings.TrimSpace(profile.LaunchMode))
+	if mode == "" {
+		mode = "argv"
+	}
+	var cmd *exec.Cmd
+	switch mode {
+	case "argv":
+		executable, err := m.resolveExecutablePath(workDir, profile.Executable)
+		if err != nil {
+			return nil, err
+		}
+		cmd = exec.Command(executable, profile.Args...)
+	case "shell":
+		if strings.TrimSpace(profile.ShellCommand) == "" {
+			return nil, fmt.Errorf("shell command is required")
+		}
+		shell, args := shellCommand(profile.ShellCommand)
+		cmd = exec.Command(shell, args...)
+	default:
+		return nil, fmt.Errorf("unsupported launch mode: %s", mode)
+	}
+	cmd.Dir = workDir
+	if len(profile.Env) > 0 {
+		cmd.Env = os.Environ()
+		for key, value := range profile.Env {
+			cmd.Env = append(cmd.Env, strings.TrimSpace(key)+"="+value)
+		}
+	}
+	m.logger.Info("Starting launch profile %s generation %d in %s", profile.ServiceName, profile.LaunchGeneration, workDir)
+	return cmd, nil
+}
+
+// resolveExecutablePath resolves a launch-profile executable under the scoped work directory.
+// workDir is the resolved scoped working directory and executable is the profile relative executable path; it returns an executable path or an error for absolute, escaping, or missing files.
+func (m *Manager) resolveExecutablePath(workDir string, executable string) (string, error) {
+	executable = strings.TrimSpace(executable)
+	if executable == "" {
+		return "", fmt.Errorf("executable is required")
+	}
+	if filepath.IsAbs(executable) {
+		return "", fmt.Errorf("absolute executable paths are not allowed")
+	}
+	candidate := filepath.Clean(filepath.Join(workDir, filepath.FromSlash(executable)))
+	if !pathWithin(workDir, candidate) && !pathWithin(m.launchScopeRoot(), candidate) {
+		return "", fmt.Errorf("executable escapes instance scope")
+	}
+	info, err := os.Stat(candidate)
+	if err != nil {
+		return "", fmt.Errorf("executable is missing: %w", err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("executable is a directory")
+	}
+	resolved, err := resolveExistingPath(candidate)
+	if err != nil {
+		return "", err
+	}
+	scope, err := resolveExistingPath(m.launchScopeRoot())
+	if err != nil {
+		return "", err
+	}
+	if !pathWithin(scope, resolved) {
+		return "", fmt.Errorf("executable symlink escapes instance scope")
+	}
+	return resolved, nil
+}
+
+// resolveScopedPath resolves an instance-relative path under the launch profile scope.
+// relative is the profile path and mustExist controls existence checks; it returns the resolved host path or an error for absolute, traversal, missing, or symlink-escaping paths.
+func (m *Manager) resolveScopedPath(relative string, mustExist bool) (string, error) {
+	scope := m.launchScopeRoot()
+	if strings.TrimSpace(scope) == "" {
+		return "", fmt.Errorf("instance scope root is required")
+	}
+	if filepath.IsAbs(relative) {
+		return "", fmt.Errorf("absolute paths are not allowed")
+	}
+	cleanRelative := filepath.Clean(filepath.FromSlash(strings.TrimSpace(relative)))
+	if cleanRelative == "" || cleanRelative == "." {
+		cleanRelative = "."
+	}
+	if strings.HasPrefix(cleanRelative, ".."+string(filepath.Separator)) || cleanRelative == ".." {
+		return "", fmt.Errorf("path traversal is not allowed")
+	}
+	candidate := filepath.Clean(filepath.Join(scope, cleanRelative))
+	if !pathWithin(scope, candidate) {
+		return "", fmt.Errorf("path escapes instance scope")
+	}
+	if mustExist {
+		info, err := os.Stat(candidate)
+		if err != nil {
+			return "", fmt.Errorf("scoped path is missing: %w", err)
+		}
+		if !info.IsDir() {
+			return "", fmt.Errorf("scoped workDir is not a directory")
+		}
+		resolved, err := resolveExistingPath(candidate)
+		if err != nil {
+			return "", err
+		}
+		resolvedScope, err := resolveExistingPath(scope)
+		if err != nil {
+			return "", err
+		}
+		if !pathWithin(resolvedScope, resolved) {
+			return "", fmt.Errorf("scoped path symlink escapes instance scope")
+		}
+		return resolved, nil
+	}
+	return candidate, nil
+}
+
+// launchScopeRoot returns the host-local root assigned to the current instance.
+// It reads the manager config and returns ExecPath as the launch-profile scope root.
+func (m *Manager) launchScopeRoot() string {
+	if m == nil || m.config == nil {
+		return ""
+	}
+	return filepath.Clean(strings.TrimSpace(m.config.ExecPath))
+}
+
+// resolveExistingPath resolves symlinks for an existing path.
+// path identifies a local filesystem entry, and the function returns its evaluated path or an error when resolution fails.
+func resolveExistingPath(path string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve symlink path: %w", err)
+	}
+	return filepath.Clean(resolved), nil
+}
+
+// pathWithin reports whether child is equal to or inside parent.
+// parent and child are host-local paths, and the function returns true when child is contained by parent after filepath cleaning.
+func pathWithin(parent string, child string) bool {
+	parent = filepath.Clean(parent)
+	child = filepath.Clean(child)
+	if parent == child {
+		return true
+	}
+	rel, err := filepath.Rel(parent, child)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
 // ensurePortAvailable verifies that the configured service port is not already owned by an untracked process.
 // It does not take parameters, and it returns nil when no port check is required or the port is available.
 func (m *Manager) ensurePortAvailable() error {
-	if m.config.GamePort <= 0 {
+	serviceName, port := serviceIdentity(m.config)
+	if port <= 0 {
 		return nil
 	}
 	portChecker := network.NewPortChecker(_const.DefaultWaitTime + _const.ShortWaitTime)
@@ -318,14 +479,14 @@ func (m *Manager) ensurePortAvailable() error {
 		host = "127.0.0.1"
 	}
 
-	m.logger.Info("Checking if port %d is available on %s...", m.config.GamePort, host)
-	portStatus, err := portChecker.CheckPort(host, m.config.GamePort)
+	m.logger.Info("Checking if port %d is available on %s...", port, host)
+	portStatus, err := portChecker.CheckPort(host, port)
 	if err != nil {
 		m.logger.Warn("Failed to check port status: %v", err)
 		return nil
 	}
 	if portStatus.InUse {
-		return fmt.Errorf("port %d is already in use on %s for service %s", m.config.GamePort, host, m.config.ServiceName)
+		return fmt.Errorf("port %d is already in use on %s for service %s", port, host, serviceName)
 	}
 	return nil
 }

@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"github.com/saintfish/chardet"
 	"github.com/shirou/gopsutil/v3/cpu"
@@ -861,7 +862,8 @@ func (c *Client) handleConfigUpdate(data interface{}) {
 	c.updateServerConfig(configData)
 }
 
-// updateServerConfig updates the local server configuration
+// updateServerConfig updates the local server configuration from websocket data.
+// configData contains legacy SCUM fields and optional launch_profile metadata, and the method stores the normalized config on the process manager; it returns no values and logs confirmation send failures.
 func (c *Client) updateServerConfig(configData map[string]interface{}) {
 	serverConfig := &model.ServerConfig{}
 
@@ -929,6 +931,12 @@ func (c *Client) updateServerConfig(configData map[string]interface{}) {
 
 	if additionalArgs, ok := configData["additional_args"].(string); ok {
 		serverConfig.AdditionalArgs = additionalArgs
+	}
+	if launchProfile, ok := decodeLaunchProfile(configData["launch_profile"]); ok {
+		serverConfig.LaunchProfile = launchProfile
+		serverConfig.ServiceName = strings.TrimSpace(launchProfile.ServiceName)
+		serverConfig.GamePort = launchProfileGamePort(launchProfile)
+		serverConfig.WorkDir = strings.TrimSpace(launchProfile.WorkDir)
 	}
 
 	// 命令行服务器（4）使用不同的配置逻辑
@@ -1008,6 +1016,7 @@ func (c *Client) updateServerConfig(configData map[string]interface{}) {
 				"enable_battleye": serverConfig.EnableBattlEye,
 				"server_ip":       serverConfig.ServerIP,
 				"additional_args": serverConfig.AdditionalArgs,
+				"launch_profile":  serverConfig.LaunchProfile,
 			},
 		},
 	}
@@ -1029,6 +1038,46 @@ func (c *Client) updateServerConfig(configData map[string]interface{}) {
 			}()
 		}
 	}
+}
+
+// decodeLaunchProfile decodes a nested launch_profile payload from server config data.
+// value contains a map or typed launch profile from websocket config, and the function returns the decoded profile plus whether a profile was present and valid.
+func decodeLaunchProfile(value interface{}) (*model.LaunchProfile, bool) {
+	if value == nil {
+		return nil, false
+	}
+	if profile, ok := value.(*model.LaunchProfile); ok && profile != nil {
+		return profile, true
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil, false
+	}
+	var profile model.LaunchProfile
+	if err := json.Unmarshal(data, &profile); err != nil {
+		return nil, false
+	}
+	if strings.TrimSpace(profile.ServiceName) == "" && len(profile.Ports) == 0 && strings.TrimSpace(profile.LaunchMode) == "" {
+		return nil, false
+	}
+	return &profile, true
+}
+
+// launchProfileGamePort returns the primary port from a launch profile.
+// profile contains declared launch ports, and the function returns the game port, first declared port, or zero when none is configured.
+func launchProfileGamePort(profile *model.LaunchProfile) int {
+	if profile == nil {
+		return 0
+	}
+	for _, port := range profile.Ports {
+		if strings.EqualFold(strings.TrimSpace(port.Name), "game") {
+			return port.Port
+		}
+	}
+	if len(profile.Ports) > 0 {
+		return profile.Ports[0].Port
+	}
+	return 0
 }
 
 // handleInstallServer 已移除 - 客户端自动处理安装，不再响应服务器端安装请求
