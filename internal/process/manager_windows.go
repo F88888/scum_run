@@ -20,6 +20,8 @@ const (
 	CTRL_BREAK_EVENT = 1
 )
 
+// configureProcessGroup starts a child process in a new Windows process group.
+// cmd is the command being started, and the function returns no values because the setting is applied directly to cmd.
 func (m *Manager) configureProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
@@ -27,8 +29,28 @@ func (m *Manager) configureProcessGroup(cmd *exec.Cmd) {
 	m.logger.Info("Process will be created in new process group for Ctrl+C handling")
 }
 
+// isProcessRunning checks whether a Windows process handle is present.
+// process is the OS process handle, and the function returns true when the handle is non-nil.
 func isProcessRunning(process *os.Process) bool {
 	return process != nil
+}
+
+// signalProcess sends a best-effort signal to a Windows process.
+// process is the target process and signal is the requested signal; the function returns any delivery error.
+func signalProcess(process *os.Process, signal syscall.Signal) error {
+	if process == nil {
+		return fmt.Errorf("process is nil")
+	}
+	return process.Signal(signal)
+}
+
+// killProcess forcefully kills a Windows process.
+// process is the target process, and the function returns any delivery error.
+func killProcess(process *os.Process) error {
+	if process == nil {
+		return fmt.Errorf("process is nil")
+	}
+	return process.Kill()
 }
 
 // sendCtrlC 向指定进程发送Ctrl+C信号

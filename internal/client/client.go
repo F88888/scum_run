@@ -881,6 +881,28 @@ func (c *Client) updateServerConfig(configData map[string]interface{}) {
 		}
 	}
 
+	if serviceName, ok := configData["service_name"].(string); ok && strings.TrimSpace(serviceName) != "" {
+		serverConfig.ServiceName = strings.TrimSpace(serviceName)
+	} else if serverName, ok := configData["server_name"].(string); ok && strings.TrimSpace(serverName) != "" {
+		serverConfig.ServiceName = strings.TrimSpace(serverName)
+	} else if c.serverID > 0 {
+		serverConfig.ServiceName = fmt.Sprintf("server-%d", c.serverID)
+	} else {
+		serverConfig.ServiceName = "game-server"
+	}
+
+	if gamePort, ok := configData["game_port"].(float64); ok {
+		serverConfig.GamePort = int(gamePort)
+	}
+
+	if workDir, ok := configData["work_dir"].(string); ok {
+		serverConfig.WorkDir = strings.TrimSpace(workDir)
+	}
+
+	if startCommand, ok := configData["start_command"].(string); ok {
+		serverConfig.StartCommand = strings.TrimSpace(startCommand)
+	}
+
 	// 保存载具类型的 trade_goods 数据
 	if vehicleGoods, ok := configData["vehicle_goods"].([]interface{}); ok {
 		c.vehicleGoodsMap = make(map[string]string)
@@ -905,28 +927,36 @@ func (c *Client) updateServerConfig(configData map[string]interface{}) {
 		c.logger.Info("Loaded %d vehicle goods from server config", len(c.vehicleGoodsMap))
 	}
 
+	if additionalArgs, ok := configData["additional_args"].(string); ok {
+		serverConfig.AdditionalArgs = additionalArgs
+	}
+
 	// 命令行服务器（4）使用不同的配置逻辑
 	if c.ftpProvider == 4 {
-		// 命令行服务器：install_path 是运行目录，additional_args 是完整的启动命令
+		// 命令行服务器：install_path 是运行目录，start_command 是完整启动命令。
 		if installPath, ok := configData["install_path"].(string); ok && installPath != "" {
-			// 对于命令行服务器，install_path 就是运行目录，不需要拼接 SCUMServer.exe
 			serverConfig.ExecPath = installPath
+			if serverConfig.WorkDir == "" {
+				serverConfig.WorkDir = installPath
+			}
 		}
-		// 命令行服务器不需要设置 GamePort
-		serverConfig.GamePort = 0
+		if serverConfig.StartCommand == "" {
+			serverConfig.StartCommand = strings.TrimSpace(serverConfig.AdditionalArgs)
+		}
 	} else {
 		// 普通 SCUM 服务器
 		if installPath, ok := configData["install_path"].(string); ok && installPath != "" {
 			serverConfig.ExecPath = installPath + "\\SCUM\\Binaries\\Win64\\SCUMServer.exe"
+			if serverConfig.WorkDir == "" {
+				serverConfig.WorkDir = installPath
+			}
 		} else {
 			// 如果没有配置路径，使用Steam检测的路径
 			steamDetector := steam.NewDetector(c.logger)
 			serverConfig.ExecPath = steamDetector.GetSCUMServerPath(c.steamDir)
 		}
 
-		if gamePort, ok := configData["game_port"].(float64); ok {
-			serverConfig.GamePort = int(gamePort)
-		} else {
+		if serverConfig.GamePort == 0 && serverConfig.StartCommand == "" {
 			serverConfig.GamePort = _const.DefaultGamePort
 		}
 	}
@@ -945,10 +975,6 @@ func (c *Client) updateServerConfig(configData map[string]interface{}) {
 		serverConfig.ServerIP = serverIP
 	}
 
-	if additionalArgs, ok := configData["additional_args"].(string); ok {
-		serverConfig.AdditionalArgs = additionalArgs
-	}
-
 	// 更新SteamCmd路径配置
 	if steamCmdPath, ok := configData["steamcmd_path"].(string); ok && steamCmdPath != "" {
 		c.config.AutoInstall.SteamCmdPath = steamCmdPath
@@ -958,8 +984,8 @@ func (c *Client) updateServerConfig(configData map[string]interface{}) {
 	// 更新进程管理器配置
 	if c.process != nil {
 		c.process.UpdateConfig(serverConfig)
-		c.logger.Info("Updated server configuration - Path: %s, Port: %d, MaxPlayers: %d, BattlEye: %v",
-			serverConfig.ExecPath, serverConfig.GamePort, serverConfig.MaxPlayers, serverConfig.EnableBattlEye)
+		c.logger.Info("Updated server configuration - Service: %s, Port: %d, WorkDir: %s",
+			serverConfig.ServiceName, serverConfig.GamePort, serverConfig.WorkDir)
 	} else {
 		// 如果进程管理器还未创建，则创建一个新的
 		c.process = process.NewWithConfig(serverConfig, c.logger)
@@ -974,6 +1000,9 @@ func (c *Client) updateServerConfig(configData map[string]interface{}) {
 			"config_updated": true,
 			"current_config": map[string]interface{}{
 				"exec_path":       serverConfig.ExecPath,
+				"service_name":    serverConfig.ServiceName,
+				"work_dir":        serverConfig.WorkDir,
+				"start_command":   serverConfig.StartCommand,
 				"game_port":       serverConfig.GamePort,
 				"max_players":     serverConfig.MaxPlayers,
 				"enable_battleye": serverConfig.EnableBattlEye,

@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -37,18 +38,31 @@ type Manager struct {
 type Status struct {
 	// Running 表示 SCUM 服务进程当前是否仍在运行。
 	Running bool `json:"running"`
+	// State 表示本地记录的服务状态，例如 running、starting、crashed 或 blocked。
+	State string `json:"state"`
 	// PID 是当前进程 ID；未运行时为 0。
 	PID int `json:"pid"`
+	// ServiceName 是本地服务实例名称。
+	ServiceName string `json:"service_name,omitempty"`
+	// GamePort 是本地服务监听端口。
+	GamePort int `json:"game_port,omitempty"`
 	// StartedAt 是当前进程启动时间；未运行或未知时为空。
 	StartedAt *time.Time `json:"started_at,omitempty"`
 	// UptimeSeconds 是当前进程已运行秒数；未运行时为 0。
 	UptimeSeconds int64 `json:"uptime_seconds"`
+	// ConsecutiveStartFailures 是连续启动失败次数。
+	ConsecutiveStartFailures int `json:"consecutive_start_failures,omitempty"`
+	// LastError 是最近一次启动或运行失败的错误摘要。
+	LastError string `json:"last_error,omitempty"`
+	// LastLogTail 是最近一次失败时截取的本地进程输出尾部。
+	LastLogTail []string `json:"last_log_tail,omitempty"`
 }
 
 // New creates a new process manager
 func New(execPath string, logger *logger.Logger) *Manager {
 	return &Manager{
 		config: &model.ServerConfig{
+			ServiceName:    "scum",
 			ExecPath:       execPath,
 			GamePort:       _const.DefaultGamePort,
 			MaxPlayers:     _const.DefaultMaxPlayers,
@@ -128,139 +142,242 @@ func (m *Manager) buildStartArgs() []string {
 	return args
 }
 
-// Start launches the configured SCUM server process.
-// It does not take parameters because configuration is stored on the manager, and it returns an error when validation, process setup, pipe creation, or process start fails.
+// Start launches or attaches to the configured game server process.
+// It does not take parameters because configuration is stored on the manager, including service name, port and startup command.
+// It returns nil when an existing matching service is alive or a new process starts, or an error when validation, locking, process setup, startup, or failure-threshold checks fail.
 func (m *Manager) Start() error {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
+	releaseLock, err := m.acquireStartupLock()
+	if err != nil {
+		return err
+	}
+	defer releaseLock()
 
+	m.mutex.Lock()
 	if m.cmd != nil && m.cmd.Process != nil {
-		return fmt.Errorf("server is already running")
+		if isProcessRunning(m.cmd.Process) {
+			m.mutex.Unlock()
+			return nil
+		}
+	}
+	m.mutex.Unlock()
+
+	state, err := m.readRuntimeState()
+	if err != nil {
+		return err
+	}
+	if inspected, alive := m.inspectRuntimeState(state); alive {
+		inspected.State = runtimeStateRunning
+		inspected.LastError = ""
+		if err := m.writeRuntimeState(inspected); err != nil {
+			m.logger.Warn("Failed to refresh attached process state: %v", err)
+		}
+		m.mutex.Lock()
+		m.startedAt = inspected.StartedAt
+		m.mutex.Unlock()
+		m.logger.Info("Attached to existing %s server process on port %d with PID: %d", inspected.ServiceName, inspected.GamePort, inspected.PID)
+		return nil
+	}
+	if state.PID > 0 && (state.State == runtimeStateRunning || state.State == runtimeStateStarting) {
+		_ = m.recordStartFailure("previous server process is no longer running", nil)
+		state, _ = m.readRuntimeState()
+	}
+	if state.State == runtimeStateBlocked && state.ConsecutiveStartFailures >= startFailureThreshold {
+		return fmt.Errorf("server startup is blocked after %d consecutive failures: %s", state.ConsecutiveStartFailures, state.LastError)
 	}
 
-	// 命令行服务器（GamePort == 0）使用不同的启动逻辑
-	if m.config.GamePort == 0 {
-		// 命令行服务器：ExecPath 是运行目录，AdditionalArgs 是完整的启动命令
-		// 使用 shell 执行命令
-		var cmd *exec.Cmd
-		if runtime.GOOS == "windows" {
-			// Windows: 使用 cmd.exe 执行命令
-			cmd = exec.Command("cmd.exe", "/c", m.config.AdditionalArgs)
-		} else {
-			// Linux/Mac: 使用 sh 执行命令
-			cmd = exec.Command("sh", "-c", m.config.AdditionalArgs)
-		}
+	if err := m.ensurePortAvailable(); err != nil {
+		_ = m.recordStartFailure(err.Error(), nil)
+		return err
+	}
 
-		// 设置工作目录为 ExecPath（运行目录）
+	cmd, err := m.buildCommand()
+	if err != nil {
+		_ = m.recordStartFailure(err.Error(), nil)
+		return err
+	}
+
+	m.configureProcessGroup(cmd)
+
+	logFile, err := m.openProcessLog()
+	if err != nil {
+		_ = m.recordStartFailure(err.Error(), nil)
+		return err
+	}
+
+	// Detached services must not depend on parent-owned stdout/stderr pipes.
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		_ = logFile.Close()
+		_ = m.recordStartFailure(fmt.Sprintf("failed to create stdin pipe: %v", err), nil)
+		return fmt.Errorf("failed to create stdin pipe: %w", err)
+	}
+
+	state = m.runtimeStateFromConfig()
+	state.State = runtimeStateStarting
+	if err := m.writeRuntimeState(state); err != nil {
+		_ = logFile.Close()
+		return err
+	}
+
+	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
+		_ = m.recordStartFailure(fmt.Sprintf("failed to start server: %v", err), nil)
+		return fmt.Errorf("failed to start server: %w", err)
+	}
+	startedAt := time.Now().UTC()
+	waitDone := make(chan error, 1)
+
+	runningState := m.runtimeStateFromConfig()
+	runningState.State = runtimeStateRunning
+	runningState.PID = cmd.Process.Pid
+	runningState.ProcessName = processName(cmd.Process.Pid)
+	runningState.ProcessCreateTimeMS = processCreateTimeMS(cmd.Process.Pid)
+	runningState.StartedAt = startedAt
+	if err := m.writeRuntimeState(runningState); err != nil {
+		m.logger.Warn("Failed to write running process state: %v", err)
+	}
+
+	m.mutex.Lock()
+	m.cmd = cmd
+	m.stdin = stdin
+	m.waitDone = waitDone
+	m.startedAt = startedAt
+	m.mutex.Unlock()
+
+	m.logger.Info("Game server %s started on port %d with PID: %d", runningState.ServiceName, runningState.GamePort, cmd.Process.Pid)
+
+	go m.readDetachedLogClose(logFile)
+	go m.waitForCompletion(cmd, waitDone)
+
+	select {
+	case err := <-waitDone:
+		summary := "server exited immediately after startup"
+		if err != nil {
+			summary = fmt.Sprintf("%s: %v", summary, err)
+		}
+		return fmt.Errorf("%s", summary)
+	case <-time.After(_const.ShortWaitTime):
+		return nil
+	}
+}
+
+// buildCommand creates the OS command used to start the configured server.
+// It reads service configuration from the manager, and it returns the command or an error when required legacy executable settings are invalid.
+func (m *Manager) buildCommand() (*exec.Cmd, error) {
+	if strings.TrimSpace(m.config.StartCommand) != "" {
+		shell, args := shellCommand(m.config.StartCommand)
+		cmd := exec.Command(shell, args...)
+		if workDir := strings.TrimSpace(m.config.WorkDir); workDir != "" {
+			cmd.Dir = workDir
+		} else if strings.TrimSpace(m.config.ExecPath) != "" {
+			cmd.Dir = m.config.ExecPath
+		}
+		m.logger.Info("Starting configured service command for %s on port %d", m.config.ServiceName, m.config.GamePort)
+		return cmd, nil
+	}
+
+	if m.config.GamePort == 0 {
+		shell, args := shellCommand(m.config.AdditionalArgs)
+		cmd := exec.Command(shell, args...)
 		if m.config.ExecPath != "" {
 			cmd.Dir = m.config.ExecPath
 			m.logger.Info("Setting working directory to: %s", m.config.ExecPath)
 		}
-
-		m.logger.Info("Starting command line server: %s (in directory: %s)", m.config.AdditionalArgs, m.config.ExecPath)
-		m.cmd = cmd
-	} else {
-		// 普通 SCUM 服务器
-		// Check if executable exists
-		if _, err := os.Stat(m.config.ExecPath); os.IsNotExist(err) {
-			return fmt.Errorf("SCUM server executable not found: %s", m.config.ExecPath)
-		}
-
-		// Check if the configured port is already in use
-		if m.config.GamePort > 0 {
-			portChecker := network.NewPortChecker(_const.DefaultWaitTime + _const.ShortWaitTime)
-			host := m.config.ServerIP
-			if host == "" {
-				host = _const.DefaultServerIP
-			}
-
-			m.logger.Info("Checking if port %d is available on %s...", m.config.GamePort, host)
-
-			portStatus, err := portChecker.CheckPort(host, m.config.GamePort)
-			if err != nil {
-				m.logger.Warn("Failed to check port status: %v", err)
-			} else if portStatus.InUse {
-				m.logger.Warn("Port %d is already in use on %s, skipping SCUM server startup", m.config.GamePort, host)
-				return fmt.Errorf("port %d is already in use on %s", m.config.GamePort, host)
-			} else {
-				m.logger.Info("Port %d is available on %s", m.config.GamePort, host)
-			}
-		}
-
-		// Build command arguments
-		args := m.buildStartArgs()
-
-		m.logger.Info("Starting SCUM server: %s %s", m.config.ExecPath, strings.Join(args, " "))
-
-		m.cmd = exec.Command(m.config.ExecPath, args...)
-
-		// Set working directory to the directory containing the executable
-		execDir := strings.TrimSuffix(m.config.ExecPath, "SCUMServer.exe")
-		if execDir != m.config.ExecPath {
-			m.cmd.Dir = execDir
-			m.logger.Info("Setting working directory to: %s", execDir)
-		}
+		m.logger.Info("Starting legacy command line server: %s (in directory: %s)", m.config.AdditionalArgs, m.config.ExecPath)
+		return cmd, nil
 	}
 
-	m.configureProcessGroup(m.cmd)
+	if _, err := os.Stat(m.config.ExecPath); os.IsNotExist(err) {
+		return nil, fmt.Errorf("server executable not found: %s", m.config.ExecPath)
+	}
 
-	// Set up stdin, stdout and stderr pipes
-	stdin, err := m.cmd.StdinPipe()
+	args := m.buildStartArgs()
+	m.logger.Info("Starting legacy SCUM server: %s %s", m.config.ExecPath, strings.Join(args, " "))
+
+	cmd := exec.Command(m.config.ExecPath, args...)
+	execDir := strings.TrimSuffix(m.config.ExecPath, "SCUMServer.exe")
+	if execDir != m.config.ExecPath {
+		cmd.Dir = execDir
+		m.logger.Info("Setting working directory to: %s", execDir)
+	}
+	return cmd, nil
+}
+
+// ensurePortAvailable verifies that the configured service port is not already owned by an untracked process.
+// It does not take parameters, and it returns nil when no port check is required or the port is available.
+func (m *Manager) ensurePortAvailable() error {
+	if m.config.GamePort <= 0 {
+		return nil
+	}
+	portChecker := network.NewPortChecker(_const.DefaultWaitTime + _const.ShortWaitTime)
+	host := m.config.ServerIP
+	if host == "" || host == "0.0.0.0" {
+		host = "127.0.0.1"
+	}
+
+	m.logger.Info("Checking if port %d is available on %s...", m.config.GamePort, host)
+	portStatus, err := portChecker.CheckPort(host, m.config.GamePort)
 	if err != nil {
-		return fmt.Errorf("failed to create stdin pipe: %w", err)
+		m.logger.Warn("Failed to check port status: %v", err)
+		return nil
 	}
-	m.stdin = stdin
-
-	stdout, err := m.cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create stdout pipe: %w", err)
+	if portStatus.InUse {
+		return fmt.Errorf("port %d is already in use on %s for service %s", m.config.GamePort, host, m.config.ServiceName)
 	}
-
-	stderr, err := m.cmd.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create stderr pipe: %w", err)
-	}
-
-	// Start the process
-	if err := m.cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start SCUM server: %w", err)
-	}
-	m.startedAt = time.Now().UTC()
-
-	// On Windows, create a new process group to manage child processes
-	if runtime.GOOS == "windows" {
-		if err := m.createProcessGroup(); err != nil {
-			m.logger.Warn("Failed to create process group: %v", err)
-		}
-	}
-
-	m.logger.Info("SCUM server started with PID: %d", m.cmd.Process.Pid)
-	m.logger.Info("Server configuration - Port: %d, MaxPlayers: %d, BattlEye: %v",
-		m.config.GamePort, m.config.MaxPlayers, m.config.EnableBattlEye)
-
-	// Start goroutines to read stdout and stderr
-	go m.readOutput(stdout, "STDOUT")
-	go m.readOutput(stderr, "STDERR")
-
-	// Start goroutine to wait for process completion
-	m.waitDone = make(chan error, 1)
-	go m.waitForCompletion(m.cmd, m.waitDone)
-
 	return nil
 }
 
-// Stop stops the SCUM server process
+// openProcessLog opens the detached process log file for stdout and stderr.
+// It does not take parameters, and it returns an append-only file handle or an error when the log cannot be created.
+func (m *Manager) openProcessLog() (*os.File, error) {
+	path := m.logPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return nil, fmt.Errorf("create process log directory: %w", err)
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("open process log: %w", err)
+	}
+	return file, nil
+}
+
+// readDetachedLogClose closes a detached process log handle after the process has inherited it.
+// file is the opened log file, and the method returns no values because close errors are only logged.
+func (m *Manager) readDetachedLogClose(file *os.File) {
+	if file == nil {
+		return
+	}
+	if err := file.Close(); err != nil {
+		m.logger.Warn("Failed to close parent process log handle: %v", err)
+	}
+}
+
+// Stop stops the configured game server process.
+// It does not take parameters and uses either the in-memory command or the persisted runtime state.
+// It returns nil when the process is stopped or an error when no matching running process exists or the stop signal fails.
 func (m *Manager) Stop() error {
 	m.mutex.Lock()
 	if m.cmd == nil || m.cmd.Process == nil {
 		m.mutex.Unlock()
-		return fmt.Errorf("server is not running")
+		state, err := m.readRuntimeState()
+		if err != nil {
+			return err
+		}
+		state, alive := m.inspectRuntimeState(state)
+		if !alive {
+			return fmt.Errorf("server is not running")
+		}
+		return m.stopPersistedProcess(state, false)
 	}
 
 	cmd := m.cmd
 	waitDone := m.waitDone
 	pid := cmd.Process.Pid
 	m.logger.Info("Stopping SCUM server (PID: %d)", pid)
+	m.markStopping(pid)
 
 	// Try graceful shutdown first
 	// 注意：避免使用可能影响scum_run主程序的信号
@@ -308,7 +425,7 @@ func (m *Manager) Stop() error {
 	} else {
 		// Unix系统下使用SIGTERM，但只发送给子进程
 		// 注意：这里需要确保信号只发送给SCUM进程，不影响scum_run主程序
-		if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		if err := signalProcess(cmd.Process, syscall.SIGTERM); err != nil {
 			m.logger.Warn("Failed to send SIGTERM: %v", err)
 		}
 		m.mutex.Unlock()
@@ -323,7 +440,7 @@ func (m *Manager) Stop() error {
 		m.logger.Info("SCUM server stopped gracefully")
 	case <-time.After(10 * time.Second):
 		m.logger.Warn("Graceful shutdown timeout, forcing kill")
-		if err := cmd.Process.Kill(); err != nil {
+		if err := killProcess(cmd.Process); err != nil {
 			m.logger.Error("Failed to kill process: %v", err)
 		}
 		<-waitDone // Wait for the process to actually exit
@@ -332,12 +449,22 @@ func (m *Manager) Stop() error {
 	return nil
 }
 
-// ForceStop forcefully stops the SCUM server process and all child processes
+// ForceStop forcefully stops the configured game server process and known child processes.
+// It does not take parameters and uses either the in-memory command or the persisted runtime state.
+// It returns nil when the process is already stopped or force-stop best effort completes, or an error when persisted state cannot be read.
 func (m *Manager) ForceStop() error {
 	m.mutex.Lock()
 	if m.cmd == nil || m.cmd.Process == nil {
 		m.mutex.Unlock()
-		return nil // Already stopped
+		state, err := m.readRuntimeState()
+		if err != nil {
+			return err
+		}
+		state, alive := m.inspectRuntimeState(state)
+		if !alive {
+			return nil
+		}
+		return m.stopPersistedProcess(state, true)
 	}
 
 	cmd := m.cmd
@@ -358,7 +485,7 @@ func (m *Manager) ForceStop() error {
 		m.killProcessTree(pid)
 	} else {
 		// On Unix-like systems, try graceful shutdown first
-		if err := m.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		if err := signalProcess(cmd.Process, syscall.SIGTERM); err != nil {
 			m.logger.Warn("Failed to send SIGTERM: %v", err)
 		}
 
@@ -366,7 +493,7 @@ func (m *Manager) ForceStop() error {
 		time.Sleep(_const.DefaultWaitTime)
 
 		// Force kill if still running
-		if err := cmd.Process.Kill(); err != nil {
+		if err := killProcess(cmd.Process); err != nil {
 			m.logger.Warn("Failed to kill main process: %v", err)
 		}
 	}
@@ -387,6 +514,73 @@ func (m *Manager) ForceStop() error {
 	}
 
 	return nil
+}
+
+// markStopping records that a tracked process is being intentionally stopped.
+// pid identifies the process being stopped, and the method returns no values because persistence failures are logged.
+func (m *Manager) markStopping(pid int) {
+	state, err := m.readRuntimeState()
+	if err != nil {
+		m.logger.Warn("Failed to read process state before stop: %v", err)
+		return
+	}
+	if state.PID != pid {
+		return
+	}
+	state.State = runtimeStateStopping
+	state.LastError = ""
+	if err := m.writeRuntimeState(state); err != nil {
+		m.logger.Warn("Failed to mark process stopping: %v", err)
+	}
+}
+
+// stopPersistedProcess stops a process recovered from the runtime state file.
+// state contains the PID and identity to stop, force selects forceful termination, and the method returns an error when the signal cannot be sent.
+func (m *Manager) stopPersistedProcess(state RuntimeState, force bool) error {
+	pid := state.PID
+	m.logger.Info("Stopping persisted server process %s on port %d (PID: %d)", state.ServiceName, state.GamePort, pid)
+	state.State = runtimeStateStopping
+	state.LastError = ""
+	if err := m.writeRuntimeState(state); err != nil {
+		m.logger.Warn("Failed to mark persisted process stopping: %v", err)
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return fmt.Errorf("find process %d: %w", pid, err)
+	}
+	if runtime.GOOS == "windows" {
+		args := []string{"/PID", fmt.Sprintf("%d", pid)}
+		if force {
+			args = append([]string{"/F"}, args...)
+		}
+		killCmd := exec.Command("taskkill", args...)
+		output, err := killCmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("taskkill process %d failed: %w, output: %s", pid, err, string(output))
+		}
+	} else if force {
+		if err := killProcess(process); err != nil {
+			return fmt.Errorf("kill process %d: %w", pid, err)
+		}
+	} else if err := signalProcess(process, syscall.SIGTERM); err != nil {
+		return fmt.Errorf("signal process %d: %w", pid, err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, alive := m.inspectRuntimeState(state); !alive {
+			state.State = runtimeStateStopped
+			state.PID = 0
+			state.LastError = ""
+			_ = m.writeRuntimeState(state)
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if !force {
+		return m.stopPersistedProcess(state, true)
+	}
+	return fmt.Errorf("process %d did not stop before timeout", pid)
 }
 
 // createProcessGroup creates a new process group on Windows
@@ -506,26 +700,18 @@ func (m *Manager) killScumProcesses() {
 	}
 }
 
-// CleanupOnExit ensures all processes are cleaned up when the program exits
+// CleanupOnExit detaches from the managed game server when scum_run exits.
+// It does not take parameters, and it returns no values because executor shutdown must not stop a user server.
 func (m *Manager) CleanupOnExit() {
 	if m.cmd != nil && m.cmd.Process != nil {
 		pid := m.cmd.Process.Pid
-		m.logger.Info("Cleaning up SCUM server process on exit (PID: %d)", pid)
-
-		// Force stop with enhanced cleanup
-		if err := m.ForceStop(); err != nil {
-			m.logger.Error("Failed to force stop SCUM server: %v", err)
-		}
-
-		// Additional cleanup for Windows - ensure process tree is killed
-		if runtime.GOOS == "windows" {
-			m.logger.Info("Performing additional Windows process cleanup for PID: %d", pid)
-			m.killProcessTree(pid)
-		}
+		m.logger.Info("Detaching from game server process on scum_run exit (PID: %d)", pid)
 	}
 }
 
-// Restart restarts the SCUM server process
+// Restart restarts the configured game server process.
+// It does not take parameters and reuses the manager configuration for the new process.
+// It returns nil when stop and start succeed, or an error when either phase fails.
 func (m *Manager) Restart() error {
 	if m.IsRunning() {
 		if err := m.Stop(); err != nil {
@@ -538,63 +724,109 @@ func (m *Manager) Restart() error {
 	return m.Start()
 }
 
-// IsRunning reports whether the SCUM server process is alive.
-// It does not take parameters, and it returns true only when a tracked process exists and accepts signal checks.
+// IsRunning reports whether the configured game server process is alive.
+// It does not take parameters, and it returns true when either the in-memory command or persisted runtime state points to a live matching process.
 func (m *Manager) IsRunning() bool {
 	m.mutex.Lock()
-	defer m.mutex.Unlock()
-
-	if m.cmd == nil || m.cmd.Process == nil {
+	if m.cmd != nil && m.cmd.Process != nil && isProcessRunning(m.cmd.Process) {
+		m.mutex.Unlock()
+		return true
+	}
+	m.mutex.Unlock()
+	state, err := m.readRuntimeState()
+	if err != nil {
 		return false
 	}
-
-	// Check if process is still alive
-	if runtime.GOOS == "windows" {
-		// On Windows, check if we can get process info
-		if err := m.cmd.Process.Signal(syscall.Signal(0)); err != nil {
-			return false
-		}
-	} else {
-		// On Unix-like systems, send signal 0 to check if process exists
-		if err := m.cmd.Process.Signal(syscall.Signal(0)); err != nil {
-			return false
-		}
-	}
-
-	return true
+	_, alive := m.inspectRuntimeState(state)
+	return alive
 }
 
-// GetPID returns the process ID of the running server.
-// It does not take parameters, and it returns 0 when no process is currently tracked.
+// GetPID returns the process ID of the configured game server.
+// It does not take parameters, and it returns 0 when no live in-memory or persisted process is currently tracked.
 func (m *Manager) GetPID() int {
 	m.mutex.Lock()
-	defer m.mutex.Unlock()
-
-	if m.cmd != nil && m.cmd.Process != nil {
+	if m.cmd != nil && m.cmd.Process != nil && isProcessRunning(m.cmd.Process) {
+		defer m.mutex.Unlock()
 		return m.cmd.Process.Pid
 	}
-	return 0
+	m.mutex.Unlock()
+	state, err := m.readRuntimeState()
+	if err != nil {
+		return 0
+	}
+	state, alive := m.inspectRuntimeState(state)
+	if !alive {
+		return 0
+	}
+	return state.PID
 }
 
-// GetStatus returns a safe status snapshot for the SCUM server process.
-// It does not take parameters, and it returns running state, PID and uptime without exposing command lines or host paths.
+// GetStatus returns a safe status snapshot for the configured game server process.
+// It does not take parameters, and it returns running state, PID, service identity, uptime and bounded failure metadata without exposing command lines or host paths.
 func (m *Manager) GetStatus() Status {
 	m.mutex.Lock()
-	defer m.mutex.Unlock()
+	if m.cmd != nil && m.cmd.Process != nil && isProcessRunning(m.cmd.Process) {
+		status := m.statusFromMemoryLocked()
+		m.mutex.Unlock()
+		return status
+	}
+	m.mutex.Unlock()
 
-	status := Status{}
-	if m.cmd == nil || m.cmd.Process == nil {
-		return status
+	state, err := m.readRuntimeState()
+	if err != nil {
+		return Status{}
 	}
-	if err := m.cmd.Process.Signal(syscall.Signal(0)); err != nil {
-		return status
+	state, alive := m.inspectRuntimeState(state)
+	if !alive && state.PID > 0 && (state.State == runtimeStateRunning || state.State == runtimeStateStarting) {
+		_ = m.recordStartFailure("server process is no longer running", nil)
+		state, _ = m.readRuntimeState()
 	}
-	status.Running = true
-	status.PID = m.cmd.Process.Pid
+	status := statusFromRuntimeState(state, alive)
+	if alive && state.State != runtimeStateRunning {
+		state.State = runtimeStateRunning
+		_ = m.writeRuntimeState(state)
+	}
+	return status
+}
+
+// statusFromMemoryLocked builds a status snapshot from the in-memory command.
+// The manager mutex must already be held, and the method returns a status payload for the currently tracked process.
+func (m *Manager) statusFromMemoryLocked() Status {
+	serviceName, port := serviceIdentity(m.config)
+	status := Status{
+		Running:     true,
+		State:       runtimeStateRunning,
+		PID:         m.cmd.Process.Pid,
+		ServiceName: serviceName,
+		GamePort:    port,
+	}
 	if !m.startedAt.IsZero() {
 		startedAt := m.startedAt
 		status.StartedAt = &startedAt
 		status.UptimeSeconds = int64(time.Since(startedAt).Seconds())
+	}
+	return status
+}
+
+// statusFromRuntimeState builds a status snapshot from a persisted runtime state.
+// state is the persisted process state and alive indicates OS liveness, and the function returns a safe status payload.
+func statusFromRuntimeState(state RuntimeState, alive bool) Status {
+	status := Status{
+		Running:                  alive,
+		State:                    state.State,
+		ServiceName:              state.ServiceName,
+		GamePort:                 state.GamePort,
+		ConsecutiveStartFailures: state.ConsecutiveStartFailures,
+		LastError:                state.LastError,
+		LastLogTail:              state.LastLogTail,
+	}
+	if alive {
+		status.PID = state.PID
+		if !state.StartedAt.IsZero() {
+			startedAt := state.StartedAt
+			status.StartedAt = &startedAt
+			status.UptimeSeconds = int64(time.Since(startedAt).Seconds())
+		}
 	}
 	return status
 }
@@ -647,8 +879,8 @@ func (m *Manager) SendCommand(command string) error {
 	return nil
 }
 
-// waitForCompletion waits for the tracked process to complete.
-// cmd is the process command and waitDone receives the wait result; the function returns no values and clears tracked process state when the command exits.
+// waitForCompletion waits for the tracked process to complete and persists the terminal state.
+// cmd is the process command and waitDone receives the wait result; the function returns no values and clears in-memory process state when the command exits.
 func (m *Manager) waitForCompletion(cmd *exec.Cmd, waitDone chan error) {
 	pid := 0
 	if cmd != nil && cmd.Process != nil {
@@ -670,6 +902,8 @@ func (m *Manager) waitForCompletion(cmd *exec.Cmd, waitDone chan error) {
 	}
 	m.mutex.Unlock()
 
+	m.recordProcessExit(pid, err)
+
 	waitDone <- err
 	close(waitDone)
 
@@ -677,5 +911,39 @@ func (m *Manager) waitForCompletion(cmd *exec.Cmd, waitDone chan error) {
 		m.logger.Error("SCUM server (PID: %d) exited with error: %v", pid, err)
 	} else {
 		m.logger.Info("SCUM server (PID: %d) exited normally", pid)
+	}
+}
+
+// recordProcessExit persists stopped or crashed state for a completed child process.
+// pid identifies the completed process and waitErr is the command wait result; the method returns no values because persistence failures are logged.
+func (m *Manager) recordProcessExit(pid int, waitErr error) {
+	state, err := m.readRuntimeState()
+	if err != nil {
+		m.logger.Warn("Failed to read process state after exit: %v", err)
+		return
+	}
+	if state.PID != pid {
+		return
+	}
+	wasStopping := state.State == runtimeStateStopping
+	state.PID = 0
+	state.LastExitCode = exitCodeFromError(waitErr)
+	if wasStopping {
+		state.State = runtimeStateStopped
+		state.LastError = ""
+	} else if waitErr != nil {
+		state.State = runtimeStateCrashed
+		state.LastError = fmt.Sprintf("server process exited: %v", waitErr)
+		state.LastLogTail = tailLogLines(state.LogPath, 20)
+		state.ConsecutiveStartFailures++
+	} else {
+		state.State = runtimeStateStopped
+		state.LastError = ""
+	}
+	if state.ConsecutiveStartFailures >= startFailureThreshold && !wasStopping {
+		state.State = runtimeStateBlocked
+	}
+	if err := m.writeRuntimeState(state); err != nil {
+		m.logger.Warn("Failed to write process exit state: %v", err)
 	}
 }
