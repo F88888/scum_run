@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,7 +15,9 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 
+	"scum_run/internal/localruntime"
 	"scum_run/internal/logger"
+	"scum_run/internal/process"
 )
 
 // TestAgentPollsReadOnlyDatabaseOperation verifies that host-agent mode can claim, execute, and report one read-only database operation.
@@ -190,6 +194,184 @@ func TestAgentRejectsMutatingDatabaseOperation(t *testing.T) {
 	}
 }
 
+// TestAgentHelloDeclaresManagedProcessLifecycleCapabilities verifies managed executors advertise process lifecycle capability and startup behavior metadata during hello.
+// t is the testing handle used for assertions, and the function returns no values.
+func TestAgentHelloDeclaresManagedProcessLifecycleCapabilities(t *testing.T) {
+	t.Setenv("SCUM_RUN_PROCESS_STATE_DIR", t.TempDir())
+	steamDir, _, _ := createManagedExecutorTestLayout(t, "#!/bin/sh\nsleep 30\n")
+	helloArrived := make(chan helloRequest, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/host-agents/hello":
+			var request helloRequest
+			defer r.Body.Close()
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatalf("decode hello request: %v", err)
+			}
+			writeJSONResponse(t, w, helloResponse{SessionToken: "session-1"})
+			helloArrived <- request
+		case r.Method == http.MethodPut && r.URL.Path == "/api/v1/host-agents/capabilities":
+			writeJSONResponse(t, w, map[string]any{"status": "ok"})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/host-agents/database-operations/next":
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/host-agents/heartbeat":
+			writeJSONResponse(t, w, map[string]any{"status": "ok"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	agent := newTestAgent(t, Config{
+		ServerURL:              server.URL,
+		RegistrationToken:      "token",
+		AgentID:                "agent-1",
+		DisplayName:            "agent-1",
+		Version:                "test",
+		StartupBehavior:        startupBehaviorWait,
+		RuntimeContractVersion: defaultRuntimeContract,
+		Address:                "127.0.0.1",
+		SteamDir:               steamDir,
+		HeartbeatInterval:      time.Second,
+		PollInterval:           20 * time.Millisecond,
+		RequestTimeout:         time.Second,
+	})
+	go func() {
+		if err := agent.register(context.Background()); err != nil {
+			t.Errorf("register agent: %v", err)
+		}
+	}()
+	var request helloRequest
+	select {
+	case request = <-helloArrived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for host-agent hello")
+	}
+	if request.JobProtocolVersion != "execution-agent-job-protocol.v1" {
+		t.Fatalf("expected job protocol version, got %+v", request)
+	}
+	if request.CapabilitySchemaVersion != defaultRuntimeContract || !request.LifecycleCommandsSupported {
+		t.Fatalf("expected runtime contract metadata, got %+v", request)
+	}
+	processCapability := findCapability(request.Capabilities, hostAgentProcessStartCapability)
+	if processCapability.Capability == "" {
+		t.Fatalf("expected %s capability in hello payload", hostAgentProcessStartCapability)
+	}
+	if processCapability.Status != hostAgentCapabilityStatus {
+		t.Fatalf("expected active process capability, got %+v", processCapability)
+	}
+	if processCapability.Metadata["startupBehavior"] != startupBehaviorWait || processCapability.Metadata["runtimeContractVersion"] != defaultRuntimeContract {
+		t.Fatalf("expected startup metadata, got %+v", processCapability.Metadata)
+	}
+}
+
+// TestAgentManagedCapabilityReturnsBlockedResult verifies host-agent mode returns a structured blocked error when process runtime readiness is missing.
+// t is the testing handle used for assertions, and the function returns no values.
+func TestAgentManagedCapabilityReturnsBlockedResult(t *testing.T) {
+	agent := newTestAgent(t, Config{
+		ServerURL:         "http://127.0.0.1",
+		RegistrationToken: "token",
+		AgentID:           "agent-1",
+		DisplayName:       "agent-1",
+		Version:           "test",
+		Address:           "127.0.0.1",
+		DatabasePath:      createTestDatabase(t),
+		HeartbeatInterval: time.Second,
+		PollInterval:      time.Second,
+		RequestTimeout:    time.Second,
+	})
+
+	_, err := agent.executeManagedCapability(hostAgentProcessStartCapability, nil)
+	var capabilityErr *localruntime.CapabilityExecutionError
+	if !errors.As(err, &capabilityErr) {
+		t.Fatalf("expected structured capability error, got %v", err)
+	}
+	if capabilityErr.ReasonCode != localruntime.ProcessReasonPathUnresolved {
+		t.Fatalf("expected process path unresolved reason, got %+v", capabilityErr)
+	}
+	if capabilityErr.Data == nil {
+		t.Fatalf("expected blocked error data, got %+v", capabilityErr)
+	}
+}
+
+// TestAgentManagedCapabilityStartsProcess verifies host-agent process dispatch uses the shared runtime for successful local lifecycle work.
+// t is the testing handle used for assertions, and the function returns no values.
+func TestAgentManagedCapabilityStartsProcess(t *testing.T) {
+	steamDir, _, _ := createManagedExecutorTestLayout(t, "#!/bin/sh\nsleep 30\n")
+	agent := newTestAgent(t, Config{
+		ServerURL:              "http://127.0.0.1",
+		RegistrationToken:      "token",
+		AgentID:                "agent-1",
+		DisplayName:            "agent-1",
+		Version:                "test",
+		StartupBehavior:        startupBehaviorWait,
+		RuntimeContractVersion: defaultRuntimeContract,
+		Address:                "127.0.0.1",
+		SteamDir:               steamDir,
+		HeartbeatInterval:      time.Second,
+		PollInterval:           time.Second,
+		RequestTimeout:         time.Second,
+	})
+
+	startResult, err := agent.executeManagedCapability(hostAgentProcessStartCapability, nil)
+	if err != nil {
+		t.Fatalf("start managed capability: %v", err)
+	}
+	status, ok := startResult.Data["status"].(process.Status)
+	if !ok || !status.Running {
+		t.Fatalf("expected running process status, got %#v", startResult.Data["status"])
+	}
+	if _, err := agent.executeManagedCapability(hostAgentProcessStopCapability, nil); err != nil {
+		t.Fatalf("stop managed capability: %v", err)
+	}
+}
+
+// TestAgentBootstrapStartOnceStartsProcessOnlyOnce verifies bootstrap_start_once starts the local process once and records an idempotency marker.
+// t is the testing handle used for assertions, and the function returns no values.
+func TestAgentBootstrapStartOnceStartsProcessOnlyOnce(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("SCUM_RUN_PROCESS_STATE_DIR", stateDir)
+	startLog := filepath.Join(t.TempDir(), "bootstrap.log")
+	script := "#!/bin/sh\n" +
+		"echo started >> '" + startLog + "'\n" +
+		"sleep 30\n"
+	steamDir, _, _ := createManagedExecutorTestLayout(t, script)
+
+	agent := newTestAgent(t, Config{
+		ServerURL:              "http://127.0.0.1",
+		RegistrationToken:      "token",
+		AgentID:                "agent-1",
+		DisplayName:            "agent-1",
+		Version:                "test",
+		StartupBehavior:        startupBehaviorBootstrap,
+		RuntimeContractVersion: defaultRuntimeContract,
+		Address:                "127.0.0.1",
+		SteamDir:               steamDir,
+		HeartbeatInterval:      time.Second,
+		PollInterval:           time.Second,
+		RequestTimeout:         time.Second,
+	})
+	if err := agent.maybeBootstrapStartOnce(); err != nil {
+		t.Fatalf("bootstrap start once: %v", err)
+	}
+	if err := agent.maybeBootstrapStartOnce(); err != nil {
+		t.Fatalf("second bootstrap start once should be ignored, got %v", err)
+	}
+	if !agent.runtime.Process().GetStatus().Running {
+		t.Fatalf("expected managed executor bootstrap to start process, got %+v", agent.runtime.Process().GetStatus())
+	}
+	content, err := os.ReadFile(startLog)
+	if err != nil {
+		t.Fatalf("read bootstrap log: %v", err)
+	}
+	if strings.Count(string(content), "started") != 1 {
+		t.Fatalf("expected bootstrap start to run once, got %q", string(content))
+	}
+	if err := agent.runtime.Process().Stop(); err != nil {
+		t.Fatalf("stop bootstrap process: %v", err)
+	}
+}
+
 // newTestAgent builds one host-agent instance for tests.
 // t is the testing handle and cfg contains the runtime configuration, and the function returns a ready Agent or fails the test when construction fails.
 func newTestAgent(t *testing.T, cfg Config) *Agent {
@@ -239,4 +421,42 @@ func writeJSONResponse(t *testing.T, w http.ResponseWriter, body any) {
 // text is the haystack, fragment is the substring, and the function returns true when fragment appears in text.
 func contains(text string, fragment string) bool {
 	return strings.Contains(text, fragment)
+}
+
+// createManagedExecutorTestLayout builds one fake SCUM layout with a database and executable for managed-executor host-agent tests.
+// t is the testing handle, script is written as the fake SCUMServer executable, and the function returns the Steam root, database path and server executable path.
+func createManagedExecutorTestLayout(t *testing.T, script string) (string, string, string) {
+	t.Helper()
+	steamDir := t.TempDir()
+	databasePath := filepath.Join(steamDir, "SCUM", "Saved", "SaveFiles", "SCUM.db")
+	serverPath := filepath.Join(steamDir, "SCUM", "Binaries", "Win64", "SCUMServer.exe")
+	if err := os.MkdirAll(filepath.Dir(databasePath), 0o755); err != nil {
+		t.Fatalf("create database dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(serverPath), 0o755); err != nil {
+		t.Fatalf("create server dir: %v", err)
+	}
+	db, err := sql.Open("sqlite3", databasePath)
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE players (id INTEGER PRIMARY KEY, name TEXT NOT NULL);`); err != nil {
+		t.Fatalf("create sqlite table: %v", err)
+	}
+	if err := os.WriteFile(serverPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake server executable: %v", err)
+	}
+	return steamDir, databasePath, serverPath
+}
+
+// findCapability returns the first declared capability with the requested key.
+// capabilities is the hello payload capability list, key identifies the desired capability, and the function returns the matching capability or a zero-value struct when absent.
+func findCapability(capabilities []hostAgentCapability, key string) hostAgentCapability {
+	for _, capability := range capabilities {
+		if capability.Capability == key {
+			return capability
+		}
+	}
+	return hostAgentCapability{}
 }

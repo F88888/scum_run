@@ -12,6 +12,9 @@ const (
 	defaultHeartbeatInterval = 15 * time.Second
 	defaultPollInterval      = 2 * time.Second
 	defaultRequestTimeout    = 15 * time.Second
+	startupBehaviorBootstrap = "bootstrap_start_once"
+	startupBehaviorWait      = "register_and_wait"
+	defaultRuntimeContract   = "managed-executor-runtime.v1"
 )
 
 var (
@@ -19,6 +22,8 @@ var (
 	compiledRegistrationToken string
 	compiledAgentID           string
 	compiledVersion           string
+	compiledStartupBehavior   string
+	compiledRuntimeContract   string
 )
 
 // Config 表示 scum_run host agent 模式的运行配置。
@@ -33,6 +38,10 @@ type Config struct {
 	DisplayName string
 	// Version 是 host agent 上报给 scum_server 的版本号。
 	Version string
+	// StartupBehavior 是当前托管执行端声明的首次启动交接策略。
+	StartupBehavior string
+	// RuntimeContractVersion 是当前托管执行端声明的本地 runtime 契约版本。
+	RuntimeContractVersion string
 	// Address 是 host agent 上报的地址或节点标识。
 	Address string
 	// DatabasePath 是本地 SCUM.db 的绝对路径；为空时会尝试自动探测。
@@ -64,6 +73,11 @@ func LoadConfigFromEnv() (Config, error) {
 		AgentID:           firstNonEmpty(strings.TrimSpace(os.Getenv("SCUM_HOST_AGENT_ID")), compiledAgentID),
 		DisplayName:       strings.TrimSpace(os.Getenv("SCUM_HOST_AGENT_DISPLAY_NAME")),
 		Version:           firstNonEmpty(strings.TrimSpace(os.Getenv("SCUM_HOST_AGENT_VERSION")), compiledVersion),
+		StartupBehavior:   firstNonEmpty(strings.TrimSpace(os.Getenv("SCUM_HOST_AGENT_STARTUP_BEHAVIOR")), compiledStartupBehavior),
+		RuntimeContractVersion: firstNonEmpty(
+			strings.TrimSpace(os.Getenv("SCUM_HOST_AGENT_RUNTIME_CONTRACT_VERSION")),
+			compiledRuntimeContract,
+		),
 		Address:           strings.TrimSpace(os.Getenv("SCUM_HOST_AGENT_ADDRESS")),
 		DatabasePath:      strings.TrimSpace(os.Getenv("SCUM_RUN_DATABASE_PATH")),
 		SteamDir:          strings.TrimSpace(os.Getenv("SCUM_RUN_STEAM_DIR")),
@@ -76,6 +90,12 @@ func LoadConfigFromEnv() (Config, error) {
 	}
 	if cfg.Version == "" {
 		cfg.Version = "host-agent-dev"
+	}
+	if cfg.StartupBehavior == "" {
+		cfg.StartupBehavior = startupBehaviorBootstrap
+	}
+	if cfg.RuntimeContractVersion == "" {
+		cfg.RuntimeContractVersion = defaultRuntimeContract
 	}
 	if cfg.Address == "" {
 		hostname, err := os.Hostname()
@@ -98,6 +118,12 @@ func (c Config) Validate() error {
 	}
 	if c.AgentID == "" {
 		errs = append(errs, errors.New("SCUM_HOST_AGENT_ID is required"))
+	}
+	if c.StartupBehavior != startupBehaviorBootstrap && c.StartupBehavior != startupBehaviorWait {
+		errs = append(errs, errors.New("SCUM_HOST_AGENT_STARTUP_BEHAVIOR must be bootstrap_start_once or register_and_wait"))
+	}
+	if c.RuntimeContractVersion == "" {
+		errs = append(errs, errors.New("SCUM_HOST_AGENT_RUNTIME_CONTRACT_VERSION is required"))
 	}
 	if c.Address == "" {
 		errs = append(errs, errors.New("SCUM_HOST_AGENT_ADDRESS is required"))

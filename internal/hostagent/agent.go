@@ -9,25 +9,36 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"scum_run/internal/database"
+	"scum_run/internal/jobprotocol"
+	"scum_run/internal/localruntime"
 	"scum_run/internal/logger"
-	"scum_run/internal/steam"
 )
 
 const (
 	hostAgentDatabaseCapability       = "scum.db.query.readonly"
 	hostAgentExecutorUpdateCapability = "executor.update.push"
 	hostAgentSelfUpdateCapability     = "executor.self_update"
+	hostAgentProcessStartCapability   = "process.start"
+	hostAgentProcessStopCapability    = "process.stop"
+	hostAgentProcessRestartCapability = "process.restart"
+	hostAgentProcessStatusCapability  = "process.status"
 	hostAgentCapabilityStatus         = "active"
 	hostAgentCapabilityVersion        = "1"
 	hostAgentCapabilityRisk           = "medium"
 	hostAgentCapabilityDir            = "request"
+	hostAgentCapabilityBlockedStatus  = "blocked"
+	hostAgentFeatureManagedProcess    = "managed_process_lifecycle"
 )
+
+var unsafeBootstrapFileChars = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
 
 // Agent 表示 scum_run 在新控制面下的 host-agent 执行端。
 type Agent struct {
@@ -35,6 +46,8 @@ type Agent struct {
 	cfg Config
 	// logger 是结构化文本日志输出器。
 	logger *logger.Logger
+	// runtime 是 host-agent 与 legacy client 共享的本地执行 runtime。
+	runtime *localruntime.LocalRuntime
 	// client 是访问 scum_server 控制面的 HTTP 客户端。
 	client *http.Client
 	// databasePath 是解析后的本地 SCUM.db 路径。
@@ -45,6 +58,10 @@ type Agent struct {
 	sessionMu sync.RWMutex
 	// sessionToken 是 hello 成功后返回的 host agent 会话令牌。
 	sessionToken string
+	// capabilityMu 保护当前能力指纹缓存，避免心跳和轮询并发重复上报。
+	capabilityMu sync.Mutex
+	// capabilityFingerprint 是最近一次成功上报的能力声明指纹。
+	capabilityFingerprint string
 }
 
 // helloRequest 表示 host agent 启动时向 scum_server 提交的注册请求。
@@ -57,6 +74,16 @@ type helloRequest struct {
 	DisplayName string `json:"displayName"`
 	// Version 是 host agent 的版本号。
 	Version string `json:"version"`
+	// JobProtocolVersion 是执行任务协议版本。
+	JobProtocolVersion string `json:"jobProtocolVersion"`
+	// CapabilitySchemaVersion 是能力声明 schema 版本。
+	CapabilitySchemaVersion string `json:"capabilitySchemaVersion"`
+	// DiagnosticsSupported 表示执行端是否声明支持控制面诊断。
+	DiagnosticsSupported bool `json:"diagnosticsSupported"`
+	// LifecycleCommandsSupported 表示执行端是否声明支持生命周期命令。
+	LifecycleCommandsSupported bool `json:"lifecycleCommandsSupported"`
+	// FeatureFlags 是执行端声明的功能开关集合。
+	FeatureFlags []string `json:"featureFlags,omitempty"`
 	// Address 是 host agent 的地址或节点标识。
 	Address string `json:"address"`
 	// Capabilities 是 host agent 当前声明的能力列表。
@@ -75,6 +102,16 @@ type heartbeatRequest struct {
 	AgentID string `json:"agentId"`
 	// Version 是当前 host agent 版本号。
 	Version string `json:"version"`
+	// JobProtocolVersion 是执行任务协议版本。
+	JobProtocolVersion string `json:"jobProtocolVersion"`
+	// CapabilitySchemaVersion 是能力声明 schema 版本。
+	CapabilitySchemaVersion string `json:"capabilitySchemaVersion"`
+	// DiagnosticsSupported 表示执行端是否声明支持控制面诊断。
+	DiagnosticsSupported bool `json:"diagnosticsSupported"`
+	// LifecycleCommandsSupported 表示执行端是否声明支持生命周期命令。
+	LifecycleCommandsSupported bool `json:"lifecycleCommandsSupported"`
+	// FeatureFlags 是执行端声明的功能开关集合。
+	FeatureFlags []string `json:"featureFlags,omitempty"`
 }
 
 // hostAgentCapability 表示 hello 时上报给 scum_server 的能力声明。
@@ -152,20 +189,20 @@ type errorResponse struct {
 // New builds one host-agent runtime from environment-derived configuration.
 // cfg contains server URL, credentials and database path hints, logger writes progress output, and the function returns a configured Agent or an error when the database path cannot be resolved.
 func New(cfg Config, logger *logger.Logger) (*Agent, error) {
-	databasePath, err := cfg.ResolveDatabasePath()
+	runtime, err := localruntime.New(localruntime.LocalRuntimeOptions{
+		SteamDir:     cfg.SteamDir,
+		DatabasePath: cfg.DatabasePath,
+	}, logger)
 	if err != nil {
-		steamDir := steam.NewDetector(logger).DetectSteamDirectory()
-		if strings.TrimSpace(steamDir) == "" {
-			return nil, err
-		}
-		databasePath = databasePathFromSteamDir(steamDir)
+		return nil, err
 	}
 	return &Agent{
 		cfg:          cfg,
 		logger:       logger,
+		runtime:      runtime,
 		client:       &http.Client{Timeout: cfg.RequestTimeout},
-		databasePath: databasePath,
-		db:           database.New(databasePath, logger),
+		databasePath: runtime.DatabasePath(),
+		db:           runtime.Database(),
 	}, nil
 }
 
@@ -173,6 +210,15 @@ func New(cfg Config, logger *logger.Logger) (*Agent, error) {
 // ctx controls the runtime lifetime, and the method returns nil on clean shutdown or an error when startup registration fails.
 func (a *Agent) Run(ctx context.Context) error {
 	if err := a.register(ctx); err != nil {
+		return err
+	}
+	if err := a.syncCapabilities(ctx); err != nil {
+		return err
+	}
+	if err := a.maybeBootstrapStartOnce(); err != nil {
+		a.logger.Warn("Managed executor bootstrap start skipped: %s", err.Error())
+	}
+	if err := a.syncCapabilities(ctx); err != nil {
 		return err
 	}
 	a.logger.Info("Host agent registered: id=%s database=%s", a.cfg.AgentID, a.redactPath(a.databasePath))
@@ -231,6 +277,16 @@ func (a *Agent) pollLoop(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 		}
+		if err := a.syncCapabilities(ctx); err != nil {
+			if a.isUnauthorized(err) {
+				a.logger.Warn("Host agent session expired during capability sync, re-registering")
+				if err := a.register(ctx); err != nil {
+					return err
+				}
+				continue
+			}
+			a.logger.Warn("Capability sync failed: %s", err.Error())
+		}
 		operation, found, err := a.nextDatabaseOperation(ctx)
 		if err != nil {
 			if a.isUnauthorized(err) {
@@ -255,46 +311,19 @@ func (a *Agent) pollLoop(ctx context.Context) error {
 // register performs the host-agent hello flow and stores the returned session token.
 // ctx controls the HTTP request lifetime, and the method returns nil on success or an error when registration fails.
 func (a *Agent) register(ctx context.Context) error {
+	capabilities, fingerprint := a.buildCapabilities()
 	request := helloRequest{
-		RegistrationToken: a.cfg.RegistrationToken,
-		AgentID:           a.cfg.AgentID,
-		DisplayName:       a.cfg.DisplayName,
-		Version:           a.cfg.Version,
-		Address:           a.cfg.Address,
-		Capabilities: []hostAgentCapability{
-			{
-				Capability: hostAgentDatabaseCapability,
-				Version:    hostAgentCapabilityVersion,
-				Direction:  hostAgentCapabilityDir,
-				RiskLevel:  hostAgentCapabilityRisk,
-				Status:     hostAgentCapabilityStatus,
-				Metadata: map[string]any{
-					"databasePath": a.redactPath(a.databasePath),
-					"databaseName": filepath.Base(a.databasePath),
-				},
-			},
-			{
-				Capability: hostAgentExecutorUpdateCapability,
-				Version:    hostAgentCapabilityVersion,
-				Direction:  hostAgentCapabilityDir,
-				RiskLevel:  "high",
-				Status:     hostAgentCapabilityStatus,
-				Metadata: map[string]any{
-					"supportsPlatformPush": true,
-					"supportsRollbackHint": true,
-				},
-			},
-			{
-				Capability: hostAgentSelfUpdateCapability,
-				Version:    hostAgentCapabilityVersion,
-				Direction:  hostAgentCapabilityDir,
-				RiskLevel:  "high",
-				Status:     hostAgentCapabilityStatus,
-				Metadata: map[string]any{
-					"supportsManualRecovery": true,
-				},
-			},
-		},
+		RegistrationToken:          a.cfg.RegistrationToken,
+		AgentID:                    a.cfg.AgentID,
+		DisplayName:                a.cfg.DisplayName,
+		Version:                    a.cfg.Version,
+		JobProtocolVersion:         jobprotocol.ProtocolVersion,
+		CapabilitySchemaVersion:    a.cfg.RuntimeContractVersion,
+		DiagnosticsSupported:       false,
+		LifecycleCommandsSupported: true,
+		FeatureFlags:               a.featureFlags(),
+		Address:                    a.cfg.Address,
+		Capabilities:               capabilities,
 	}
 	var response helloResponse
 	if err := a.requestJSON(ctx, http.MethodPost, "/api/v1/host-agents/hello", "", request, &response); err != nil {
@@ -304,6 +333,7 @@ func (a *Agent) register(ctx context.Context) error {
 		return errors.New("register host agent: empty session token")
 	}
 	a.setSessionToken(response.SessionToken)
+	a.setCapabilityFingerprint(fingerprint)
 	return nil
 }
 
@@ -311,8 +341,13 @@ func (a *Agent) register(ctx context.Context) error {
 // ctx controls the HTTP request lifetime, and the method returns nil when the heartbeat succeeds or an error when it fails.
 func (a *Agent) sendHeartbeat(ctx context.Context) error {
 	return a.requestJSON(ctx, http.MethodPost, "/api/v1/host-agents/heartbeat", a.session(), heartbeatRequest{
-		AgentID: a.cfg.AgentID,
-		Version: a.cfg.Version,
+		AgentID:                    a.cfg.AgentID,
+		Version:                    a.cfg.Version,
+		JobProtocolVersion:         jobprotocol.ProtocolVersion,
+		CapabilitySchemaVersion:    a.cfg.RuntimeContractVersion,
+		DiagnosticsSupported:       false,
+		LifecycleCommandsSupported: true,
+		FeatureFlags:               a.featureFlags(),
 	}, nil)
 }
 
@@ -391,6 +426,231 @@ func (a *Agent) executeDatabaseOperation(operation databaseOperation) databaseOp
 		DurationMS:  result.DurationMS,
 		Summary:     operation.SQLSummary,
 	}
+}
+
+// syncCapabilities compares the latest local capability declaration with the last successful upload and pushes updates only when changed.
+// ctx controls the HTTP request lifetime, and the method returns nil when no update is needed or the capability set is synced successfully.
+func (a *Agent) syncCapabilities(ctx context.Context) error {
+	capabilities, fingerprint := a.buildCapabilities()
+	if a.capabilityFingerprintMatches(fingerprint) {
+		return nil
+	}
+	if err := a.requestJSON(ctx, http.MethodPut, "/api/v1/host-agents/capabilities", a.session(), map[string]any{
+		"capabilities": capabilities,
+	}, nil); err != nil {
+		return err
+	}
+	a.setCapabilityFingerprint(fingerprint)
+	return nil
+}
+
+// buildCapabilities assembles the current bounded capability declaration for hello and capability refresh flows.
+// It takes no parameters and returns the current capability list plus a stable JSON fingerprint used to suppress duplicate uploads.
+func (a *Agent) buildCapabilities() ([]hostAgentCapability, string) {
+	processReadiness := a.runtime.ProcessReadiness()
+	processMetadata := map[string]any{
+		"runtimeContractVersion": a.cfg.RuntimeContractVersion,
+		"startupBehavior":        a.cfg.StartupBehavior,
+		"processReady":           processReadiness.Ready,
+		"processSupported":       processReadiness.Supported,
+		"reasonCode":             processReadiness.ReasonCode,
+		"summary":                processReadiness.Summary,
+		"processState":           processReadiness.Status.State,
+		"running":                processReadiness.Status.Running,
+		"serviceName":            processReadiness.Status.ServiceName,
+		"gamePort":               processReadiness.Status.GamePort,
+		"bootstrapAttempted":     a.bootstrapAttempted(),
+	}
+	processCapabilityStatus := hostAgentCapabilityBlockedStatus
+	if processReadiness.Ready {
+		processCapabilityStatus = hostAgentCapabilityStatus
+	}
+	capabilities := []hostAgentCapability{
+		{
+			Capability: hostAgentDatabaseCapability,
+			Version:    hostAgentCapabilityVersion,
+			Direction:  hostAgentCapabilityDir,
+			RiskLevel:  hostAgentCapabilityRisk,
+			Status:     hostAgentCapabilityStatus,
+			Metadata: map[string]any{
+				"databasePath": a.redactPath(a.databasePath),
+				"databaseName": filepath.Base(a.databasePath),
+			},
+		},
+		{
+			Capability: hostAgentProcessStartCapability,
+			Version:    hostAgentCapabilityVersion,
+			Direction:  hostAgentCapabilityDir,
+			RiskLevel:  "high",
+			Status:     processCapabilityStatus,
+			Metadata:   processMetadata,
+		},
+		{
+			Capability: hostAgentProcessStopCapability,
+			Version:    hostAgentCapabilityVersion,
+			Direction:  hostAgentCapabilityDir,
+			RiskLevel:  "high",
+			Status:     processCapabilityStatus,
+			Metadata:   processMetadata,
+		},
+		{
+			Capability: hostAgentProcessRestartCapability,
+			Version:    hostAgentCapabilityVersion,
+			Direction:  hostAgentCapabilityDir,
+			RiskLevel:  "high",
+			Status:     processCapabilityStatus,
+			Metadata:   processMetadata,
+		},
+		{
+			Capability: hostAgentProcessStatusCapability,
+			Version:    hostAgentCapabilityVersion,
+			Direction:  hostAgentCapabilityDir,
+			RiskLevel:  hostAgentCapabilityRisk,
+			Status:     processCapabilityStatus,
+			Metadata:   processMetadata,
+		},
+		{
+			Capability: hostAgentExecutorUpdateCapability,
+			Version:    hostAgentCapabilityVersion,
+			Direction:  hostAgentCapabilityDir,
+			RiskLevel:  "high",
+			Status:     hostAgentCapabilityStatus,
+			Metadata: map[string]any{
+				"supportsPlatformPush": true,
+				"supportsRollbackHint": true,
+			},
+		},
+		{
+			Capability: hostAgentSelfUpdateCapability,
+			Version:    hostAgentCapabilityVersion,
+			Direction:  hostAgentCapabilityDir,
+			RiskLevel:  "high",
+			Status:     hostAgentCapabilityStatus,
+			Metadata: map[string]any{
+				"supportsManualRecovery": true,
+			},
+		},
+	}
+	encoded, _ := json.Marshal(capabilities)
+	return capabilities, string(encoded)
+}
+
+// featureFlags returns the bounded managed-executor feature flags declared to the control plane.
+// It takes no parameters and returns the stable feature flag list describing process lifecycle support and startup behavior.
+func (a *Agent) featureFlags() []string {
+	flags := []string{hostAgentFeatureManagedProcess}
+	if strings.TrimSpace(a.cfg.StartupBehavior) == startupBehaviorBootstrap {
+		flags = append(flags, "startup.bootstrap_start_once")
+	} else {
+		flags = append(flags, "startup.register_and_wait")
+	}
+	return flags
+}
+
+// maybeBootstrapStartOnce performs the first-run bootstrap handoff for managed executors that should auto-start once.
+// It takes no parameters, reuses the shared local runtime for dependency checks and process startup, and returns an error only when the one-time bootstrap start was requested but could not complete.
+func (a *Agent) maybeBootstrapStartOnce() error {
+	if a == nil || strings.TrimSpace(a.cfg.StartupBehavior) != startupBehaviorBootstrap {
+		return nil
+	}
+	if a.bootstrapAttempted() {
+		return nil
+	}
+	readiness := a.runtime.ProcessReadiness()
+	if readiness.Status.Running {
+		return a.markBootstrapAttempt("already_running")
+	}
+	if !readiness.Ready {
+		return nil
+	}
+	if err := a.runtime.EnsureRuntimeDependencies(); err != nil {
+		return err
+	}
+	if _, err := a.executeManagedCapability(hostAgentProcessStartCapability, nil); err != nil {
+		return err
+	}
+	return a.markBootstrapAttempt("started")
+}
+
+// executeManagedCapability runs one managed-executor capability through the shared local runtime.
+// capability identifies the requested process or database action and payload carries bounded execution parameters, and the method returns a structured result or a stable execution error when local readiness is missing.
+func (a *Agent) executeManagedCapability(capability string, payload map[string]any) (localruntime.CapabilityExecutionResult, error) {
+	if a == nil || a.runtime == nil {
+		return localruntime.CapabilityExecutionResult{}, &localruntime.CapabilityExecutionError{
+			ReasonCode: localruntime.ProcessReasonPathUnresolved,
+			Summary:    "host-agent 本地执行 runtime 未初始化。",
+			Retryable:  true,
+		}
+	}
+	return a.runtime.ExecuteCapability(strings.TrimSpace(capability), payload)
+}
+
+// bootstrapAttempted reports whether bootstrap_start_once has already been completed or deliberately skipped on this host.
+// It takes no parameters and returns true when the local bootstrap marker exists; filesystem read failures are treated as not attempted.
+func (a *Agent) bootstrapAttempted() bool {
+	if a == nil {
+		return false
+	}
+	_, err := os.Stat(a.bootstrapMarkerPath())
+	return err == nil
+}
+
+// markBootstrapAttempt writes the local idempotency marker for bootstrap_start_once.
+// state describes the recorded terminal bootstrap state, and the method returns nil when the marker is persisted or an error when the host-local marker cannot be written.
+func (a *Agent) markBootstrapAttempt(state string) error {
+	path := a.bootstrapMarkerPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create bootstrap marker dir: %w", err)
+	}
+	payload := map[string]any{
+		"agentId":    a.cfg.AgentID,
+		"state":      strings.TrimSpace(state),
+		"recordedAt": time.Now().UTC().Format(time.RFC3339),
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal bootstrap marker: %w", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return fmt.Errorf("write bootstrap marker: %w", err)
+	}
+	return nil
+}
+
+// bootstrapMarkerPath returns the host-local path used to prevent duplicate bootstrap_start_once process starts.
+// It takes no parameters and returns a safe path rooted near the executable unless SCUM_RUN_PROCESS_STATE_DIR overrides the runtime directory.
+func (a *Agent) bootstrapMarkerPath() string {
+	baseDir := strings.TrimSpace(os.Getenv("SCUM_RUN_PROCESS_STATE_DIR"))
+	if baseDir == "" {
+		exe, err := os.Executable()
+		if err != nil {
+			baseDir = filepath.Join(".", "runtime", "hostagent")
+		} else {
+			baseDir = filepath.Join(filepath.Dir(exe), "runtime", "hostagent")
+		}
+	}
+	name := unsafeBootstrapFileChars.ReplaceAllString(strings.TrimSpace(a.cfg.AgentID), "_")
+	name = strings.Trim(name, "._-")
+	if name == "" {
+		name = "agent"
+	}
+	return filepath.Join(baseDir, "bootstrap_"+name+".json")
+}
+
+// capabilityFingerprintMatches reports whether the supplied capability fingerprint already matches the last successful upload.
+// fingerprint is the JSON fingerprint of the current capability declaration, and the method returns true when an update can be safely skipped.
+func (a *Agent) capabilityFingerprintMatches(fingerprint string) bool {
+	a.capabilityMu.Lock()
+	defer a.capabilityMu.Unlock()
+	return a.capabilityFingerprint == fingerprint
+}
+
+// setCapabilityFingerprint updates the last successful capability declaration fingerprint.
+// fingerprint is the JSON fingerprint returned by buildCapabilities, and the method stores it for subsequent duplicate-suppression checks.
+func (a *Agent) setCapabilityFingerprint(fingerprint string) {
+	a.capabilityMu.Lock()
+	defer a.capabilityMu.Unlock()
+	a.capabilityFingerprint = fingerprint
 }
 
 // requestJSON performs one authenticated JSON HTTP request against scum_server.

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,8 +13,8 @@ import (
 	"time"
 
 	"scum_run/config"
-	"scum_run/internal/database"
 	"scum_run/internal/jobprotocol"
+	"scum_run/internal/localruntime"
 )
 
 const (
@@ -115,6 +116,16 @@ func (c *Client) executeJobEnvelope(envelope jobprotocol.Envelope, startedAt tim
 		result.Retryable = true
 		result.ErrorSummary = jobprotocol.SafeError(err)
 		result.Summary = "execution job failed"
+		var capabilityErr *localruntime.CapabilityExecutionError
+		if errors.As(err, &capabilityErr) {
+			result.ResultCode = firstNonEmptyJobString(capabilityErr.ReasonCode, "execution_failed")
+			result.Retryable = capabilityErr.Retryable
+			result.ErrorSummary = jobprotocol.SafeError(capabilityErr)
+			result.Summary = firstNonEmptyJobString(capabilityErr.Summary, "execution job failed")
+			if capabilityErr.Data != nil {
+				result.Data = capabilityErr.Data
+			}
+		}
 		return result
 	}
 	result.Data = data
@@ -131,11 +142,16 @@ func (c *Client) executeJobEnvelope(envelope jobprotocol.Envelope, startedAt tim
 // executeJobCapability dispatches an accepted job to the local SCUM capability implementation.
 // envelope contains the capability key and payload, and the function returns bounded data, a safe summary, or an execution error.
 func (c *Client) executeJobCapability(envelope jobprotocol.Envelope) (map[string]any, string, error) {
+	if c.runtime != nil {
+		result, err := c.runtime.ExecuteCapability(strings.TrimSpace(envelope.CapabilityKey), envelope.Payload)
+		if err == nil {
+			return result.Data, result.Summary, nil
+		}
+		if c.runtime.SupportsCapability(envelope.CapabilityKey) {
+			return nil, "", err
+		}
+	}
 	switch strings.TrimSpace(envelope.CapabilityKey) {
-	case "scum.db.query.readonly":
-		return c.executeDatabaseJob(envelope, true)
-	case "scum.db.query":
-		return c.executeDatabaseJob(envelope, boolFromJobPayload(envelope.Payload, "readOnly", "read_only"))
 	case "process.start":
 		if err := c.process.Start(); err != nil {
 			return nil, "", err
@@ -156,46 +172,6 @@ func (c *Client) executeJobCapability(envelope jobprotocol.Envelope) (map[string
 	default:
 		return nil, "", fmt.Errorf("unsupported execution job capability: %s", jobprotocol.RedactText(envelope.CapabilityKey))
 	}
-}
-
-// executeDatabaseJob runs a bounded SCUM.db query through the local database client.
-// envelope contains SQL payload and limits while readOnly forces read-only execution, and the function returns bounded result data or a sanitized error.
-func (c *Client) executeDatabaseJob(envelope jobprotocol.Envelope, readOnly bool) (map[string]any, string, error) {
-	query := stringFromJobPayload(envelope.Payload, "query", "sql")
-	if strings.TrimSpace(query) == "" {
-		return nil, "", fmt.Errorf("missing database query")
-	}
-	options := database.QueryOptions{
-		QueryID:  firstNonEmptyJobString(stringFromJobPayload(envelope.Payload, "queryId", "query_id"), envelope.JobID),
-		Args:     databaseArgsFromMessage(envelope.Payload["args"]),
-		Timeout:  durationFromMilliseconds(firstJobValue(envelope.Payload, "timeoutMs", "timeout_ms")),
-		MaxRows:  intFromJobValue(firstLimitValue(envelope, "maxRows", "max_rows")),
-		MaxBytes: intFromJobValue(firstLimitValue(envelope, "maxBytes", "max_bytes")),
-	}
-	var (
-		result database.QueryResult
-		err    error
-	)
-	if readOnly {
-		result, err = c.db.ExecuteReadOnlyCapability(query, options)
-	} else {
-		result, err = c.db.ExecuteCapability(query, options)
-	}
-	if err != nil {
-		return nil, "", err
-	}
-	data := map[string]any{
-		"queryId":      result.QueryID,
-		"action":       result.Action,
-		"columns":      result.Columns,
-		"rows":         result.Rows,
-		"rowCount":     len(result.Rows),
-		"rowsAffected": result.RowsAffected,
-		"truncated":    result.Truncated,
-		"truncatedBy":  result.TruncatedBy,
-		"durationMs":   result.DurationMS,
-	}
-	return data, "database query completed", nil
 }
 
 // sendJobProgress records and emits one bounded progress update.
@@ -304,71 +280,6 @@ func newExecutionEndpointID(cfg *config.Config) string {
 	}
 	sum := sha256.Sum256([]byte(seed))
 	return "scum-run-" + hex.EncodeToString(sum[:])[:16]
-}
-
-// stringFromJobPayload reads the first non-empty string value from a job payload.
-// payload contains decoded JSON fields and keys are candidate names, and the function returns an empty string when no string value exists.
-func stringFromJobPayload(payload map[string]any, keys ...string) string {
-	for _, key := range keys {
-		if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
-}
-
-// boolFromJobPayload reads the first boolean value from a job payload.
-// payload contains decoded JSON fields and keys are candidate names, and the function returns false when no boolean value exists.
-func boolFromJobPayload(payload map[string]any, keys ...string) bool {
-	for _, key := range keys {
-		if value, ok := payload[key].(bool); ok {
-			return value
-		}
-	}
-	return false
-}
-
-// firstJobValue returns the first present payload value for a set of keys.
-// payload contains decoded JSON fields and keys are candidate names, and the function returns nil when none exists.
-func firstJobValue(payload map[string]any, keys ...string) any {
-	for _, key := range keys {
-		if value, ok := payload[key]; ok {
-			return value
-		}
-	}
-	return nil
-}
-
-// firstLimitValue returns a limit from payload first and envelope limits second.
-// envelope contains payload and limit maps, key names are candidate names, and the function returns nil when no value exists.
-func firstLimitValue(envelope jobprotocol.Envelope, keys ...string) any {
-	if value := firstJobValue(envelope.Payload, keys...); value != nil {
-		return value
-	}
-	for _, key := range keys {
-		if value, ok := envelope.Limits[key]; ok {
-			return value
-		}
-	}
-	return nil
-}
-
-// intFromJobValue converts JSON numeric values into an int.
-// value is a decoded JSON scalar, and the function returns zero when conversion is not possible.
-func intFromJobValue(value any) int {
-	switch typed := value.(type) {
-	case float64:
-		return int(typed)
-	case int:
-		return typed
-	case int64:
-		return int(typed)
-	case json.Number:
-		parsed, _ := typed.Int64()
-		return int(parsed)
-	default:
-		return 0
-	}
 }
 
 // firstNonEmptyJobString returns the first non-empty string from two candidates.

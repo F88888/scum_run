@@ -29,6 +29,7 @@ import (
 	_const "scum_run/internal/const"
 	"scum_run/internal/database"
 	"scum_run/internal/jobprotocol"
+	"scum_run/internal/localruntime"
 	"scum_run/internal/logger"
 	"scum_run/internal/logmonitor"
 	"scum_run/internal/monitor"
@@ -91,6 +92,8 @@ type Client struct {
 
 	fileTransferSem chan struct{}
 	operationSem    chan struct{}
+	// runtime 是 client 与 host-agent 共享的本地执行 runtime。
+	runtime *localruntime.LocalRuntime
 	// jobJournal 是本地 execution job journal，用于幂等、结果重放和对账。
 	jobJournal *jobprotocol.Journal
 	// jobEndpointID 是当前 scum_run 执行端的稳定脱敏标识。
@@ -165,6 +168,17 @@ func New(cfg *config.Config, steamDir string, logger *logger.Logger) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	steamDetector := steam.NewDetector(logger)
+	runtime, runtimeErr := localruntime.New(localruntime.LocalRuntimeOptions{SteamDir: steamDir}, logger)
+	if runtimeErr != nil {
+		logger.Warn("Shared local runtime initialization fell back to legacy path: %s", runtimeErr.Error())
+	}
+
+	dbClient := database.New(steamDetector.GetSCUMDatabasePath(steamDir), logger)
+	processManager := process.New(steamDetector.GetSCUMServerPath(steamDir), logger)
+	if runtime != nil {
+		dbClient = runtime.Database()
+		processManager = runtime.Process()
+	}
 
 	client := &Client{
 		config:              cfg,
@@ -172,8 +186,8 @@ func New(cfg *config.Config, steamDir string, logger *logger.Logger) *Client {
 		logger:              logger,
 		ctx:                 ctx,
 		cancel:              cancel,
-		db:                  database.New(steamDetector.GetSCUMDatabasePath(steamDir), logger),
-		process:             process.New(steamDetector.GetSCUMServerPath(steamDir), logger),
+		db:                  dbClient,
+		process:             processManager,
 		sysMonitor:          monitor.New(logger, 10*time.Second),                    // 每10秒监控一次
 		logFileDataBuffer:   make([]string, 0, 100),                                 // 预分配100条日志文件数据的缓冲区
 		processOutputBuffer: make([]string, 0, 100),                                 // 预分配100条进程输出的缓冲区
@@ -181,6 +195,7 @@ func New(cfg *config.Config, steamDir string, logger *logger.Logger) *Client {
 		logRateWindow:       time.Duration(_const.LogRateWindow) * time.Millisecond, // 频率控制窗口
 		fileTransferSem:     make(chan struct{}, maxConcurrentFileOps),
 		operationSem:        make(chan struct{}, maxConcurrentControlOps),
+		runtime:             runtime,
 		jobEndpointID:       newExecutionEndpointID(cfg),
 		jobGeneration:       uint64(time.Now().UnixNano()),
 	}
@@ -536,11 +551,19 @@ func (c *Client) handleServerStart() {
 	}
 
 	// 检查并安装必要的运行时依赖
-	runtimeChecker := runtimeMode.NewChecker(c.logger)
-	if err := runtimeChecker.CheckAndInstallRuntimes(); err != nil {
-		c.logger.Error("运行时依赖检查/安装失败: %v", err)
-		c.sendResponse(MsgTypeServerStart, nil, fmt.Sprintf("运行时依赖检查失败: %v", err))
-		return
+	if c.runtime != nil {
+		if err := c.runtime.EnsureRuntimeDependencies(); err != nil {
+			c.logger.Error("运行时依赖检查/安装失败: %v", err)
+			c.sendResponse(MsgTypeServerStart, nil, fmt.Sprintf("运行时依赖检查失败: %v", err))
+			return
+		}
+	} else {
+		runtimeChecker := runtimeMode.NewChecker(c.logger)
+		if err := runtimeChecker.CheckAndInstallRuntimes(); err != nil {
+			c.logger.Error("运行时依赖检查/安装失败: %v", err)
+			c.sendResponse(MsgTypeServerStart, nil, fmt.Sprintf("运行时依赖检查失败: %v", err))
+			return
+		}
 	}
 
 	// Initialize log monitor if not already done
