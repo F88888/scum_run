@@ -190,8 +190,10 @@ type errorResponse struct {
 // cfg contains server URL, credentials and database path hints, logger writes progress output, and the function returns a configured Agent or an error when the database path cannot be resolved.
 func New(cfg Config, logger *logger.Logger) (*Agent, error) {
 	runtime, err := localruntime.New(localruntime.LocalRuntimeOptions{
+		ScopeRoot:    cfg.ScopeRoot,
 		SteamDir:     cfg.SteamDir,
 		DatabasePath: cfg.DatabasePath,
+		ServerPath:   cfg.ServerPath,
 	}, logger)
 	if err != nil {
 		return nil, err
@@ -213,13 +215,13 @@ func (a *Agent) Run(ctx context.Context) error {
 		return err
 	}
 	if err := a.syncCapabilities(ctx); err != nil {
-		return err
+		a.logger.Warn("Initial capability sync failed before bootstrap: %s", err.Error())
 	}
 	if err := a.maybeBootstrapStartOnce(); err != nil {
 		a.logger.Warn("Managed executor bootstrap start skipped: %s", err.Error())
 	}
 	if err := a.syncCapabilities(ctx); err != nil {
-		return err
+		a.logger.Warn("Capability sync failed after bootstrap: %s", err.Error())
 	}
 	a.logger.Info("Host agent registered: id=%s database=%s", a.cfg.AgentID, a.redactPath(a.databasePath))
 	heartbeatErrCh := make(chan error, 1)
@@ -554,13 +556,16 @@ func (a *Agent) maybeBootstrapStartOnce() error {
 		return nil
 	}
 	if a.bootstrapAttempted() {
+		a.logger.Info("Managed executor bootstrap start already attempted for agent %s", a.cfg.AgentID)
 		return nil
 	}
 	readiness := a.runtime.ProcessReadiness()
 	if readiness.Status.Running {
+		a.logger.Info("Managed executor bootstrap found SCUM server already running: state=%s pid=%d", readiness.Status.State, readiness.Status.PID)
 		return a.markBootstrapAttempt("already_running")
 	}
 	if !readiness.Ready {
+		a.logger.Warn("Managed executor bootstrap start not ready: reason=%s summary=%s", firstNonEmpty(readiness.ReasonCode, "process.not_ready"), firstNonEmpty(readiness.Summary, "local process runtime is not ready"))
 		return nil
 	}
 	if err := a.runtime.EnsureRuntimeDependencies(); err != nil {
@@ -569,6 +574,7 @@ func (a *Agent) maybeBootstrapStartOnce() error {
 	if _, err := a.executeManagedCapability(hostAgentProcessStartCapability, nil); err != nil {
 		return err
 	}
+	a.logger.Info("Managed executor bootstrap start dispatched for agent %s", a.cfg.AgentID)
 	return a.markBootstrapAttempt("started")
 }
 

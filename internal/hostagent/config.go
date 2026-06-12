@@ -24,6 +24,8 @@ var (
 	compiledVersion           string
 	compiledStartupBehavior   string
 	compiledRuntimeContract   string
+	compiledScopeRoot         string
+	compiledServerPath        string
 )
 
 // Config 表示 scum_run host agent 模式的运行配置。
@@ -44,6 +46,10 @@ type Config struct {
 	RuntimeContractVersion string
 	// Address 是 host agent 上报的地址或节点标识。
 	Address string
+	// ScopeRoot 是服务器实例在宿主机上的真实根目录，优先用于启动 SCUM 服务。
+	ScopeRoot string
+	// ServerPath 是 SCUMServer.exe 的显式路径；为空时从 ScopeRoot 或兼容目录推导。
+	ServerPath string
 	// DatabasePath 是本地 SCUM.db 的绝对路径；为空时会尝试自动探测。
 	DatabasePath string
 	// SteamDir 是显式指定的 Steam 根目录；当 DatabasePath 为空时用于推导数据库路径。
@@ -79,6 +85,8 @@ func LoadConfigFromEnv() (Config, error) {
 			compiledRuntimeContract,
 		),
 		Address:           strings.TrimSpace(os.Getenv("SCUM_HOST_AGENT_ADDRESS")),
+		ScopeRoot:         firstNonEmpty(strings.TrimSpace(os.Getenv("SCUM_RUN_SCOPE_ROOT")), compiledScopeRoot),
+		ServerPath:        firstNonEmpty(strings.TrimSpace(os.Getenv("SCUM_RUN_SERVER_PATH")), compiledServerPath),
 		DatabasePath:      strings.TrimSpace(os.Getenv("SCUM_RUN_DATABASE_PATH")),
 		SteamDir:          strings.TrimSpace(os.Getenv("SCUM_RUN_STEAM_DIR")),
 		HeartbeatInterval: envDuration("SCUM_HOST_AGENT_HEARTBEAT_INTERVAL", defaultHeartbeatInterval),

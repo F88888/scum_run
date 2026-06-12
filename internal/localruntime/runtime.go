@@ -11,6 +11,7 @@ import (
 	"scum_run/internal/process"
 	runtimecheck "scum_run/internal/runtime"
 	"scum_run/internal/steam"
+	"scum_run/model"
 )
 
 const (
@@ -24,6 +25,8 @@ const (
 
 // LocalRuntimeOptions 描述共享本地执行 runtime 的初始化输入。
 type LocalRuntimeOptions struct {
+	// ScopeRoot 是实例在宿主机上的真实根目录，优先用于解析启动文件和数据库。
+	ScopeRoot string
 	// SteamDir 是可选的 Steam 根目录，用于推导数据库和服务端可执行文件路径。
 	SteamDir string
 	// DatabasePath 是可选的本地 SCUM.db 路径；为空时会按 SteamDir 自动推导。
@@ -72,10 +75,17 @@ func New(options LocalRuntimeOptions, log *logger.Logger) (*LocalRuntime, error)
 		log = logger.New()
 	}
 	detector := steam.NewDetector(log)
+	scopeRoot := strings.TrimSpace(options.ScopeRoot)
 	steamDir := strings.TrimSpace(options.SteamDir)
 	databasePath := strings.TrimSpace(options.DatabasePath)
 	serverPath := strings.TrimSpace(options.ServerPath)
 
+	if databasePath == "" && scopeRoot != "" {
+		databasePath = filepath.Join(scopeRoot, "SCUM", "Saved", "SaveFiles", "SCUM.db")
+	}
+	if serverPath == "" && scopeRoot != "" {
+		serverPath = filepath.Join(scopeRoot, "SCUM", "Binaries", "Win64", "SCUMServer.exe")
+	}
 	if steamDir == "" && (databasePath == "" || serverPath == "") {
 		steamDir = strings.TrimSpace(detector.DetectSteamDirectory())
 	}
@@ -100,8 +110,16 @@ func New(options LocalRuntimeOptions, log *logger.Logger) (*LocalRuntime, error)
 		databasePath: databasePath,
 		serverPath:   serverPath,
 		db:           database.New(databasePath, log),
-		process:      process.New(serverPath, log),
-		checker:      runtimecheck.NewChecker(log),
+		process: process.NewWithConfig(&model.ServerConfig{
+			ServiceName:    "scum",
+			ExecPath:       serverPath,
+			WorkDir:        firstNonEmpty(scopeRoot, filepath.Dir(serverPath)),
+			GamePort:       7777,
+			MaxPlayers:     64,
+			EnableBattlEye: true,
+			ServerIP:       "0.0.0.0",
+		}, log),
+		checker: runtimecheck.NewChecker(log),
 	}, nil
 }
 

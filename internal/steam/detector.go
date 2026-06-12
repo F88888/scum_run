@@ -93,20 +93,40 @@ func (d *Detector) isValidSteamDirectory(path string) bool {
 	return true
 }
 
-// GetSCUMServerPath returns the path to the SCUM Server executable
+// GetSCUMServerPath resolves the SCUM Server executable path from a Steam root or direct server install directory.
+// steamDir may be the Steam installation root or the SCUM dedicated server directory, and the function returns an existing candidate when found or the standard Steam path fallback.
 func (d *Detector) GetSCUMServerPath(steamDir string) string {
-	// Fall back to standard Steam installation path
-	return filepath.Join(steamDir, "SCUM", "Binaries", "Win64", "SCUMServer.exe")
+	candidates := []string{
+		filepath.Join(steamDir, "steamapps", "common", "SCUM Server", "SCUM", "Binaries", "Win64", "SCUMServer.exe"),
+		filepath.Join(steamDir, "steamapps", "common", "scum server", "SCUM", "Binaries", "Win64", "SCUMServer.exe"),
+		filepath.Join(steamDir, "SCUM", "Binaries", "Win64", "SCUMServer.exe"),
+		filepath.Join(steamDir, "Binaries", "Win64", "SCUMServer.exe"),
+	}
+	return firstExistingPath(candidates)
 }
 
-// GetSCUMDatabasePath returns the path to the SCUM database
+// GetSCUMDatabasePath resolves the SCUM database path from a Steam root or direct server install directory.
+// steamDir may be the Steam installation root or the SCUM dedicated server directory, and the function returns an existing candidate when found or the standard Steam path fallback.
 func (d *Detector) GetSCUMDatabasePath(steamDir string) string {
-	return filepath.Join(steamDir, "SCUM", "Saved", "SaveFiles", "SCUM.db")
+	candidates := []string{
+		filepath.Join(steamDir, "steamapps", "common", "SCUM Server", "SCUM", "Saved", "SaveFiles", "SCUM.db"),
+		filepath.Join(steamDir, "steamapps", "common", "scum server", "SCUM", "Saved", "SaveFiles", "SCUM.db"),
+		filepath.Join(steamDir, "SCUM", "Saved", "SaveFiles", "SCUM.db"),
+		filepath.Join(steamDir, "Saved", "SaveFiles", "SCUM.db"),
+	}
+	return firstExistingPath(candidates)
 }
 
-// GetSCUMLogsPath returns the path to the SCUM logs directory
+// GetSCUMLogsPath resolves the SCUM logs directory from a Steam root or direct server install directory.
+// steamDir may be the Steam installation root or the SCUM dedicated server directory, and the function returns an existing candidate when found or the standard Steam path fallback.
 func (d *Detector) GetSCUMLogsPath(steamDir string) string {
-	return filepath.Join(steamDir, "SCUM", "Saved", "SaveFiles", "Logs")
+	candidates := []string{
+		filepath.Join(steamDir, "steamapps", "common", "SCUM Server", "SCUM", "Saved", "SaveFiles", "Logs"),
+		filepath.Join(steamDir, "steamapps", "common", "scum server", "SCUM", "Saved", "SaveFiles", "Logs"),
+		filepath.Join(steamDir, "SCUM", "Saved", "SaveFiles", "Logs"),
+		filepath.Join(steamDir, "Saved", "SaveFiles", "Logs"),
+	}
+	return firstExistingPath(candidates)
 }
 
 // IsSCUMServerInstalled checks if SCUM Dedicated Server is installed
@@ -158,4 +178,18 @@ func (d *Detector) IsSCUMLogsDirectoryAvailable(steamDir string) bool {
 
 	d.logger.Debug("SCUM logs directory found: %s", logsPath)
 	return true
+}
+
+// firstExistingPath chooses the first existing path from an ordered candidate list.
+// candidates contains preferred paths followed by fallbacks, and the function returns the first existing path or the first candidate when none exists.
+func firstExistingPath(candidates []string) string {
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	if len(candidates) == 0 {
+		return ""
+	}
+	return candidates[0]
 }

@@ -88,6 +88,34 @@ func TestLocalRuntimeExecuteDatabaseCapabilities(t *testing.T) {
 	}
 }
 
+// TestLocalRuntimeResolvesStandardSteamRoot verifies Steam-root layouts resolve under steamapps/common/SCUM Server.
+// t is the testing handle, and the function returns no values while failing the test when standard Steam installs are mapped to direct-install paths.
+func TestLocalRuntimeResolvesStandardSteamRoot(t *testing.T) {
+	steamRoot, databasePath, _ := createStandardSteamRootTestLayout(t, "#!/bin/sh\nsleep 30\n")
+	runtime := newTestLocalRuntime(t, LocalRuntimeOptions{SteamDir: steamRoot})
+
+	if runtime.DatabasePath() != databasePath {
+		t.Fatalf("expected database path %q, got %q", databasePath, runtime.DatabasePath())
+	}
+	if readiness := runtime.ProcessReadiness(); !readiness.Ready {
+		t.Fatalf("expected process readiness for standard Steam root, got reason=%s summary=%s", readiness.ReasonCode, readiness.Summary)
+	}
+}
+
+// TestLocalRuntimePrefersExplicitScopeRoot verifies managed executors use the configured server root instead of Steam detection.
+// t is the testing handle, and the function returns no values while failing the test when explicit scope roots are ignored.
+func TestLocalRuntimePrefersExplicitScopeRoot(t *testing.T) {
+	serverRoot, databasePath, _ := createLocalRuntimeTestLayout(t, "#!/bin/sh\nsleep 30\n")
+	runtime := newTestLocalRuntime(t, LocalRuntimeOptions{ScopeRoot: serverRoot})
+
+	if runtime.DatabasePath() != databasePath {
+		t.Fatalf("expected database path %q, got %q", databasePath, runtime.DatabasePath())
+	}
+	if readiness := runtime.ProcessReadiness(); !readiness.Ready {
+		t.Fatalf("expected process readiness for explicit scope root, got reason=%s summary=%s", readiness.ReasonCode, readiness.Summary)
+	}
+}
+
 // newTestLocalRuntime constructs one shared runtime for tests.
 // t is the testing handle and options describes the local Steam/database layout, and the function returns a ready runtime or fails the test when initialization fails.
 func newTestLocalRuntime(t *testing.T, options LocalRuntimeOptions) *LocalRuntime {
@@ -132,4 +160,33 @@ func createLocalRuntimeTestLayout(t *testing.T, script string) (string, string, 
 		t.Fatalf("write fake server executable: %v", err)
 	}
 	return steamDir, databasePath, startLog
+}
+
+// createStandardSteamRootTestLayout creates a fake Steam root with SCUM Server installed under steamapps/common.
+// t is the testing handle and script is written as the fake SCUMServer executable, and the function returns the Steam root, database path, and script log path.
+func createStandardSteamRootTestLayout(t *testing.T, script string) (string, string, string) {
+	t.Helper()
+	steamRoot := t.TempDir()
+	serverRoot := filepath.Join(steamRoot, "steamapps", "common", "SCUM Server")
+	databasePath := filepath.Join(serverRoot, "SCUM", "Saved", "SaveFiles", "SCUM.db")
+	serverPath := filepath.Join(serverRoot, "SCUM", "Binaries", "Win64", "SCUMServer.exe")
+	startLog := filepath.Join(filepath.Dir(serverPath), "process-start.log")
+	if err := os.MkdirAll(filepath.Dir(databasePath), 0o755); err != nil {
+		t.Fatalf("create database dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(serverPath), 0o755); err != nil {
+		t.Fatalf("create server dir: %v", err)
+	}
+	db, err := sql.Open("sqlite3", databasePath)
+	if err != nil {
+		t.Fatalf("open sqlite db: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE players (id INTEGER PRIMARY KEY, name TEXT NOT NULL);`); err != nil {
+		t.Fatalf("seed sqlite db: %v", err)
+	}
+	if err := os.WriteFile(serverPath, []byte(strings.ReplaceAll(script, "__START_LOG__", filepath.ToSlash(startLog))), 0o755); err != nil {
+		t.Fatalf("write fake server executable: %v", err)
+	}
+	return steamRoot, databasePath, startLog
 }
