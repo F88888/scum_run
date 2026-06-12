@@ -28,6 +28,7 @@ import (
 	"scum_run/config"
 	_const "scum_run/internal/const"
 	"scum_run/internal/database"
+	"scum_run/internal/jobprotocol"
 	"scum_run/internal/logger"
 	"scum_run/internal/logmonitor"
 	"scum_run/internal/monitor"
@@ -90,6 +91,12 @@ type Client struct {
 
 	fileTransferSem chan struct{}
 	operationSem    chan struct{}
+	// jobJournal 是本地 execution job journal，用于幂等、结果重放和对账。
+	jobJournal *jobprotocol.Journal
+	// jobEndpointID 是当前 scum_run 执行端的稳定脱敏标识。
+	jobEndpointID string
+	// jobGeneration 是当前进程启动生成的执行端代次，用于识别陈旧 job。
+	jobGeneration uint64
 }
 
 // Message types for WebSocket communication
@@ -174,7 +181,14 @@ func New(cfg *config.Config, steamDir string, logger *logger.Logger) *Client {
 		logRateWindow:       time.Duration(_const.LogRateWindow) * time.Millisecond, // 频率控制窗口
 		fileTransferSem:     make(chan struct{}, maxConcurrentFileOps),
 		operationSem:        make(chan struct{}, maxConcurrentControlOps),
+		jobEndpointID:       newExecutionEndpointID(cfg),
+		jobGeneration:       uint64(time.Now().UnixNano()),
 	}
+	jobJournal, err := jobprotocol.NewJournal(jobprotocol.JournalOptions{Path: defaultJobJournalPath(), MaxActive: maxConcurrentControlOps})
+	if err != nil {
+		logger.Warn("Execution job journal started with degraded persistence: %s", jobprotocol.RedactText(err.Error()))
+	}
+	client.jobJournal = jobJournal
 
 	// 设置进程输出回调函数
 	client.process.SetOutputCallback(client.handleProcessOutput)
@@ -494,6 +508,14 @@ func (c *Client) handleMessage(msg request.WebSocketMessage) {
 		c.handleSystemMonitor(msg.Data)
 	case MsgTypeGetSystemInfo:
 		c.handleGetSystemInfo()
+	case MsgTypeExecutionJob:
+		go c.handleExecutionJob(msg.Data)
+	case MsgTypeExecutionJobCancel:
+		c.handleExecutionJobCancel(msg.Data)
+	case MsgTypeExecutionJobReconcile:
+		c.handleExecutionJobReconcile(msg.Data)
+	case MsgTypeExecutionJobReadiness:
+		c.handleExecutionJobReadiness()
 	default:
 		c.logger.Warn("Unknown message type: %s", msg.Type)
 	}
