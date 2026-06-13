@@ -101,6 +101,33 @@ func TestBuildLaunchProfileCommandRejectsTraversal(t *testing.T) {
 	}
 }
 
+// TestBuildLegacySCUMCommandUsesConfiguredWorkDir verifies managed executors start SCUM from the configured instance root.
+// t is the test handle, and the test fails when the legacy SCUM command ignores WorkDir.
+func TestBuildLegacySCUMCommandUsesConfiguredWorkDir(t *testing.T) {
+	scope := t.TempDir()
+	executable := filepath.Join(scope, "SCUM", "Binaries", "Win64", "SCUMServer.exe")
+	if err := os.MkdirAll(filepath.Dir(executable), 0755); err != nil {
+		t.Fatalf("create executable dir: %v", err)
+	}
+	if err := os.WriteFile(executable, []byte("#!/bin/sh\n"), 0755); err != nil {
+		t.Fatalf("write executable: %v", err)
+	}
+	manager := NewWithConfig(&model.ServerConfig{
+		ServiceName: "scum",
+		ExecPath:    executable,
+		WorkDir:     scope,
+		GamePort:    7777,
+	}, logger.New())
+
+	cmd, err := manager.buildCommand()
+	if err != nil {
+		t.Fatalf("build legacy SCUM command: %v", err)
+	}
+	if cmd.Dir != scope {
+		t.Fatalf("expected command dir %q, got %q", scope, cmd.Dir)
+	}
+}
+
 // TestBuildLaunchProfileCommandRejectsSymlinkEscape verifies executable symlinks cannot leave the instance scope.
 // t is the test handle, and the test skips when the platform does not allow symlink creation.
 func TestBuildLaunchProfileCommandRejectsSymlinkEscape(t *testing.T) {

@@ -80,6 +80,15 @@ func New(options LocalRuntimeOptions, log *logger.Logger) (*LocalRuntime, error)
 	databasePath := strings.TrimSpace(options.DatabasePath)
 	serverPath := strings.TrimSpace(options.ServerPath)
 
+	if err := validateLocalPathHint("SCUM_RUN_SCOPE_ROOT", scopeRoot); err != nil {
+		return nil, err
+	}
+	if err := validateLocalPathHint("SCUM_RUN_DATABASE_PATH", databasePath); err != nil {
+		return nil, err
+	}
+	if err := validateLocalPathHint("SCUM_RUN_SERVER_PATH", serverPath); err != nil {
+		return nil, err
+	}
 	if databasePath == "" && scopeRoot != "" {
 		databasePath = filepath.Join(scopeRoot, "SCUM", "Saved", "SaveFiles", "SCUM.db")
 	}
@@ -254,4 +263,47 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// validateLocalPathHint rejects malformed Windows-style volume prefixes before SQLite or process startup sees them.
+// name identifies the environment or compiled path source and value is the raw path hint; it returns nil for blank or usable paths and an error for values such as manual:\server or C:server.
+func validateLocalPathHint(name string, value string) error {
+	path := strings.TrimSpace(value)
+	if path == "" {
+		return nil
+	}
+	if hasMalformedWindowsVolume(path) {
+		return fmt.Errorf("%s must be a real Windows absolute path such as D:\\scum-run-manual, not a logical ref such as manual:\\server or C:server", name)
+	}
+	return nil
+}
+
+// hasMalformedWindowsVolume detects path prefixes that are invalid or drive-relative on Windows.
+// value is a user-supplied path hint, and the function returns true for scheme-like prefixes or drive-relative prefixes that would later become invalid local filenames.
+func hasMalformedWindowsVolume(value string) bool {
+	path := strings.TrimSpace(value)
+	colon := strings.IndexByte(path, ':')
+	if colon < 0 {
+		return false
+	}
+	firstSeparator := strings.IndexAny(path, `/\`)
+	if firstSeparator >= 0 && colon > firstSeparator {
+		return false
+	}
+	if colon == 1 && isASCIILetter(path[0]) {
+		return len(path) < 3 || !isWindowsSeparator(path[2])
+	}
+	return true
+}
+
+// isASCIILetter reports whether b is an English alphabetic byte.
+// b is one byte from a path prefix, and the function returns true for A-Z or a-z.
+func isASCIILetter(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
+}
+
+// isWindowsSeparator reports whether b is a Windows path separator.
+// b is one byte from a path string, and the function returns true for slash or backslash.
+func isWindowsSeparator(b byte) bool {
+	return b == '\\' || b == '/'
 }

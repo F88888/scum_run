@@ -301,10 +301,15 @@ func (m *Manager) buildCommand() (*exec.Cmd, error) {
 	m.logger.Info("Starting legacy SCUM server: %s %s", m.config.ExecPath, strings.Join(args, " "))
 
 	cmd := exec.Command(m.config.ExecPath, args...)
-	execDir := strings.TrimSuffix(m.config.ExecPath, "SCUMServer.exe")
-	if execDir != m.config.ExecPath {
-		cmd.Dir = execDir
-		m.logger.Info("Setting working directory to: %s", execDir)
+	if workDir := strings.TrimSpace(m.config.WorkDir); workDir != "" {
+		cmd.Dir = workDir
+		m.logger.Info("Setting working directory to configured scope root: %s", workDir)
+	} else {
+		execDir := strings.TrimSuffix(m.config.ExecPath, "SCUMServer.exe")
+		if execDir != m.config.ExecPath {
+			cmd.Dir = execDir
+			m.logger.Info("Setting working directory to: %s", execDir)
+		}
 	}
 	return cmd, nil
 }
@@ -433,10 +438,13 @@ func (m *Manager) resolveScopedPath(relative string, mustExist bool) (string, er
 }
 
 // launchScopeRoot returns the host-local root assigned to the current instance.
-// It reads the manager config and returns ExecPath as the launch-profile scope root.
+// It reads WorkDir first and falls back to ExecPath for older scoped launch-profile configs, returning an empty string when no scope is configured.
 func (m *Manager) launchScopeRoot() string {
 	if m == nil || m.config == nil {
 		return ""
+	}
+	if workDir := strings.TrimSpace(m.config.WorkDir); workDir != "" {
+		return filepath.Clean(workDir)
 	}
 	return filepath.Clean(strings.TrimSpace(m.config.ExecPath))
 }

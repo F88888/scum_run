@@ -116,6 +116,15 @@ func TestLocalRuntimePrefersExplicitScopeRoot(t *testing.T) {
 	}
 }
 
+// TestLocalRuntimeRejectsMalformedWindowsScopeRoot verifies invalid logical refs fail before SQLite initialization.
+// t is the testing handle, and the function returns no values while failing when malformed scope roots are accepted.
+func TestLocalRuntimeRejectsMalformedWindowsScopeRoot(t *testing.T) {
+	_, err := New(LocalRuntimeOptions{ScopeRoot: `manual:\scum-run-manual`}, logger.New())
+	if err == nil || !strings.Contains(err.Error(), "SCUM_RUN_SCOPE_ROOT") {
+		t.Fatalf("expected malformed scope root error, got %v", err)
+	}
+}
+
 // newTestLocalRuntime constructs one shared runtime for tests.
 // t is the testing handle and options describes the local Steam/database layout, and the function returns a ready runtime or fails the test when initialization fails.
 func newTestLocalRuntime(t *testing.T, options LocalRuntimeOptions) *LocalRuntime {
