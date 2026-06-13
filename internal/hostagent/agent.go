@@ -20,6 +20,7 @@ import (
 	"scum_run/internal/jobprotocol"
 	"scum_run/internal/localruntime"
 	"scum_run/internal/logger"
+	"scum_run/model"
 )
 
 const (
@@ -94,6 +95,36 @@ type helloRequest struct {
 type helloResponse struct {
 	// SessionToken 是后续 heartbeat 和轮询接口使用的会话令牌。
 	SessionToken string `json:"sessionToken"`
+	// BootstrapLaunchProfile 是控制面下发给首次 bootstrap 启动使用的安全 argv 启动配置。
+	BootstrapLaunchProfile *bootstrapLaunchProfile `json:"bootstrapLaunchProfile,omitempty"`
+}
+
+// bootstrapLaunchProfile 表示 host-agent hello 响应里附带的安全启动配置。
+type bootstrapLaunchProfile struct {
+	// ServiceName 是执行端本地服务名。
+	ServiceName string `json:"serviceName"`
+	// Ports 是声明端口列表。
+	Ports []bootstrapLaunchDeclaredPort `json:"ports"`
+	// WorkDir 是实例作用域内的相对工作目录。
+	WorkDir string `json:"workDir"`
+	// LaunchMode 是启动模式；当前仅接受 argv。
+	LaunchMode string `json:"launchMode"`
+	// Executable 是 argv 模式下的相对可执行文件路径。
+	Executable string `json:"executable,omitempty"`
+	// Args 是 argv 模式下的启动参数。
+	Args []string `json:"args,omitempty"`
+	// DesiredGeneration 是当前期望应用的启动配置代次。
+	DesiredGeneration uint64 `json:"desiredGeneration"`
+}
+
+// bootstrapLaunchDeclaredPort 表示 hello 响应中一条声明端口。
+type bootstrapLaunchDeclaredPort struct {
+	// Name 是端口业务名，例如 game。
+	Name string `json:"name"`
+	// Port 是端口号。
+	Port int `json:"port"`
+	// Protocol 是端口协议。
+	Protocol string `json:"protocol,omitempty"`
 }
 
 // heartbeatRequest 表示 host agent 对 scum_server 的心跳请求。
@@ -335,8 +366,39 @@ func (a *Agent) register(ctx context.Context) error {
 		return errors.New("register host agent: empty session token")
 	}
 	a.setSessionToken(response.SessionToken)
+	if err := a.applyBootstrapLaunchProfile(response.BootstrapLaunchProfile); err != nil {
+		return fmt.Errorf("apply bootstrap launch profile: %w", err)
+	}
 	a.setCapabilityFingerprint(fingerprint)
 	return nil
+}
+
+// applyBootstrapLaunchProfile updates the shared local runtime with one hello-delivered argv launch profile.
+// profile contains a safe launch profile summary from scum_server, and the method returns nil when no bootstrap profile should be applied.
+func (a *Agent) applyBootstrapLaunchProfile(profile *bootstrapLaunchProfile) error {
+	if a == nil || a.runtime == nil || profile == nil {
+		return nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(profile.LaunchMode), "argv") {
+		return nil
+	}
+	ports := make([]model.LaunchDeclaredPort, 0, len(profile.Ports))
+	for _, port := range profile.Ports {
+		ports = append(ports, model.LaunchDeclaredPort{
+			Name:     strings.TrimSpace(port.Name),
+			Port:     port.Port,
+			Protocol: strings.TrimSpace(port.Protocol),
+		})
+	}
+	return a.runtime.ApplyLaunchProfile(&model.LaunchProfile{
+		ServiceName:      strings.TrimSpace(profile.ServiceName),
+		Ports:            ports,
+		LaunchGeneration: profile.DesiredGeneration,
+		WorkDir:          strings.TrimSpace(profile.WorkDir),
+		LaunchMode:       "argv",
+		Executable:       strings.TrimSpace(profile.Executable),
+		Args:             append([]string(nil), profile.Args...),
+	})
 }
 
 // sendHeartbeat refreshes host-agent liveness with the current session token.

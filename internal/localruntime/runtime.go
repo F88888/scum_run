@@ -177,6 +177,28 @@ func (r *LocalRuntime) Process() *process.Manager {
 	return r.process
 }
 
+// ApplyLaunchProfile updates the shared process manager to use one launch profile for future lifecycle actions.
+// profile contains the scoped executable, argv arguments, ports and restart metadata from scum_server, and the method returns an error only when the runtime has no process manager.
+func (r *LocalRuntime) ApplyLaunchProfile(profile *model.LaunchProfile) error {
+	if r == nil || r.process == nil {
+		return fmt.Errorf("local process runtime is not initialized")
+	}
+	config := r.process.GetConfig()
+	if config == nil {
+		config = &model.ServerConfig{}
+	}
+	config.LaunchProfile = profile
+	if profile != nil {
+		config.ServiceName = strings.TrimSpace(profile.ServiceName)
+		config.WorkDir = strings.TrimSpace(profile.WorkDir)
+		if port := launchProfilePrimaryPort(profile); port > 0 {
+			config.GamePort = port
+		}
+	}
+	r.process.UpdateConfig(config)
+	return nil
+}
+
 // EnsureRuntimeDependencies 执行本地运行时依赖检查。
 // 它不接收额外参数，会使用 runtime 自带检查器执行依赖校验。
 // 它返回 nil 表示依赖已满足或当前平台无需检查；若依赖安装或检查失败则返回错误。
@@ -242,6 +264,25 @@ func inferSteamDirFromDatabasePath(databasePath string) string {
 		return filepath.Dir(scumDir)
 	}
 	return ""
+}
+
+// launchProfilePrimaryPort returns the primary game port declared by one launch profile.
+// profile contains declared ports from the control plane, and the function returns the first game or first declared port number, or zero when none exist.
+func launchProfilePrimaryPort(profile *model.LaunchProfile) int {
+	if profile == nil {
+		return 0
+	}
+	for _, port := range profile.Ports {
+		if strings.EqualFold(strings.TrimSpace(port.Name), "game") && port.Port > 0 {
+			return port.Port
+		}
+	}
+	for _, port := range profile.Ports {
+		if port.Port > 0 {
+			return port.Port
+		}
+	}
+	return 0
 }
 
 // inferServerPathFromDatabasePath 根据数据库路径反推 SCUM server 可执行文件路径。

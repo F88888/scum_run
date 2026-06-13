@@ -372,6 +372,59 @@ func TestAgentBootstrapStartOnceStartsProcessOnlyOnce(t *testing.T) {
 	}
 }
 
+// TestAgentRegisterAppliesBootstrapLaunchProfile verifies hello bootstrap launch profiles update the shared runtime before process start.
+// t is the testing handle used for assertions, and the function returns no values.
+func TestAgentRegisterAppliesBootstrapLaunchProfile(t *testing.T) {
+	t.Setenv("SCUM_RUN_PROCESS_STATE_DIR", t.TempDir())
+	steamDir, _, _ := createManagedExecutorTestLayout(t, "#!/bin/sh\nsleep 30\n")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/host-agents/hello":
+			writeJSONResponse(t, w, helloResponse{
+				SessionToken: "session-1",
+				BootstrapLaunchProfile: &bootstrapLaunchProfile{
+					ServiceName:       "scum-main",
+					Ports:             []bootstrapLaunchDeclaredPort{{Name: "game", Port: 7777}},
+					WorkDir:           ".",
+					LaunchMode:        "argv",
+					Executable:        "SCUM/Binaries/Win64/SCUMServer.exe",
+					Args:              []string{"-log", "-port=7777"},
+					DesiredGeneration: 4,
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	agent := newTestAgent(t, Config{
+		ServerURL:              server.URL,
+		RegistrationToken:      "token",
+		AgentID:                "agent-1",
+		DisplayName:            "agent-1",
+		Version:                "test",
+		StartupBehavior:        startupBehaviorWait,
+		RuntimeContractVersion: defaultRuntimeContract,
+		Address:                "127.0.0.1",
+		SteamDir:               steamDir,
+		HeartbeatInterval:      time.Second,
+		PollInterval:           time.Second,
+		RequestTimeout:         time.Second,
+	})
+
+	if err := agent.register(context.Background()); err != nil {
+		t.Fatalf("register agent: %v", err)
+	}
+	config := agent.runtime.Process().GetConfig()
+	if config.LaunchProfile == nil {
+		t.Fatal("expected bootstrap launch profile to be applied to process config")
+	}
+	if len(config.LaunchProfile.Args) != 2 || config.LaunchProfile.Args[0] != "-log" {
+		t.Fatalf("expected argv args to be applied, got %+v", config.LaunchProfile)
+	}
+}
+
 // newTestAgent builds one host-agent instance for tests.
 // t is the testing handle and cfg contains the runtime configuration, and the function returns a ready Agent or fails the test when construction fails.
 func newTestAgent(t *testing.T, cfg Config) *Agent {
