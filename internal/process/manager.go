@@ -196,7 +196,8 @@ func (m *Manager) Start() error {
 		return err
 	}
 
-	m.configureProcessGroup(cmd)
+	releaseProcessAttributes := m.configureProcessGroup(cmd)
+	defer releaseProcessAttributes()
 
 	logFile, err := m.openProcessLog()
 	if err != nil {

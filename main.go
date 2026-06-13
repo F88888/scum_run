@@ -24,13 +24,15 @@ var (
 	commit  = ""
 )
 
-// cleanup ensures all processes are properly cleaned up on exit
+// cleanup shuts down the scum_run control client without stopping the managed SCUM server.
+// It does not accept parameters because it uses the package-level client created during startup.
+// It returns no values; cleanup failures are logged by the client shutdown path.
 func cleanup() {
 	if scumClient != nil {
 		logger := logger.New()
-		logger.Info("Starting cleanup process...")
+		logger.Info("Starting scum_run cleanup process...")
 		scumClient.ForceStop()
-		logger.Info("Cleanup process completed")
+		logger.Info("scum_run cleanup process completed")
 	}
 }
 
@@ -103,9 +105,9 @@ func main() {
 	// Initialize SCUM client
 	scumClient = client.New(cfg, steamDir, logger)
 
-	// 设置关闭回调，当控制台关闭时优雅停止 SCUM 服务器
+	// 设置关闭回调，当控制台关闭时只关闭 scum_run 控制端并保留 SCUM 服务器。
 	internalSignal.SetShutdownCallback(func() {
-		logger.Info("Console closing, gracefully stopping SCUM server...")
+		logger.Info("Console closing, detaching from SCUM server before scum_run exits...")
 		cleanup()
 	})
 

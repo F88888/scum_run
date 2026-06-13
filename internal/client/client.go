@@ -368,9 +368,9 @@ func (c *Client) Stop() {
 	c.wg.Wait()
 }
 
-// ForceStop forcefully stops the client and all associated local processes.
-// It does not accept parameters and uses the receiver's process manager for cleanup.
-// It returns no values; cleanup failures are logged and shutdown continues.
+// ForceStop shuts down the scum_run client while detaching from the managed SCUM server.
+// It does not accept parameters and uses the receiver's timers, monitors, database and WebSocket client for cleanup.
+// It returns no values; cleanup failures are logged and shutdown continues without stopping the game server.
 func (c *Client) ForceStop() {
 	c.cancel()
 
@@ -399,7 +399,6 @@ func (c *Client) ForceStop() {
 		c.logMonitor.Stop()
 	}
 
-	// Force stop the SCUM server process and all child processes
 	if c.process != nil {
 		c.process.CleanupOnExit()
 	}
@@ -1988,7 +1987,9 @@ func (c *Client) handleProcessOutput(_ string, line string) {
 	c.addProcessOutputToBuffer(line)
 }
 
-// handleClientUpdate handles client update requests
+// handleClientUpdate handles self-update requests from the control plane.
+// data contains the update action, optional stop_server flag, and download_url payload from the server.
+// It returns no values; invalid payloads or update preparation failures are reported back through client_update responses.
 func (c *Client) handleClientUpdate(data interface{}) {
 	c.logger.Info("🔍 [DEBUG] 接收到客户端更新消息，数据: %+v", data)
 
@@ -2017,30 +2018,12 @@ func (c *Client) handleClientUpdate(data interface{}) {
 
 	switch action {
 	case "update":
-		// 检查是否需要先停止服务器
 		stopServer, _ := updateData["stop_server"].(bool)
-		if stopServer {
-			c.logger.Info("🛑 更新前需要先停止SCUM服务器...")
-			if c.process != nil && c.process.IsRunning() {
-				if err := c.process.Stop(); err != nil {
-					c.logger.Error("❌ 更新前停止服务器失败: %v", err)
-					c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
-						"type":   "self_update",
-						"status": _const.UpdateStatusFailed,
-					}, fmt.Sprintf("Failed to stop server: %v", err))
-					return
-				}
-				c.logger.Info("✅ 服务器已成功停止，继续客户端更新")
-			}
-		}
-
-		// 获取下载链接
 		downloadURL, _ := updateData["download_url"].(string)
 		c.logger.Info("📥 获取到下载链接: %s", downloadURL)
 
-		// 启动自我更新流程，传递下载链接
 		c.logger.Info("🚀 启动客户端自我更新流程...")
-		go c.performSelfUpdateWithURL(downloadURL)
+		go c.performSelfUpdateWithURL(downloadURL, stopServer)
 	default:
 		c.logger.Error("❌ 未知的更新动作: %s", action)
 		c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
@@ -2050,8 +2033,10 @@ func (c *Client) handleClientUpdate(data interface{}) {
 	}
 }
 
-// performSelfUpdateWithURL performs the self-update process using provided download URL
-func (c *Client) performSelfUpdateWithURL(downloadURL string) {
+// performSelfUpdateWithURL performs the self-update flow with an explicit server-stop policy.
+// downloadURL is the binary artifact URL, and stopServerRequested indicates whether the caller explicitly wants SCUM stopped before replacement.
+// It returns no values; failures are reported through client_update responses, and successful preparation schedules the current process to exit for the external updater.
+func (c *Client) performSelfUpdateWithURL(downloadURL string, stopServerRequested bool) {
 	c.logger.Info("🔄 开始执行客户端自我更新流程")
 
 	// 发送更新开始状态
@@ -2071,33 +2056,19 @@ func (c *Client) performSelfUpdateWithURL(downloadURL string) {
 
 	c.logger.Info("📥 更新下载链接: %s", downloadURL)
 
-	// 在更新前优雅地停止SCUM服务器
-	if c.process != nil && c.process.IsRunning() {
-		c.logger.Info("🛑 检测到SCUM服务器正在运行，发送Ctrl+C信号进行优雅关闭...")
-
-		// 发送更新状态，告知正在停止服务器
+	if stopServerRequested && c.process != nil && c.process.IsRunning() {
 		c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
 			"type":   "self_update",
 			"status": _const.UpdateStatusChecking,
 		}, "Stopping SCUM server before update...")
-
-		// 优雅停止SCUM服务器
-		if err := c.process.Stop(); err != nil {
-			c.logger.Warn("⚠️ 优雅停止SCUM服务器失败，将强制停止: %v", err)
-			// 如果优雅停止失败，尝试强制停止
-			if forceErr := c.process.ForceStop(); forceErr != nil {
-				c.logger.Error("❌ 强制停止SCUM服务器也失败: %v", forceErr)
-			} else {
-				c.logger.Info("✅ SCUM服务器已强制停止")
-			}
-		} else {
-			c.logger.Info("✅ SCUM服务器已优雅停止")
-		}
-
-		// 等待一段时间确保服务器完全停止
-		time.Sleep(_const.LongWaitTime)
-	} else {
-		c.logger.Info("ℹ️ SCUM服务器未运行，无需停止")
+	}
+	if err := c.prepareRunningServerForSelfUpdate(stopServerRequested); err != nil {
+		c.logger.Error("❌ 更新前处理SCUM服务器失败: %v", err)
+		c.sendResponse(MsgTypeClientUpdate, map[string]interface{}{
+			"type":   "self_update",
+			"status": _const.UpdateStatusFailed,
+		}, fmt.Sprintf("Failed to prepare SCUM server for update: %v", err))
+		return
 	}
 
 	// 准备更新配置
@@ -2159,6 +2130,38 @@ func (c *Client) performSelfUpdateWithURL(downloadURL string) {
 			os.Exit(0)
 		}
 	}()
+}
+
+// prepareRunningServerForSelfUpdate optionally stops the managed SCUM server before replacing scum_run.
+// stopServerRequested indicates whether the caller explicitly requested a stop, and the method uses the current process manager to inspect and stop the local server.
+// It returns nil when no stop is required or the stop succeeds, or an error when an explicitly requested stop fails even after graceful and forceful attempts.
+func (c *Client) prepareRunningServerForSelfUpdate(stopServerRequested bool) error {
+	if !stopServerRequested {
+		c.logger.Info("ℹ️ 未请求在客户端更新前停止SCUM服务器，保持当前服务继续运行")
+		return nil
+	}
+	if c.process == nil {
+		c.logger.Info("ℹ️ 当前客户端没有可管理的SCUM进程，无需停止")
+		return nil
+	}
+	if !c.process.IsRunning() {
+		c.logger.Info("ℹ️ SCUM服务器未运行，无需停止")
+		return nil
+	}
+
+	c.logger.Info("🛑 更新前需要停止SCUM服务器，先尝试优雅关闭...")
+	if err := c.process.Stop(); err != nil {
+		c.logger.Warn("⚠️ 优雅停止SCUM服务器失败，将强制停止: %v", err)
+		if forceErr := c.process.ForceStop(); forceErr != nil {
+			return fmt.Errorf("force stop server before self-update: %w", forceErr)
+		}
+		c.logger.Info("✅ SCUM服务器已强制停止")
+	} else {
+		c.logger.Info("✅ SCUM服务器已优雅停止")
+	}
+
+	time.Sleep(_const.LongWaitTime)
+	return nil
 }
 
 // performSelfUpdate performs the self-update process using external updater (legacy method)

@@ -11,11 +11,12 @@ import (
 )
 
 // configureProcessGroup detaches a child process into its own Unix process group.
-// cmd is the command being started, and the function returns no values because the setting is applied directly to cmd.
-func (m *Manager) configureProcessGroup(cmd *exec.Cmd) {
+// cmd is the command being started, and the function returns a cleanup callback for API parity with Windows.
+func (m *Manager) configureProcessGroup(cmd *exec.Cmd) func() {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 	}
+	return func() {}
 }
 
 // sendCtrlC reports that Ctrl+C console events are unsupported on non-Windows systems.
