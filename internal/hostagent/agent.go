@@ -3,6 +3,7 @@ package hostagent
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,9 +13,11 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"scum_run/internal/database"
 	"scum_run/internal/jobprotocol"
@@ -27,6 +30,8 @@ const (
 	hostAgentDatabaseCapability       = "scum.db.query.readonly"
 	hostAgentExecutorUpdateCapability = "executor.update.push"
 	hostAgentSelfUpdateCapability     = "executor.self_update"
+	hostAgentFileListCapability       = "file.list"
+	hostAgentFileReadCapability       = "file.read"
 	hostAgentProcessStartCapability   = "process.start"
 	hostAgentProcessStopCapability    = "process.stop"
 	hostAgentProcessRestartCapability = "process.restart"
@@ -211,6 +216,52 @@ type databaseOperationResultRequest struct {
 	Summary string `json:"summary,omitempty"`
 }
 
+// fileOperation 表示从 scum_server 拉取的一条待执行文件操作。
+type fileOperation struct {
+	// ID 是文件操作记录 ID。
+	ID string `json:"id"`
+	// OperationType 是文件操作类型，例如 list 或 read。
+	OperationType string `json:"operationType"`
+	// RelativePath 是相对实例根目录的受控路径。
+	RelativePath string `json:"relativePath"`
+	// ContentMode 是控制面声明的内容模式，例如 text 或 metadata。
+	ContentMode string `json:"contentMode"`
+	// Result 是控制面附带的脱敏策略元数据，例如 limits。
+	Result map[string]any `json:"result,omitempty"`
+}
+
+// fileOperationResultRequest 表示 host agent 向 scum_server 回报文件操作结果的请求体。
+type fileOperationResultRequest struct {
+	// Status 是文件操作最终状态。
+	Status string `json:"status"`
+	// BeforeChecksum 是执行前文件校验和。
+	BeforeChecksum string `json:"beforeChecksum,omitempty"`
+	// AfterChecksum 是执行后文件校验和。
+	AfterChecksum string `json:"afterChecksum,omitempty"`
+	// ContentMode 是执行端判定后的内容模式。
+	ContentMode string `json:"contentMode,omitempty"`
+	// ErrorCode 是结构化错误码。
+	ErrorCode string `json:"errorCode,omitempty"`
+	// ErrorMessage 是脱敏错误摘要。
+	ErrorMessage string `json:"errorMessage,omitempty"`
+	// Metadata 是脱敏结果元数据，例如目录条目或文本内容片段。
+	Metadata map[string]any `json:"metadata,omitempty"`
+}
+
+// fileListEntry 表示一次目录读取返回的一条脱敏文件项。
+type fileListEntry struct {
+	// Name 是目录项名称，不包含父级路径。
+	Name string `json:"name"`
+	// RelativePath 是相对实例根目录的路径。
+	RelativePath string `json:"relativePath"`
+	// Directory 表示该目录项是否为目录。
+	Directory bool `json:"directory"`
+	// SizeBytes 是文件字节数；目录时为 0。
+	SizeBytes int64 `json:"sizeBytes"`
+	// ModifiedAt 是目录项最后修改时间。
+	ModifiedAt string `json:"modifiedAt"`
+}
+
 // errorResponse 表示 scum_server 返回的标准错误体。
 type errorResponse struct {
 	// Error 是返回给调用方的错误摘要。
@@ -239,7 +290,7 @@ func New(cfg Config, logger *logger.Logger) (*Agent, error) {
 	}, nil
 }
 
-// Run starts host-agent registration, heartbeat, and database polling loops.
+// Run starts host-agent registration, heartbeat, and bounded capability polling loops.
 // ctx controls the runtime lifetime, and the method returns nil on clean shutdown or an error when startup registration fails.
 func (a *Agent) Run(ctx context.Context) error {
 	if err := a.register(ctx); err != nil {
@@ -299,7 +350,7 @@ func (a *Agent) heartbeatLoop(ctx context.Context, errCh chan<- error) {
 	}
 }
 
-// pollLoop continuously claims database operations and reports execution results.
+// pollLoop continuously claims database and file operations and reports execution results.
 // ctx controls cancellation, and the method returns nil on shutdown or an error when re-registration fails.
 func (a *Agent) pollLoop(ctx context.Context) error {
 	ticker := time.NewTicker(a.cfg.PollInterval)
@@ -332,11 +383,29 @@ func (a *Agent) pollLoop(ctx context.Context) error {
 			a.logger.Warn("Database polling failed: %s", err.Error())
 			continue
 		}
-		if !found {
+		if found {
+			if err := a.handleDatabaseOperation(ctx, operation); err != nil {
+				a.logger.Warn("Database operation %s handling failed: %s", operation.ID, err.Error())
+			}
 			continue
 		}
-		if err := a.handleDatabaseOperation(ctx, operation); err != nil {
-			a.logger.Warn("Database operation %s handling failed: %s", operation.ID, err.Error())
+		fileOp, fileFound, fileErr := a.nextFileOperation(ctx)
+		if fileErr != nil {
+			if a.isUnauthorized(fileErr) {
+				a.logger.Warn("Host agent session expired during file polling, re-registering")
+				if err := a.register(ctx); err != nil {
+					return err
+				}
+				continue
+			}
+			a.logger.Warn("File polling failed: %s", fileErr.Error())
+			continue
+		}
+		if !fileFound {
+			continue
+		}
+		if err := a.handleFileOperation(ctx, fileOp); err != nil {
+			a.logger.Warn("File operation %s handling failed: %s", fileOp.ID, err.Error())
 		}
 	}
 }
@@ -443,6 +512,34 @@ func (a *Agent) handleDatabaseOperation(ctx context.Context, operation databaseO
 	)
 }
 
+// nextFileOperation claims the next pending file operation for this host agent.
+// ctx controls the HTTP request lifetime, and the method returns the reserved operation, whether one existed, or an error.
+func (a *Agent) nextFileOperation(ctx context.Context) (fileOperation, bool, error) {
+	var operation fileOperation
+	err := a.requestJSON(ctx, http.MethodGet, "/api/v1/host-agents/file-operations/next", a.session(), nil, &operation)
+	if err != nil {
+		if errors.Is(err, errNotFound) {
+			return fileOperation{}, false, nil
+		}
+		return fileOperation{}, false, err
+	}
+	return operation, true, nil
+}
+
+// handleFileOperation executes one claimed file operation and reports the shaped result back to scum_server.
+// ctx controls the report request lifetime, operation is the reserved file task, and the method returns nil when local execution and reporting both succeed.
+func (a *Agent) handleFileOperation(ctx context.Context, operation fileOperation) error {
+	result := a.executeFileOperation(operation)
+	return a.requestJSON(
+		ctx,
+		http.MethodPost,
+		fmt.Sprintf("/api/v1/host-agents/file-operations/%s/result", url.PathEscape(operation.ID)),
+		a.session(),
+		result,
+		nil,
+	)
+}
+
 // executeDatabaseOperation runs one read-only SQL request against the local SCUM database.
 // operation contains SQL, args and result limits, and the method returns a shaped success or failure payload for scum_server.
 func (a *Agent) executeDatabaseOperation(operation databaseOperation) databaseOperationResultRequest {
@@ -492,6 +589,152 @@ func (a *Agent) executeDatabaseOperation(operation databaseOperation) databaseOp
 	}
 }
 
+// executeFileOperation runs one scoped list/read file request against the local instance root.
+// operation contains the relative path plus policy metadata, and the method returns a shaped success or failure payload for scum_server.
+func (a *Agent) executeFileOperation(operation fileOperation) fileOperationResultRequest {
+	fullPath, err := a.resolveScopedPath(operation.RelativePath)
+	if err != nil {
+		return fileOperationResultRequest{
+			Status:       "failed",
+			ContentMode:  "metadata",
+			ErrorCode:    "file.path_invalid",
+			ErrorMessage: err.Error(),
+		}
+	}
+	switch strings.TrimSpace(operation.OperationType) {
+	case "list":
+		return a.executeFileListOperation(operation, fullPath)
+	case "read":
+		return a.executeFileReadOperation(operation, fullPath)
+	default:
+		return fileOperationResultRequest{
+			Status:       "failed",
+			ContentMode:  "metadata",
+			ErrorCode:    "file.operation_unsupported",
+			ErrorMessage: fmt.Sprintf("unsupported file operation: %s", strings.TrimSpace(operation.OperationType)),
+		}
+	}
+}
+
+// executeFileListOperation lists one scoped directory and returns a bounded metadata payload.
+// operation carries the relative path and optional list limits, fullPath is the resolved host path, and the method returns directory entries or a stable failure payload.
+func (a *Agent) executeFileListOperation(operation fileOperation, fullPath string) fileOperationResultRequest {
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		return fileOperationErrorResult(err, "metadata")
+	}
+	if !info.IsDir() {
+		return fileOperationResultRequest{
+			Status:       "failed",
+			ContentMode:  "metadata",
+			ErrorCode:    "file.not_directory",
+			ErrorMessage: "requested path is not a directory",
+		}
+	}
+	entries, err := os.ReadDir(fullPath)
+	if err != nil {
+		return fileOperationErrorResult(err, "metadata")
+	}
+	sort.Slice(entries, func(left int, right int) bool {
+		return strings.ToLower(entries[left].Name()) < strings.ToLower(entries[right].Name())
+	})
+	limit := fileOperationListEntryLimit(operation)
+	truncated := limit > 0 && len(entries) > limit
+	if truncated {
+		entries = entries[:limit]
+	}
+	items := make([]fileListEntry, 0, len(entries))
+	for _, entry := range entries {
+		itemInfo, infoErr := entry.Info()
+		if infoErr != nil {
+			continue
+		}
+		items = append(items, fileListEntry{
+			Name:         entry.Name(),
+			RelativePath: filepath.ToSlash(filepath.Join(operation.RelativePath, entry.Name())),
+			Directory:    entry.IsDir(),
+			SizeBytes:    itemInfo.Size(),
+			ModifiedAt:   itemInfo.ModTime().UTC().Format(time.RFC3339),
+		})
+	}
+	return fileOperationResultRequest{
+		Status:      "succeeded",
+		ContentMode: "metadata",
+		Metadata: map[string]any{
+			"path":       operation.RelativePath,
+			"entries":    items,
+			"entryCount": len(items),
+			"truncated":  truncated,
+		},
+	}
+}
+
+// executeFileReadOperation reads one scoped file and returns bounded text or metadata.
+// operation carries the relative path and byte limits, fullPath is the resolved host path, and the method returns file content metadata or a stable failure payload.
+func (a *Agent) executeFileReadOperation(operation fileOperation, fullPath string) fileOperationResultRequest {
+	info, err := os.Stat(fullPath)
+	if err != nil {
+		return fileOperationErrorResult(err, "metadata")
+	}
+	if info.IsDir() {
+		return fileOperationResultRequest{
+			Status:       "failed",
+			ContentMode:  "metadata",
+			ErrorCode:    "file.is_directory",
+			ErrorMessage: "requested path is a directory",
+		}
+	}
+	checksum, err := sha256ForFile(fullPath)
+	if err != nil {
+		return fileOperationErrorResult(err, "metadata")
+	}
+	limit := fileOperationReadByteLimit(operation)
+	content, offset, truncated, readErr := readBoundedFileTail(fullPath, limit)
+	if readErr != nil {
+		return fileOperationErrorResult(readErr, "metadata")
+	}
+	binaryMode := fileOperationBinaryMode(operation)
+	if isBinaryContent(content) {
+		return fileOperationResultRequest{
+			Status:         "succeeded",
+			BeforeChecksum: checksum,
+			AfterChecksum:  checksum,
+			ContentMode:    "metadata",
+			Metadata: map[string]any{
+				"path":       operation.RelativePath,
+				"sizeBytes":  info.Size(),
+				"checksum":   checksum,
+				"binary":     true,
+				"binaryMode": binaryMode,
+				"truncated":  truncated,
+				"readOffset": offset,
+			},
+		}
+	}
+	text := string(content)
+	if truncated {
+		if newline := strings.IndexByte(text, '\n'); newline >= 0 && newline < len(text)-1 {
+			offset += int64(newline + 1)
+			text = text[newline+1:]
+		}
+	}
+	return fileOperationResultRequest{
+		Status:         "succeeded",
+		BeforeChecksum: checksum,
+		AfterChecksum:  checksum,
+		ContentMode:    firstNonEmpty(strings.TrimSpace(operation.ContentMode), "text"),
+		Metadata: map[string]any{
+			"path":       operation.RelativePath,
+			"content":    text,
+			"sizeBytes":  info.Size(),
+			"checksum":   checksum,
+			"binary":     false,
+			"truncated":  truncated,
+			"readOffset": offset,
+		},
+	}
+}
+
 // syncCapabilities compares the latest local capability declaration with the last successful upload and pushes updates only when changed.
 // ctx controls the HTTP request lifetime, and the method returns nil when no update is needed or the capability set is synced successfully.
 func (a *Agent) syncCapabilities(ctx context.Context) error {
@@ -529,6 +772,11 @@ func (a *Agent) buildCapabilities() ([]hostAgentCapability, string) {
 	if processReadiness.Ready {
 		processCapabilityStatus = hostAgentCapabilityStatus
 	}
+	fileCapabilityMetadata := a.fileCapabilityMetadata()
+	fileCapabilityStatus := hostAgentCapabilityBlockedStatus
+	if fileCapabilityMetadata["scopeConfigured"] == true {
+		fileCapabilityStatus = hostAgentCapabilityStatus
+	}
 	capabilities := []hostAgentCapability{
 		{
 			Capability: hostAgentDatabaseCapability,
@@ -540,6 +788,22 @@ func (a *Agent) buildCapabilities() ([]hostAgentCapability, string) {
 				"databasePath": a.redactPath(a.databasePath),
 				"databaseName": filepath.Base(a.databasePath),
 			},
+		},
+		{
+			Capability: hostAgentFileListCapability,
+			Version:    hostAgentCapabilityVersion,
+			Direction:  hostAgentCapabilityDir,
+			RiskLevel:  hostAgentCapabilityRisk,
+			Status:     fileCapabilityStatus,
+			Metadata:   fileCapabilityMetadata,
+		},
+		{
+			Capability: hostAgentFileReadCapability,
+			Version:    hostAgentCapabilityVersion,
+			Direction:  hostAgentCapabilityDir,
+			RiskLevel:  hostAgentCapabilityRisk,
+			Status:     fileCapabilityStatus,
+			Metadata:   fileCapabilityMetadata,
 		},
 		{
 			Capability: hostAgentProcessStartCapability,
@@ -801,6 +1065,41 @@ func (a *Agent) redactPath(path string) string {
 	return filepath.Base(trimmed)
 }
 
+// resolveScopedPath resolves one instance-relative path inside the configured scope root.
+// relativePath is the file operation path, and the method returns the absolute host path or an error when the agent lacks a scope root or the path escapes it.
+func (a *Agent) resolveScopedPath(relativePath string) (string, error) {
+	root := strings.TrimSpace(a.cfg.ScopeRoot)
+	if root == "" {
+		root = strings.TrimSpace(a.cfg.SteamDir)
+	}
+	if root == "" {
+		return "", errors.New("file scope root is not configured")
+	}
+	cleanRoot := filepath.Clean(root)
+	joined := filepath.Clean(filepath.Join(cleanRoot, filepath.FromSlash(relativePath)))
+	rel, err := filepath.Rel(cleanRoot, joined)
+	if err != nil {
+		return "", fmt.Errorf("resolve scoped path: %w", err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", errors.New("file path escapes scope root")
+	}
+	return joined, nil
+}
+
+// fileCapabilityMetadata returns the bounded capability metadata shared by file.list and file.read declarations.
+// It takes no parameters and returns a redacted metadata object describing whether a usable scope root is configured.
+func (a *Agent) fileCapabilityMetadata() map[string]any {
+	root := strings.TrimSpace(a.cfg.ScopeRoot)
+	if root == "" {
+		root = strings.TrimSpace(a.cfg.SteamDir)
+	}
+	return map[string]any{
+		"scopeConfigured": root != "",
+		"scopeRootName":   a.redactPath(root),
+	}
+}
+
 // isUnauthorized reports whether an error came from an expired or invalid host-agent session.
 // err is the request error returned by requestJSON, and the method returns true when re-registration should be attempted.
 func (a *Agent) isUnauthorized(err error) bool {
@@ -846,4 +1145,153 @@ func databaseErrorCode(err error) string {
 	default:
 		return "execution_failed"
 	}
+}
+
+// fileOperationErrorResult converts one local file execution error into a stable result payload.
+// err is the local filesystem error, contentMode is the fallback response mode, and the function returns a structured failure result.
+func fileOperationErrorResult(err error, contentMode string) fileOperationResultRequest {
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return fileOperationResultRequest{Status: "failed", ContentMode: contentMode, ErrorCode: "file.not_found", ErrorMessage: "requested file does not exist"}
+	case errors.Is(err, os.ErrPermission):
+		return fileOperationResultRequest{Status: "failed", ContentMode: contentMode, ErrorCode: "file.permission_denied", ErrorMessage: "permission denied while reading file"}
+	default:
+		return fileOperationResultRequest{Status: "failed", ContentMode: contentMode, ErrorCode: "file.execution_failed", ErrorMessage: err.Error()}
+	}
+}
+
+// fileOperationListEntryLimit extracts the scoped list entry cap from one file operation payload.
+// operation contains control-plane metadata, and the function returns the declared list limit or a safe default when metadata is missing.
+func fileOperationListEntryLimit(operation fileOperation) int {
+	limits := fileOperationLimits(operation)
+	value := intValue(limits["listEntryLimit"])
+	if value <= 0 {
+		return 500
+	}
+	return value
+}
+
+// fileOperationReadByteLimit extracts the scoped byte cap from one file operation payload.
+// operation contains control-plane metadata, and the function returns the declared byte limit or a safe default when metadata is missing.
+func fileOperationReadByteLimit(operation fileOperation) int64 {
+	limits := fileOperationLimits(operation)
+	value := int64Value(limits["readByteLimit"])
+	if value <= 0 {
+		return 1 << 20
+	}
+	return value
+}
+
+// fileOperationBinaryMode extracts the binary read policy from one file operation payload.
+// operation contains control-plane metadata, and the function returns the declared binary mode or metadata when metadata is missing.
+func fileOperationBinaryMode(operation fileOperation) string {
+	limits := fileOperationLimits(operation)
+	value, _ := limits["binaryMode"].(string)
+	if strings.TrimSpace(value) == "" {
+		return "metadata"
+	}
+	return strings.TrimSpace(value)
+}
+
+// fileOperationLimits returns the nested limits metadata attached by scum_server file policy evaluation.
+// operation contains the decoded result metadata, and the function returns the limits object or an empty map when none exists.
+func fileOperationLimits(operation fileOperation) map[string]any {
+	if operation.Result == nil {
+		return map[string]any{}
+	}
+	limits, _ := operation.Result["limits"].(map[string]any)
+	if limits == nil {
+		return map[string]any{}
+	}
+	return limits
+}
+
+// intValue converts one decoded JSON scalar into an int.
+// value is the decoded metadata scalar, and the function returns zero when conversion is not possible.
+func intValue(value any) int {
+	switch typed := value.(type) {
+	case float64:
+		return int(typed)
+	case float32:
+		return int(typed)
+	case int:
+		return typed
+	case int32:
+		return int(typed)
+	case int64:
+		return int(typed)
+	default:
+		return 0
+	}
+}
+
+// int64Value converts one decoded JSON scalar into an int64.
+// value is the decoded metadata scalar, and the function returns zero when conversion is not possible.
+func int64Value(value any) int64 {
+	switch typed := value.(type) {
+	case float64:
+		return int64(typed)
+	case float32:
+		return int64(typed)
+	case int:
+		return int64(typed)
+	case int32:
+		return int64(typed)
+	case int64:
+		return typed
+	default:
+		return 0
+	}
+}
+
+// readBoundedFileTail reads at most limit bytes from the end of one file.
+// path identifies the target file, limit is the maximum number of bytes to read, and the function returns the bytes, the starting offset, whether truncation happened, or an error.
+func readBoundedFileTail(path string, limit int64) ([]byte, int64, bool, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, 0, false, err
+	}
+	size := info.Size()
+	if limit <= 0 || size <= limit {
+		data, readErr := io.ReadAll(file)
+		return data, 0, false, readErr
+	}
+	offset := size - limit
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		return nil, 0, false, err
+	}
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	return data, offset, true, nil
+}
+
+// sha256ForFile streams one file and returns its sha256 checksum with a stable prefix.
+// path identifies the target file, and the function returns the checksum string or an error when the file cannot be read.
+func sha256ForFile(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("sha256:%x", hash.Sum(nil)), nil
+}
+
+// isBinaryContent reports whether the provided bytes should be treated as binary.
+// data contains the bounded file sample, and the function returns true when it contains NUL bytes or invalid UTF-8.
+func isBinaryContent(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	return bytes.IndexByte(data, 0) >= 0 || !utf8.Valid(data)
 }

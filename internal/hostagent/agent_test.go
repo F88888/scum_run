@@ -263,6 +263,159 @@ func TestAgentHelloDeclaresManagedProcessLifecycleCapabilities(t *testing.T) {
 	if processCapability.Metadata["startupBehavior"] != startupBehaviorWait || processCapability.Metadata["runtimeContractVersion"] != defaultRuntimeContract {
 		t.Fatalf("expected startup metadata, got %+v", processCapability.Metadata)
 	}
+	fileReadCapability := findCapability(request.Capabilities, hostAgentFileReadCapability)
+	if fileReadCapability.Capability == "" || fileReadCapability.Status != hostAgentCapabilityStatus {
+		t.Fatalf("expected active %s capability, got %+v", hostAgentFileReadCapability, fileReadCapability)
+	}
+	fileListCapability := findCapability(request.Capabilities, hostAgentFileListCapability)
+	if fileListCapability.Capability == "" || fileListCapability.Status != hostAgentCapabilityStatus {
+		t.Fatalf("expected active %s capability, got %+v", hostAgentFileListCapability, fileListCapability)
+	}
+}
+
+// TestAgentPollsFileReadOperation verifies that host-agent mode can claim, execute, and report one bounded file read operation.
+// t is the testing handle used for assertions, and the function returns no values.
+func TestAgentPollsFileReadOperation(t *testing.T) {
+	steamDir, _, _ := createManagedExecutorTestLayout(t, "#!/bin/sh\nsleep 30\n")
+	targetPath := filepath.Join(steamDir, "SCUM", "Saved", "Config", "WindowsServer", "ServerSettings.ini")
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		t.Fatalf("create settings dir: %v", err)
+	}
+	content := strings.Repeat("header-line\n", 8) + "ServerName=Test Server\nMaxPlayers=64\n"
+	if err := os.WriteFile(targetPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write settings file: %v", err)
+	}
+	var (
+		report        fileOperationResultRequest
+		reportArrived = make(chan struct{}, 1)
+		fileServed    bool
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/host-agents/hello":
+			writeJSONResponse(t, w, helloResponse{SessionToken: "session-1"})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/host-agents/heartbeat":
+			writeJSONResponse(t, w, map[string]any{"status": "ok"})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/host-agents/database-operations/next":
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/host-agents/file-operations/next":
+			if fileServed {
+				http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+				return
+			}
+			fileServed = true
+			writeJSONResponse(t, w, fileOperation{
+				ID:            "fop-1",
+				OperationType: "read",
+				RelativePath:  "SCUM/Saved/Config/WindowsServer/ServerSettings.ini",
+				ContentMode:   "text",
+				Result:        map[string]any{"limits": map[string]any{"readByteLimit": 64}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/host-agents/file-operations/fop-1/result":
+			defer r.Body.Close()
+			if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
+				t.Fatalf("decode file report: %v", err)
+			}
+			w.WriteHeader(http.StatusOK)
+			select {
+			case reportArrived <- struct{}{}:
+			default:
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	agent := newTestAgent(t, Config{
+		ServerURL:              server.URL,
+		RegistrationToken:      "token",
+		AgentID:                "agent-1",
+		DisplayName:            "agent-1",
+		Version:                "test",
+		StartupBehavior:        startupBehaviorWait,
+		RuntimeContractVersion: defaultRuntimeContract,
+		Address:                "127.0.0.1",
+		ScopeRoot:              steamDir,
+		SteamDir:               steamDir,
+		HeartbeatInterval:      5 * time.Second,
+		PollInterval:           20 * time.Millisecond,
+		RequestTimeout:         time.Second,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- agent.Run(ctx)
+	}()
+
+	select {
+	case <-reportArrived:
+		cancel()
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for file report")
+	}
+
+	if err := <-done; err != nil {
+		t.Fatalf("agent returned error: %v", err)
+	}
+	if report.Status != "succeeded" {
+		t.Fatalf("expected succeeded file report, got %+v", report)
+	}
+	if report.Metadata["content"] == "" {
+		t.Fatalf("expected bounded file content, got %+v", report.Metadata)
+	}
+	if report.BeforeChecksum == "" || report.AfterChecksum == "" {
+		t.Fatalf("expected file checksums, got %+v", report)
+	}
+}
+
+// TestAgentExecuteFileListOperation verifies the host agent can enumerate one scoped directory with bounded metadata.
+// t is the testing handle used for assertions, and the function returns no values.
+func TestAgentExecuteFileListOperation(t *testing.T) {
+	steamDir, _, _ := createManagedExecutorTestLayout(t, "#!/bin/sh\nsleep 30\n")
+	logsDir := filepath.Join(steamDir, "SCUM", "Saved", "SaveFiles", "Logs")
+	if err := os.MkdirAll(logsDir, 0o755); err != nil {
+		t.Fatalf("create logs dir: %v", err)
+	}
+	for _, name := range []string{"admin.log", "gameplay.log", "login.log"} {
+		if err := os.WriteFile(filepath.Join(logsDir, name), []byte(name), 0o644); err != nil {
+			t.Fatalf("write log file: %v", err)
+		}
+	}
+	agent := newTestAgent(t, Config{
+		ServerURL:              "http://127.0.0.1",
+		RegistrationToken:      "token",
+		AgentID:                "agent-1",
+		DisplayName:            "agent-1",
+		Version:                "test",
+		StartupBehavior:        startupBehaviorWait,
+		RuntimeContractVersion: defaultRuntimeContract,
+		Address:                "127.0.0.1",
+		ScopeRoot:              steamDir,
+		SteamDir:               steamDir,
+		HeartbeatInterval:      time.Second,
+		PollInterval:           time.Second,
+		RequestTimeout:         time.Second,
+	})
+
+	result := agent.executeFileOperation(fileOperation{
+		ID:            "fop-list-1",
+		OperationType: "list",
+		RelativePath:  "SCUM/Saved/SaveFiles/Logs",
+		Result:        map[string]any{"limits": map[string]any{"listEntryLimit": 2}},
+	})
+	if result.Status != "succeeded" {
+		t.Fatalf("expected succeeded list result, got %+v", result)
+	}
+	entries, ok := result.Metadata["entries"].([]fileListEntry)
+	if !ok {
+		t.Fatalf("expected typed file list entries, got %+v", result.Metadata["entries"])
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected bounded entry list, got %+v", entries)
+	}
 }
 
 // TestAgentManagedCapabilityReturnsBlockedResult verifies host-agent mode returns a structured blocked error when process runtime readiness is missing.
